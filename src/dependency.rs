@@ -2,7 +2,7 @@ use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
 use crate::rdd::{
-    default_hash, free_res_enc, get_encrypted_data, AccArg, ItemE, OpId, RddBase, MAX_THREAD,
+    default_hash, free_res_enc, get_encrypted_data, AccArg, ItemE, OpId, RddBase, INNER_PARA,
 };
 use crate::serializable_traits::Data;
 use dashmap::mapref::one::RefMut;
@@ -285,6 +285,7 @@ where
             let mut acc_arg = AccArg::new(
                 dep_info,
                 Some(self.partitioner.get_num_of_partitions()),
+                self.partitioner.get_range_bound_src(),
                 Arc::new(atomic::AtomicBool::new(false)),
             );
 
@@ -293,7 +294,8 @@ where
             let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
 
             let num_output_splits = self.partitioner.get_num_of_partitions();
-            let mut buckets: Vec<Vec<Vec<ItemE>>> = (0..num_output_splits * (MAX_THREAD + 1))
+            let mut buckets: Vec<Vec<Vec<ItemE>>> = (0..num_output_splits * INNER_PARA)
+                // (0..num_output_splits * (INNER_PARA+1))
                 .map(|_| Vec::new())
                 .collect::<Vec<_>>();
             for block_ptr in rx {
@@ -315,7 +317,8 @@ where
             }
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             log::info!("in dependency, shuffle write {:?}", dur);
-            for (i, local_buckets) in buckets.chunks_exact(MAX_THREAD + 1).into_iter().enumerate() {
+            //for (i, local_buckets) in buckets.chunks_exact(INNER_PARA + 1).into_iter().enumerate() {
+            for (i, local_buckets) in buckets.chunks_exact(INNER_PARA).into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(local_buckets).unwrap();
                 env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
             }

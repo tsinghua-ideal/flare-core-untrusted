@@ -141,6 +141,7 @@ where
                     let mut acc_arg_cg = AccArg::new(
                         DepInfo::padding_new(0),
                         None,
+                        Vec::new(),
                         Arc::new(AtomicBool::new(false)),
                     );
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?; //TODO need sorted
@@ -201,6 +202,7 @@ where
                     let mut acc_arg_cg = AccArg::new(
                         DepInfo::padding_new(0),
                         None,
+                        Vec::new(),
                         Arc::new(AtomicBool::new(false)),
                     );
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?; //TODO need sorted

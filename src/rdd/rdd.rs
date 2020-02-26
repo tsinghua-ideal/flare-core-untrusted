@@ -25,7 +25,7 @@ use crate::dependency::{DepInfo, Dependency};
 use crate::env::{self, Env, BOUNDED_MEM_CACHE};
 use crate::error::{Error, Result};
 use crate::partial::{BoundedDouble, CountEvaluator, GroupedCountEvaluator, PartialResult};
-use crate::partitioner::{HashPartitioner, Partitioner};
+use crate::partitioner::{HashPartitioner, Partitioner, RangePartitioner};
 use crate::scheduler::TaskContext;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::serialization_free::{Construct, Idx, SizeBuf};
@@ -73,7 +73,9 @@ pub type ItemE = Vec<u8>;
 
 static immediate_cout: bool = true;
 pub const MAX_ENC_BL: usize = 1024;
-pub const MAX_THREAD: usize = 1;
+pub const INNER_PARA: usize = 1;
+// it is better to be consist with app/src/main.rs and enclave/src/lib.rs
+pub const OUTER_PARA: usize = 8;
 
 extern "C" {
     pub fn secure_execute_pre(
@@ -82,6 +84,7 @@ extern "C" {
         op_ids: *const u8,
         part_nums: *const u8,
         dep_info: DepInfo,
+        range_bound_src: *const u8,
     ) -> sgx_status_t;
     pub fn secure_execute(
         eid: sgx_enclave_id_t,
@@ -181,7 +184,12 @@ pub fn default_hash<T: Hash>(t: &T) -> u64 {
     s.finish()
 }
 
-pub fn wrapper_secure_execute_pre(op_ids: &Vec<OpId>, split_nums: &Vec<usize>, dep_info: DepInfo) {
+pub fn wrapper_secure_execute_pre(
+    op_ids: &Vec<OpId>,
+    split_nums: &Vec<usize>,
+    dep_info: DepInfo,
+    range_bound_src: &Vec<ItemE>,
+) {
     let eid = Env::get()
         .enclave
         .lock()
@@ -197,6 +205,7 @@ pub fn wrapper_secure_execute_pre(op_ids: &Vec<OpId>, split_nums: &Vec<usize>, d
             op_ids as *const Vec<OpId> as *const u8,
             split_nums as *const Vec<usize> as *const u8,
             dep_info,
+            range_bound_src as *const Vec<ItemE> as *const u8,
         )
     };
     match sgx_status {
@@ -256,7 +265,12 @@ where
 pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<usize>) -> f64 {
     let mut wait = 0.0;
     let cache_meta = acc_arg.to_cache_meta();
-    wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
+    wrapper_secure_execute_pre(
+        &acc_arg.op_ids,
+        &acc_arg.split_nums,
+        acc_arg.dep_info,
+        &acc_arg.range_bound_src,
+    );
     let wait_now = Instant::now();
     acc_arg.get_enclave_lock();
     let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
@@ -645,12 +659,13 @@ pub fn secure_compute_cached(
         let split_nums = acc_arg.split_nums.clone();
         let cache_meta = acc_arg.to_cache_meta();
         let dep_info = acc_arg.dep_info;
+        let range_bound_src = acc_arg.range_bound_src.clone();
         let eenter_lock = acc_arg.eenter_lock.clone();
         let captured_vars = acc_arg.captured_vars.clone();
 
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
-            wrapper_secure_execute_pre(&op_ids, &split_nums, dep_info);
+            wrapper_secure_execute_pre(&op_ids, &split_nums, dep_info, &range_bound_src);
             let mut result_ptr: usize = 0;
             while eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                 //wait
@@ -691,6 +706,7 @@ pub struct AccArg {
     pub part_ids: Vec<usize>,
     pub split_nums: Vec<usize>,
     pub dep_info: DepInfo,
+    pub range_bound_src: Vec<ItemE>,
     caching_rdd_id: usize,
     cached_rdd_id: usize,
     pub eenter_lock: Arc<AtomicBool>,
@@ -698,7 +714,12 @@ pub struct AccArg {
 }
 
 impl AccArg {
-    pub fn new(dep_info: DepInfo, reduce_num: Option<usize>, eenter_lock: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        dep_info: DepInfo,
+        reduce_num: Option<usize>,
+        range_bound_src: Vec<ItemE>,
+        eenter_lock: Arc<AtomicBool>,
+    ) -> Self {
         let split_nums = match reduce_num {
             Some(reduce_num) => {
                 assert!(dep_info.is_shuffle == 1);
@@ -712,6 +733,7 @@ impl AccArg {
             part_ids: Vec::new(),
             split_nums,
             dep_info,
+            range_bound_src,
             caching_rdd_id: 0,
             cached_rdd_id: 0,
             eenter_lock,
@@ -859,7 +881,7 @@ impl Input {
         let data = data as *const T as usize;
         Input {
             data,
-            parallel_num: MAX_THREAD,
+            parallel_num: OUTER_PARA,
         }
     }
 
@@ -871,7 +893,7 @@ impl Input {
     pub fn build_from_ptr(data: *const u8) -> Self {
         Input {
             data: data as usize,
-            parallel_num: MAX_THREAD,
+            parallel_num: OUTER_PARA,
         }
     }
 }
@@ -1249,7 +1271,7 @@ pub trait Rdd: RddBase + 'static {
         let rdd_id = self.get_rdd_id();
         let op_id = self.get_op_id();
         let part_id = split.get_index();
-        let mut acc_arg = AccArg::new(dep_info, None, Arc::new(AtomicBool::new(false)));
+        let mut acc_arg = AccArg::new(dep_info, None, Vec::new(), Arc::new(AtomicBool::new(false)));
         if let Some(action_id) = action_id {
             acc_arg.insert_quadruple(rdd_id, action_id, usize::MAX, usize::MAX);
         }
@@ -2530,6 +2552,77 @@ pub trait Rdd: RddBase + 'static {
         rdd.register_op_name("count_approx");
         self.get_context()
             .run_approximate_job(count_elements, rdd, None, evaluator, timeout)
+    }
+
+    #[track_caller]
+    fn sort_by<K, F>(
+        &self,
+        ascending: bool,
+        num_partitions: usize,
+        func: F,
+    ) -> SerArc<dyn Rdd<Item = Self::Item>>
+    where
+        K: Data + Eq + Hash + PartialEq + Ord + PartialOrd,
+        F: SerFunc(&Self::Item) -> K,
+        Self::Item: Data + Eq + Hash,
+        Self: Sized + Clone,
+    {
+        let f_clone = func.clone();
+        let sample_point_per_partition_hint = 20;
+        let sample_size = std::cmp::min(1000000, sample_point_per_partition_hint * num_partitions);
+        let sample_size_per_partition = sample_size * 3 / num_partitions;
+        let k_rdd = self.map(Fn!(move |x: Self::Item| -> K { (f_clone)(&x) }));
+        self.get_context().add_num(1);
+        let sample_k_rdd =
+            k_rdd.map_partitions(Box::new(Fn!(
+                move |iter: Box<dyn Iterator<Item = K>>| -> Box<dyn Iterator<Item = K>> {
+                    let mut res = Vec::<K>::new();
+
+                    let mut rand = utils::random::get_rng_with_random_seed();
+                    for (idx, item) in iter.enumerate() {
+                        if idx < sample_size_per_partition {
+                            res.push(item);
+                        } else {
+                            let i = rand.gen_range(0, idx);
+                            if i < sample_size_per_partition {
+                                res[i] = item
+                            }
+                        }
+                    }
+                    Box::new(res.into_iter())
+                }
+            )));
+        self.get_context().add_num(1);
+
+        assert!(num_partitions >= 1);
+        let part = if self.get_secure() {
+            let samples_enc = sample_k_rdd.secure_collect().unwrap().get_ct();
+            RangePartitioner::<K>::new(num_partitions, ascending, Vec::new(), samples_enc)
+        } else {
+            let samples = sample_k_rdd.collect().unwrap();
+            RangePartitioner::<K>::new(num_partitions, ascending, samples, Vec::new())
+        };
+
+        // otherwise func is called multiple time during sorting. perhaps change it later
+        let f_clone = func.clone();
+        let rdd = self.map(Box::new(Fn!(move |x: Self::Item| -> (K, Self::Item) {
+            ((f_clone)(&x), x)
+        })));
+        self.get_context().add_num(1);
+
+        let f_clone = func.clone();
+        let sort = Fn!(
+        move|iter: Box<dyn Iterator<Item = Self::Item>>| -> Box<dyn Iterator<Item = Self::Item>> {
+            let mut res: Vec<Self::Item> = iter.collect();
+            // sort_by_key expect a FnMut parameter, but f_clone only implement Fn
+            // so a wrapper which implement FnMut needed here.
+            res.sort_by_key(|x| (f_clone)(&x));
+            Box::new(res.into_iter())
+        });
+
+        let partition_rdd = rdd.partition_by_key(Box::new(part));
+        self.get_context().add_num(1);
+        partition_rdd.map_partitions(sort)
     }
 
     /// Creates tuples of the elements in this RDD by applying `f`.

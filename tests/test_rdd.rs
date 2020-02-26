@@ -582,6 +582,46 @@ fn count_by_value_aprox() -> Result<()> {
     res.sort_by(|e1, e2| e1.0.cmp(&e2.0));
 
     let expected = vec![(1i32, 1.0f64), (2, 2.0), (3, 3.0)];
+
+#[test]
+fn test_sort_by() {
+    let sc = CONTEXT.clone();
+    let col = vec![
+        "1".to_string(),
+        "3".to_string(),
+        "2".to_string(),
+        "4".to_string(),
+        "4".to_string(),
+        "10".to_string(),
+        "9".to_string(),
+        "13".to_string(),
+        "19".to_string(),
+        "0".to_string(),
+    ];
+
+    let rdd = sc.parallelize(col, 2);
+    let res = rdd
+        .sort_by(
+            true,
+            5,
+            Fn!(|x: &String| -> u8 { x.parse::<u8>().unwrap() }),
+        )
+        .collect()
+        .unwrap();
+
+    let expected = vec![
+        "0".to_string(),
+        "1".to_string(),
+        "2".to_string(),
+        "3".to_string(),
+        "4".to_string(),
+        "4".to_string(),
+        "9".to_string(),
+        "10".to_string(),
+        "13".to_string(),
+        "19".to_string(),
+    ];
+
     assert_eq!(res, expected);
     Ok(())
 }
