@@ -16,8 +16,7 @@ impl ShuffleFetcher {
     pub async fn fetch<K: Data, V: Data>(
         shuffle_id: usize,
         reduce_id: usize,
-        mut func: impl FnMut((K, V)) -> (),
-    ) -> Result<()> {
+    ) -> Result<impl Iterator<Item = (K, V)>> {
         log::debug!("inside fetch function");
         let mut inputs_by_uri = HashMap::new();
         let server_uris = env::Env::get()
@@ -78,52 +77,45 @@ impl ShuffleFetcher {
                             input_id,
                             reduce_id,
                         )?;
-                        let data = {
+                        let data_bytes = {
                             let res = client.get(chunk_uri).await?;
                             hyper::body::to_bytes(res.into_body()).await
                         };
-                        if let Ok(data) = data {
-                            shuffle_chunks.push(data.to_vec());
+                        if let Ok(bytes) = data_bytes {
+                            let deser_data = bincode::deserialize::<Vec<(K, V)>>(&bytes.to_vec())?;
+                            shuffle_chunks.push(deser_data);
                         } else {
                             failure.store(true, atomic::Ordering::Release);
                             return Err(ShuffleError::FailedFetchOp);
                         }
                     }
-                    Ok(shuffle_chunks)
+                    Ok::<Box<dyn Iterator<Item = (K, V)> + Send>, _>(Box::new(
+                        shuffle_chunks.into_iter().flatten(),
+                    ))
                 } else {
-                    Ok(Vec::new())
+                    Ok::<Box<dyn Iterator<Item = (K, V)> + Send>, _>(Box::new(std::iter::empty()))
                 }
             };
-            // spawning is required so tasks are run in parallel in the tokio tp
             tasks.push(tokio::spawn(task));
         }
-        let task_results = future::join_all(tasks.into_iter()).await;
         log::debug!("total_results {}", total_results);
-        // TODO: make this pure; instead of modifying the compute results inside the passing closure
-        // return the deserialized values iterator to the caller
-        task_results
-            .into_iter()
-            .map(|join_res| {
-                if let Ok(results) = join_res {
-                    for res_set in &results {
-                        res_set
-                            .iter()
-                            .map(|bytes| {
-                                let set = bincode::deserialize::<Vec<(K, V)>>(&bytes)?;
-                                set.into_iter().for_each(|kv| func(kv));
-                                Ok(())
-                            })
-                            .fold(
-                                Ok(()),
-                                |curr: Result<()>, res| if res.is_err() { res } else { curr },
-                            )?
+        let task_results = future::join_all(tasks.into_iter()).await;
+        let results = task_results.into_iter().fold(
+            Ok(Vec::<(K, V)>::with_capacity(total_results)),
+            |curr, res| {
+                if let Ok(mut curr) = curr {
+                    if let Ok(Ok(res)) = res {
+                        curr.extend(res);
+                        Ok(curr)
+                    } else {
+                        Err(ShuffleError::FailedFetchOp)
                     }
-                    Ok(())
                 } else {
-                    Err(ShuffleError::Other)
+                    Err(ShuffleError::FailedFetchOp)
                 }
-            })
-            .fold(Ok(()), |curr, res| if res.is_err() { res } else { curr })
+            },
+        )?;
+        Ok(results.into_iter())
     }
 
     fn make_chunk_uri(
@@ -148,7 +140,7 @@ impl ShuffleFetcher {
 mod tests {
     use super::*;
 
-    // #[tokio::test]
+    #[tokio::test(core_threads = 4)]
     async fn fetch_ok() -> StdResult<(), Box<dyn std::error::Error + 'static>> {
         {
             let addr = format!(
@@ -156,23 +148,24 @@ mod tests {
                 env::Env::get().shuffle_manager.server_port
             );
             let servers = &env::Env::get().map_output_tracker.server_uris;
-            servers.insert(0, vec![Some(addr)]);
+            servers.insert(11000, vec![Some(addr)]);
 
             let data = vec![(0i32, "example data".to_string())];
             let serialized_data = bincode::serialize(&data).unwrap();
-            env::SHUFFLE_CACHE.insert((0, 0, 0), serialized_data);
+            env::SHUFFLE_CACHE.insert((11000, 0, 11001), serialized_data);
         }
 
-        let test_func = |(k, v): (i32, String)| {
-            assert_eq!(k, 0);
-            assert_eq!(v, "example data");
-        };
-        ShuffleFetcher::fetch(0, 0, test_func).await?;
+        let result: Vec<(i32, String)> = ShuffleFetcher::fetch(11000, 11001)
+            .await?
+            .into_iter()
+            .collect();
+        assert_eq!(result[0].0, 0);
+        assert_eq!(result[0].1, "example data");
 
         Ok(())
     }
 
-    // #[tokio::test]
+    #[tokio::test(core_threads = 4)]
     async fn fetch_failure() -> StdResult<(), Box<dyn std::error::Error + 'static>> {
         {
             let addr = format!(
@@ -180,18 +173,15 @@ mod tests {
                 env::Env::get().shuffle_manager.server_port
             );
             let servers = &env::Env::get().map_output_tracker.server_uris;
-            servers.insert(1, vec![Some(addr)]);
+            servers.insert(10000, vec![Some(addr)]);
 
             let data = "corrupted data";
             let serialized_data = bincode::serialize(&data).unwrap();
-            env::SHUFFLE_CACHE.insert((1, 0, 0), serialized_data);
+            env::SHUFFLE_CACHE.insert((10000, 0, 10001), serialized_data);
         }
 
-        let test_func = |(_k, _v): (i32, String)| {};
-        assert!(ShuffleFetcher::fetch(1, 0, test_func)
-            .await
-            .unwrap_err()
-            .deserialization_err());
+        let err = ShuffleFetcher::fetch::<i32, String>(10000, 10001).await;
+        assert!(err.is_err());
 
         Ok(())
     }

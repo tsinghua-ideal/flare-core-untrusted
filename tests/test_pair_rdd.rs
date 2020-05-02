@@ -57,7 +57,6 @@ fn test_join() {
     let col2 = sc.parallelize(col2, 4);
     let inner_joined_rdd = col2.join(col1.clone(), 4);
     let mut res = inner_joined_rdd.collect().unwrap();
-    println!("res {:?}", res);
     res.sort();
 
     let expected = vec![
@@ -110,7 +109,7 @@ fn test_count_by_value() -> Result<()> {
 }
 
 #[test]
-fn group_by() -> Result<()> {
+fn test_group_by() -> Result<()> {
     let sc = CONTEXT.clone();
     let vec = vec![-3i32, -2, -1, 0, 1, 2, 3];
     let r = sc.make_rdd(vec, 2);

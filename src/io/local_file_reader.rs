@@ -73,7 +73,9 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
         let files_per_executor = Arc::new(
             MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files).pin(),
         );
-        SerArc::new(MapperRdd::new(files_per_executor, decoder).pin())
+        let decoder = MapperRdd::new(files_per_executor, decoder).pin();
+        decoder.register_op_name("local_fs_reader<bytes>");
+        SerArc::new(decoder)
     }
 }
 
@@ -93,7 +95,9 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
         let files_per_executor = Arc::new(
             MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files).pin(),
         );
-        SerArc::new(MapperRdd::new(files_per_executor, decoder).pin())
+        let decoder = MapperRdd::new(files_per_executor, decoder).pin();
+        decoder.register_op_name("local_fs_reader<files>");
+        SerArc::new(decoder)
     }
 }
 
