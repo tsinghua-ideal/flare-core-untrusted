@@ -74,7 +74,8 @@ pub struct CoGroupedRdd<K: Data> {
 impl<K: Data + Eq + Hash> CoGroupedRdd<K> {
     pub fn new(rdds: Vec<SerArc<dyn RddBase>>, part: Box<dyn Partitioner>) -> Self {
         let context = rdds[0].get_context();
-        let mut vals = RddVals::new(context.clone());
+        let secure = rdds[0].get_secure();
+        let mut vals = RddVals::new(context.clone(), secure);
         let create_combiner = Box::new(Fn!(|v: Box<dyn AnyData>| vec![v]));
         fn merge_value(
             mut buf: Vec<Box<dyn AnyData>>,
@@ -146,6 +147,10 @@ impl<K: Data + Eq + Hash> RddBase for CoGroupedRdd<K> {
 
     fn get_dependencies(&self) -> Vec<Dependency> {
         self.vals.dependencies.clone()
+    }
+
+    fn get_secure(&self) -> bool {
+        self.vals.secure
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

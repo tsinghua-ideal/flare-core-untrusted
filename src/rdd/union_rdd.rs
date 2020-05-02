@@ -107,7 +107,8 @@ impl<T: Data> Clone for UnionVariants<T> {
 impl<T: Data> UnionVariants<T> {
     fn new(rdds: &[Arc<dyn Rdd<Item = T>>]) -> Result<Self> {
         let context = rdds[0].get_context();
-        let mut vals = RddVals::new(context);
+        let secure = rdds[0].get_secure();  //temp
+        let mut vals = RddVals::new(context, secure);
 
         let mut pos = 0;
         let final_rdds: Vec<_> = rdds.iter().map(|rdd| rdd.clone().into()).collect();
@@ -208,6 +209,13 @@ impl<T: Data> RddBase for UnionRdd<T> {
         match &self.0 {
             NonUniquePartitioner { vals, .. } => vals.dependencies.clone(),
             PartitionerAware { vals, .. } => vals.dependencies.clone(),
+        }
+    }
+
+    fn get_secure(&self) -> bool {
+        match &self.0 {
+            NonUniquePartitioner { vals, .. } => vals.secure,
+            PartitionerAware { vals, .. } => vals.secure,
         }
     }
 

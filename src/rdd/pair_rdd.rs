@@ -210,7 +210,7 @@ where
     F: Func(V) -> U + Clone,
 {
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F) -> Self {
-        let mut vals = RddVals::new(prev.get_context());
+        let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
             .push(Dependency::NarrowDependency(Arc::new(
                 OneToOneDependency::new(prev.get_rdd_base()),
@@ -240,6 +240,11 @@ where
     fn get_dependencies(&self) -> Vec<Dependency> {
         self.vals.dependencies.clone()
     }
+
+    fn get_secure(&self) -> bool {
+        self.vals.secure
+    }
+
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()
     }
@@ -322,7 +327,7 @@ where
     F: Func(V) -> Box<dyn Iterator<Item = U>> + Clone,
 {
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F) -> Self {
-        let mut vals = RddVals::new(prev.get_context());
+        let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
             .push(Dependency::NarrowDependency(Arc::new(
                 OneToOneDependency::new(prev.get_rdd_base()),
@@ -351,6 +356,9 @@ where
     }
     fn get_dependencies(&self) -> Vec<Dependency> {
         self.vals.dependencies.clone()
+    }
+    fn get_secure(&self) -> bool {
+        self.vals.secure
     }
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()

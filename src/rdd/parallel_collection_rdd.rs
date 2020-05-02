@@ -77,28 +77,28 @@ impl<T: Data> Clone for ParallelCollection<T> {
 }
 
 impl<T: Data> ParallelCollection<T> {
-    pub fn new<I>(context: Arc<Context>, data: I, num_slices: usize) -> Self
+    pub fn new<I>(context: Arc<Context>, data: I, num_slices: usize, secure: bool) -> Self
     where
         I: IntoIterator<Item = T>,
     {
         ParallelCollection {
             rdd_vals: Arc::new(ParallelCollectionVals {
                 context: Arc::downgrade(&context),
-                vals: Arc::new(RddVals::new(context.clone())),
+                vals: Arc::new(RddVals::new(context.clone(), secure)), //chain of security
                 splits_: ParallelCollection::slice(data, num_slices),
-                num_slices,
+                num_slices, //field init shorthand
             }),
         }
     }
 
-    pub fn from_chunkable<C>(context: Arc<Context>, data: C) -> Self
+    pub fn from_chunkable<C>(context: Arc<Context>, data: C, secure: bool) -> Self
     where
         C: Chunkable<T>,
     {
         let splits_ = data.slice();
         let rdd_vals = ParallelCollectionVals {
             context: Arc::downgrade(&context),
-            vals: Arc::new(RddVals::new(context.clone())),
+            vals: Arc::new(RddVals::new(context.clone(), secure)),
             num_slices: splits_.len(),
             splits_,
         };
@@ -160,6 +160,9 @@ impl<T: Data> RddBase for ParallelCollection<T> {
     }
     fn get_dependencies(&self) -> Vec<Dependency> {
         self.rdd_vals.vals.dependencies.clone()
+    }
+    fn get_secure(&self) -> bool {
+        self.rdd_vals.vals.secure
     }
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (0..self.rdd_vals.splits_.len())

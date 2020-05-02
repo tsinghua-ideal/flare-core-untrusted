@@ -56,3 +56,6 @@ mod utils;
 // Import global external types and macros:
 pub use serde_closure::Fn;
 use serde_traitobject::{Arc as SerArc, Box as SerBox};
+
+pub use sgx_types::*;
+pub use sgx_urts::SgxEnclave;

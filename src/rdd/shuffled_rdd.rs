@@ -62,8 +62,9 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffledRdd<K, V, C> {
         part: Box<dyn Partitioner>,
     ) -> Self {
         let ctx = parent.get_context();
+        let secure = parent.get_secure();   //temp
         let shuffle_id = ctx.new_shuffle_id();
-        let mut vals = RddVals::new(ctx);
+        let mut vals = RddVals::new(ctx, secure);
 
         vals.dependencies
             .push(Dependency::ShuffleDependency(Arc::new(
@@ -97,6 +98,10 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> RddBase for ShuffledRdd<K, V, C> {
 
     fn get_dependencies(&self) -> Vec<Dependency> {
         self.vals.dependencies.clone()
+    }
+
+    fn get_secure(&self) -> bool {
+        self.vals.secure
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

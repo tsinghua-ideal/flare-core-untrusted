@@ -40,7 +40,7 @@ where
     F: SerFunc(T) -> Box<dyn Iterator<Item = U>>,
 {
     pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, f: F) -> Self {
-        let mut vals = RddVals::new(prev.get_context());
+        let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
             .push(Dependency::NarrowDependency(Arc::new(
                 OneToOneDependency::new(prev.get_rdd_base()),
@@ -69,6 +69,10 @@ where
 
     fn get_dependencies(&self) -> Vec<Dependency> {
         self.vals.dependencies.clone()
+    }
+
+    fn get_secure(&self) -> bool {
+        self.vals.secure
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

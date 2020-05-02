@@ -182,6 +182,23 @@ impl Context {
             .into_string()
             .map_err(Error::OsStringToString)?;
 
+        let mut enclave_path  = PathBuf::from("");
+        if let Some(dir) = binary_path.parent() {
+            enclave_path = dir.join("enclave.signed.so");
+        }
+        let enclave_path = enclave_path;
+        
+        let enclave_path_str = enclave_path
+            .to_str()
+            .ok_or_else(|| Error::PathToString(enclave_path.clone()))?
+            .into();
+        let enclave_name = enclave_path
+            .file_name()
+            .ok_or(Error::CurrentEnclaveName)?
+            .to_os_string()
+            .into_string()
+            .map_err(Error::OsStringToString)?;
+                    
         fs::create_dir_all(&job_work_dir).unwrap();
         let conf_path = job_work_dir.join("config.toml");
         let conf_path = conf_path.to_str().unwrap();
@@ -226,6 +243,18 @@ impl Context {
                     source: e,
                     command: "scp executor".into(),
                 })?;
+
+            // Copy enclave
+            let remote_path = format!("{}:{}/{}", address, job_work_dir_str, enclave_name);
+            
+            Command::new("scp")
+                .args(&[&enclave_path_str, &remote_path])
+                .output()
+                .map_err(|e| Error::CommandOutput {
+                    source: e,
+                    command: "scp executor enclave".into(),
+                })?;
+            // Copy pem??
 
             // Deploy a remote slave:
             let path = format!("{}/{}", job_work_dir_str, binary_name);
@@ -360,11 +389,12 @@ impl Context {
         self: &Arc<Self>,
         seq: I,
         num_slices: usize,
+        secure: bool,
     ) -> SerArc<dyn Rdd<Item = T>>
     where
         I: IntoIterator<Item = T>,
     {
-        self.parallelize(seq, num_slices)
+        self.parallelize(seq, num_slices, secure)
     }
 
     pub fn range(
@@ -373,21 +403,23 @@ impl Context {
         end: u64,
         step: usize,
         num_slices: usize,
+        secure: bool,
     ) -> SerArc<dyn Rdd<Item = u64>> {
         // TODO: input validity check
         let seq = (start..=end).step_by(step);
-        self.parallelize(seq, num_slices)
+        self.parallelize(seq, num_slices, secure)
     }
 
     pub fn parallelize<T: Data, I>(
         self: &Arc<Self>,
         seq: I,
         num_slices: usize,
+        secure: bool,
     ) -> SerArc<dyn Rdd<Item = T>>
     where
         I: IntoIterator<Item = T>,
     {
-        SerArc::new(ParallelCollection::new(self.clone(), seq, num_slices))
+        SerArc::new(ParallelCollection::new(self.clone(), seq, num_slices, secure))
     }
 
     /// Load from a distributed source and turns it into a parallel collection.

@@ -28,6 +28,12 @@ pub enum Error {
 
     #[error("couldn't determine the path to the current binary")]
     CurrentBinaryPath,
+    
+    #[error("couldn't determine the current enclave's name")]
+    CurrentEnclaveName,
+
+    #[error("couldn't determine the path to the current enclave")]
+    CurrentEnclavePath,
 
     #[error("failed trying converting to type {0}")]
     ConversionError(&'static str),

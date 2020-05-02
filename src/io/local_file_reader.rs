@@ -20,6 +20,7 @@ use serde_derive::{Deserialize, Serialize};
 pub struct LocalFsReaderConfig {
     filter_ext: Option<std::ffi::OsString>,
     expect_dir: bool,
+    secure: bool,
     dir_path: PathBuf,
     executor_partitions: Option<u64>,
 }
@@ -30,6 +31,7 @@ impl LocalFsReaderConfig {
         LocalFsReaderConfig {
             filter_ext: None,
             expect_dir: true,
+            secure: true,              //default: need security
             dir_path: path.into(),
             executor_partitions: None,
         }
@@ -100,6 +102,7 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LocalFsReader<T> {
     id: usize,
+    secure: bool,
     path: PathBuf,
     is_single_file: bool,
     filter_ext: Option<std::ffi::OsString>,
@@ -118,6 +121,7 @@ impl<T: Data> LocalFsReader<T> {
         let LocalFsReaderConfig {
             dir_path,
             expect_dir,
+            secure,
             filter_ext,
             executor_partitions,
         } = config;
@@ -133,6 +137,7 @@ impl<T: Data> LocalFsReader<T> {
             is_single_file,
             filter_ext,
             expect_dir,
+            secure,
             executor_partitions,
             splits: context.address_map.clone(),
             context,
@@ -311,6 +316,10 @@ macro_rules! impl_common_lfs_rddb_funcs {
 
         fn get_dependencies(&self) -> Vec<Dependency> {
             vec![]
+        }
+
+        fn get_secure (&self) -> bool {
+            self.secure
         }
 
         fn is_pinned(&self) -> bool {

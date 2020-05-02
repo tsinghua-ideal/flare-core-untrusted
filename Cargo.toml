@@ -1,7 +1,7 @@
 [package]
 name = "native_spark"
 version = "0.1.0"
-authors = ["raja <rajasekar3eg@gmail.com>"]
+authors = ["raja <rajasekar3eg@gmail.com>", "Xiang Li <Xiang.Leee@outlook.com>"]
 edition = "2018"
 
 build = "build.rs"
@@ -59,6 +59,10 @@ serde_traitobject = "0.2.4"
 rusoto_core = { version = "0.43", optional = true }
 rusoto_s3 = { version = "0.43", optional = true }
 
+#rust sgx sdk
+sgx_types = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
+sgx_urts = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
+
 [build-dependencies]
 capnpc = "0.12.1"
 
@@ -67,3 +71,7 @@ async-std = { version = "1.5.0", features = ["attributes"] }
 chrono = "0.4.11"
 parquet = "0.15.1"
 tempfile = "3"
+
+[patch.'https://github.com/apache/teaclave-sgx-sdk.git']
+sgx_types = { path = "../incubator-teaclave-sgx-sdk/sgx_types" }
+sgx_urts = { path = "../incubator-teaclave-sgx-sdk/sgx_urts" }

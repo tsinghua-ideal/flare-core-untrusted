@@ -44,7 +44,7 @@ impl<T: Data, U: Data> CartesianRdd<T, U> {
         rdd1: Arc<dyn Rdd<Item = T>>,
         rdd2: Arc<dyn Rdd<Item = U>>,
     ) -> CartesianRdd<T, U> {
-        let vals = Arc::new(RddVals::new(rdd1.get_context()));
+        let vals = Arc::new(RddVals::new(rdd1.get_context(), rdd1.get_secure()));
         let num_partitions_in_rdd2 = rdd2.number_of_splits();
         CartesianRdd {
             vals,
@@ -81,6 +81,10 @@ impl<T: Data, U: Data> RddBase for CartesianRdd<T, U> {
 
     fn get_dependencies(&self) -> Vec<Dependency> {
         self.vals.dependencies.clone()
+    }
+
+    fn get_secure(&self) -> bool {
+        self.vals.secure
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

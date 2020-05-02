@@ -51,16 +51,18 @@ pub(crate) struct RddVals {
     pub id: usize,
     pub dependencies: Vec<Dependency>,
     should_cache: bool,
+    secure: bool,
     #[serde(skip_serializing, skip_deserializing)]
     pub context: Weak<Context>,
 }
 
 impl RddVals {
-    pub fn new(sc: Arc<Context>) -> Self {
+    pub fn new(sc: Arc<Context>, secure: bool) -> Self {
         RddVals {
             id: sc.new_rdd_id(),
             dependencies: Vec::new(),
             should_cache: false,
+            secure,
             context: Arc::downgrade(&sc),
         }
     }
@@ -79,6 +81,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn get_rdd_id(&self) -> usize;
     fn get_context(&self) -> Arc<Context>;
     fn get_dependencies(&self) -> Vec<Dependency>;
+    fn get_secure(&self) -> bool;
     fn preferred_locations(&self, _split: Box<dyn Split>) -> Vec<Ipv4Addr> {
         Vec::new()
     }
@@ -134,6 +137,9 @@ impl<I: Rdd + ?Sized> RddBase for SerArc<I> {
     }
     fn get_dependencies(&self) -> Vec<Dependency> {
         (**self).get_rdd_base().get_dependencies()
+    }
+    fn get_secure(&self) -> bool {
+        (**self).get_rdd_base().get_secure()
     }
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
