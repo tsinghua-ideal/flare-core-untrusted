@@ -1,7 +1,7 @@
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::cache::BoundedMemoryCache;
 use crate::cache_tracker::CacheTracker;
@@ -15,14 +15,19 @@ use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, Runtime};
 
+use sgx_types::*;
+use sgx_urts::SgxEnclave;
+
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
 type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
 
 const ENV_VAR_PREFIX: &str = "NS_";
+pub const ENCLAVE_FILE: &str = "enclave.signed.so";
 pub(crate) const THREAD_PREFIX: &str = "_NS";
 static CONF: OnceCell<Configuration> = OnceCell::new();
 static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);
+
 
 pub(crate) static SHUFFLE_CACHE: Lazy<ShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
 pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(BoundedMemoryCache::new);
@@ -32,6 +37,7 @@ pub(crate) struct Env {
     pub shuffle_manager: ShuffleManager,
     pub shuffle_fetcher: ShuffleFetcher,
     pub cache_tracker: Arc<CacheTracker>,
+    pub enclave: Arc<Mutex<Option<SgxEnclave>>>,
 }
 
 impl Env {
@@ -80,6 +86,13 @@ impl Env {
             let map_output_tracker = MapOutputTracker::new(conf.is_driver, master_addr);
             let shuffle_manager =
                 ShuffleManager::new().expect("fatal error: failed creating shuffle manager");
+
+            let enclave = match conf.deployment_mode == DeploymentMode::Distributed  && conf.is_driver == true {
+                true => Arc::new(Mutex::new(None)),
+                false => Arc::new(Mutex::new(Some(Env::init_enclave()
+                              .unwrap_or_else(|x| panic!("[-] Init Enclave Failed {}!", x.as_str()))))),
+            };
+
             Env {
                 map_output_tracker,
                 shuffle_manager,
@@ -91,8 +104,24 @@ impl Env {
                     &BOUNDED_MEM_CACHE,
                 )
                 .expect("fatal error: failed creating cache tracker"),
+                enclave,
             }
         })
+    }
+
+    //whether secure flag is set or not, the enclave should be inited and destroyed in the end.
+    fn init_enclave() -> SgxResult<SgxEnclave> {
+        let mut launch_token: sgx_launch_token_t = [0; 1024];
+        let mut launch_token_updated: i32 = 0;
+        // call sgx_create_enclave to initialize an enclave instance
+        // Debug Support: set 2nd parameter to 1
+        let debug = 1;
+        let mut misc_attr = sgx_misc_attribute_t {secs_attr: sgx_attributes_t { flags:0, xfrm:0}, misc_select:0};
+        SgxEnclave::create(ENCLAVE_FILE,
+                           debug,
+                           &mut launch_token,
+                           &mut launch_token_updated,
+                           &mut misc_attr)
     }
 }
 

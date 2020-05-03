@@ -26,6 +26,9 @@ use simplelog::*;
 use uuid::Uuid;
 use Schedulers::*;
 
+use sgx_types::*;
+use sgx_urts::SgxEnclave;
+
 // There is a problem with this approach since T needs to satisfy PartialEq, Eq for Range
 // No such restrictions are needed for Vec
 pub enum Sequence<T> {
@@ -231,7 +234,7 @@ impl Context {
 
         let mut enclave_path  = PathBuf::from("");
         if let Some(dir) = binary_path.parent() {
-            enclave_path = dir.join("enclave.signed.so");
+            enclave_path = dir.join(env::ENCLAVE_FILE);
         }
         let enclave_path = enclave_path;
         
@@ -378,6 +381,9 @@ impl Context {
         // Give some time for the executors to shut down and clean up
         std::thread::sleep(std::time::Duration::from_millis(1_500));
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
+        if let Some(enclave) = std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None) {
+            enclave.destroy();
+        }
         utils::clean_up_work_dir(work_dir);
     }
 
