@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use native_spark::*;
 use once_cell::sync::Lazy;
+use vega::*;
 
 static CONTEXT: Lazy<Arc<Context>> = Lazy::new(|| Context::new().unwrap());
 

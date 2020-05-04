@@ -6,13 +6,13 @@ if [ -z $VERSION ]
 then
 VERSION='latest'
 fi
-PACKAGE="native_spark:${VERSION}"
+PACKAGE="vega:${VERSION}"
 
 
 cd $SCRIPT_PATH && cd ..
 echo "work dir: $(pwd)"
 
-RUST_VERSION="$(cat ./rust-toolchain | tr -d '[:space:]')"
+RUST_VERSION="nightly"
 echo "rust version: $RUST_VERSION"
 
 echo "building $PACKAGE..."

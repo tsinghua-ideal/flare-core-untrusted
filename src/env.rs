@@ -21,9 +21,9 @@ use sgx_urts::SgxEnclave;
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
 type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
 
-const ENV_VAR_PREFIX: &str = "NS_";
 pub const ENCLAVE_FILE: &str = "enclave.signed.so";
-pub(crate) const THREAD_PREFIX: &str = "_NS";
+const ENV_VAR_PREFIX: &str = "VEGA_";
+pub(crate) const THREAD_PREFIX: &str = "_VEGA";
 static CONF: OnceCell<Configuration> = OnceCell::new();
 static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);

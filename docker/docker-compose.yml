@@ -4,8 +4,8 @@ networks:
   native-spark:
 
 services:
-  ns_master:
-    image: native_spark:latest
+  vega_master:
+    image: vega:latest
     ports:
       - "3000"
     tty: true
@@ -16,12 +16,12 @@ services:
         source: "../target"
         target: "/home/dev"
     environment:
-      NS_DEPLOYMENT_MODE: distributed
+      VEGA_DEPLOYMENT_MODE: distributed
     depends_on:
-      - ns_worker
+      - vega_worker
 
-  ns_worker:
-    image: native_spark:latest
+  vega_worker:
+    image: vega:latest
     ports:
       - "10500"
       - "22"
