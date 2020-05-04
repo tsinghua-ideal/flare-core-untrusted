@@ -26,9 +26,6 @@ use simplelog::*;
 use uuid::Uuid;
 use Schedulers::*;
 
-use sgx_types::*;
-use sgx_urts::SgxEnclave;
-
 // There is a problem with this approach since T needs to satisfy PartialEq, Eq for Range
 // No such restrictions are needed for Vec
 pub enum Sequence<T> {
