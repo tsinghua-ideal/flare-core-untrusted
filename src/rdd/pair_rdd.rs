@@ -14,6 +14,7 @@ use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
+use parking_lot::Mutex;
 
 // Trait containing pair rdd methods. No need of implicit conversion like in Spark version.
 pub trait PairRdd<K: Data + Eq + Hash, V: Data>: Rdd<Item = (K, V)> + Send + Sync {
@@ -183,6 +184,7 @@ where
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = (K, V)>>,
     vals: Arc<RddVals>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     f: F,
     _marker_t: PhantomData<K>, // phantom data is necessary because of type parameter T
     _marker_v: PhantomData<V>,
@@ -197,6 +199,7 @@ where
         MappedValuesRdd {
             prev: self.prev.clone(),
             vals: self.vals.clone(),
+            ecall_ids: self.ecall_ids.clone(),
             f: self.f.clone(),
             _marker_t: PhantomData,
             _marker_v: PhantomData,
@@ -216,9 +219,11 @@ where
                 OneToOneDependency::new(prev.get_rdd_base()),
             )));
         let vals = Arc::new(vals);
+        let ecall_ids = prev.get_ecall_ids();
         MappedValuesRdd {
             prev,
             vals,
+            ecall_ids,
             f,
             _marker_t: PhantomData,
             _marker_v: PhantomData,
@@ -243,6 +248,16 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.ecall_ids.clone()
+    }
+
+    fn insert_ecall_id(&self) {
+        if self.vals.secure {
+            self.ecall_ids.lock().push(self.vals.id);
+        }
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -300,6 +315,7 @@ where
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = (K, V)>>,
     vals: Arc<RddVals>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     f: F,
     _marker_t: PhantomData<K>, // phantom data is necessary because of type parameter T
     _marker_v: PhantomData<V>,
@@ -314,6 +330,7 @@ where
         FlatMappedValuesRdd {
             prev: self.prev.clone(),
             vals: self.vals.clone(),
+            ecall_ids: self.ecall_ids.clone(),
             f: self.f.clone(),
             _marker_t: PhantomData,
             _marker_v: PhantomData,
@@ -333,9 +350,11 @@ where
                 OneToOneDependency::new(prev.get_rdd_base()),
             )));
         let vals = Arc::new(vals);
+        let ecall_ids = prev.get_ecall_ids();
         FlatMappedValuesRdd {
             prev,
             vals,
+            ecall_ids,
             f,
             _marker_t: PhantomData,
             _marker_v: PhantomData,
@@ -360,6 +379,17 @@ where
     fn get_secure(&self) -> bool {
         self.vals.secure
     }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.ecall_ids.clone()
+    }
+
+    fn insert_ecall_id(&self) {
+        if self.vals.secure {
+            self.ecall_ids.lock().push(self.vals.id);
+        }
+    }
+
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()
     }

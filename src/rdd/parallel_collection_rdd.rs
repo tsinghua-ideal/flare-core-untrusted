@@ -2,6 +2,7 @@
 use std::sync::{Arc, Weak};
 
 use crate::context::Context;
+use crate::env::Env;
 use crate::dependency::Dependency;
 use crate::error::Result;
 use crate::rdd::{Rdd, RddBase, RddVals};
@@ -9,6 +10,7 @@ use crate::serializable_traits::{AnyData, Data};
 use crate::split::Split;
 use parking_lot::Mutex;
 use serde_derive::{Deserialize, Serialize};
+use sgx_types::*;
 
 /// A collection of objects which can be sliced into partitions with a partitioning function.
 pub trait Chunkable<D>
@@ -24,6 +26,22 @@ where
         let as_many_parts_as_cpus = num_cpus::get();
         self.slice_with_set_parts(as_many_parts_as_cpus)
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct DataAndFuncId<T> { //need to be revised
+    pub data: Vec<T>,
+    pub ecall_ids: Vec<usize>,
+}
+
+extern "C" {
+    fn secure_executing(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        input: *const u8,
+        in_len: usize,
+        output: *mut u8,
+    ) -> sgx_status_t;
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -53,11 +71,56 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let len = data.len();
         Box::new((0..len).map(move |i| data[i].clone()))
     }
+
+    pub fn secure_iterator(&self, ecall_ids: Arc<Mutex<Vec<usize>>>) -> Vec<u8> {
+        let data = self.values.clone();  
+        let len = data.len();
+        
+        let ecall_ids = (*ecall_ids.lock()).clone();
+        let data_and_fid = DataAndFuncId { 
+            data: (0..len).map(move |i| data[i].clone()).collect(),
+            ecall_ids, 
+        };
+        
+        let serialized_data_and_fid: Vec<u8> = bincode::serialize(&data_and_fid).unwrap();
+        let cap = 1 << (7+10+10);  //128MB
+        
+        let mut serialized_result = Vec::<u8>::with_capacity(cap);
+        //let p = serialized_result.as_mut_ptr();
+        let (ptr, _, cap) = serialized_result.into_raw_parts();
+        let mut retval = cap;
+        log::debug!("ecall");
+        let sgx_status = unsafe {
+            secure_executing(
+                Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                &mut retval,
+                serialized_data_and_fid.as_ptr() as *const u8,
+                serialized_data_and_fid.len(),
+                ptr as *mut u8,
+            )
+        };
+        serialized_result = unsafe { 
+            Vec::from_raw_parts(ptr, retval, cap)
+        };
+        log::debug!("retval = {}, result = {:?}, len = {}, cap = {}", retval, serialized_result, serialized_result.len(), serialized_result.capacity());
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            },
+        };
+        log::debug!("shrink");
+        serialized_result.shrink_to_fit();
+        log::debug!("out secure_iterator");
+        serialized_result
+
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct ParallelCollectionVals<T> {
     vals: Arc<RddVals>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     #[serde(skip_serializing, skip_deserializing)]
     context: Weak<Context>,
     splits_: Vec<Arc<Vec<T>>>,
@@ -90,6 +153,7 @@ impl<T: Data> ParallelCollection<T> {
             rdd_vals: Arc::new(ParallelCollectionVals {
                 context: Arc::downgrade(&context),
                 vals: Arc::new(RddVals::new(context.clone(), secure)), //chain of security
+                ecall_ids: Arc::new(Mutex::new(Vec::new())),
                 splits_: ParallelCollection::slice(data, num_slices),
                 num_slices, //field init shorthand
             }),
@@ -104,6 +168,7 @@ impl<T: Data> ParallelCollection<T> {
         let rdd_vals = ParallelCollectionVals {
             context: Arc::downgrade(&context),
             vals: Arc::new(RddVals::new(context.clone(), secure)),
+            ecall_ids: Arc::new(Mutex::new(Vec::new())),
             num_slices: splits_.len(),
             splits_,
         };
@@ -181,6 +246,15 @@ impl<T: Data> RddBase for ParallelCollection<T> {
     
     fn get_secure(&self) -> bool {
         self.rdd_vals.vals.secure
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.rdd_vals.ecall_ids.clone()
+    }
+    fn insert_ecall_id(&self) {
+        if self.rdd_vals.vals.secure {
+            self.rdd_vals.ecall_ids.lock().push(self.rdd_vals.vals.id);
+        }
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

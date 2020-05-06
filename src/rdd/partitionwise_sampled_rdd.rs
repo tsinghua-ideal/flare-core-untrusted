@@ -9,12 +9,14 @@ use crate::utils::random::RandomSampler;
 use serde_derive::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use parking_lot::Mutex;
 
 #[derive(Serialize, Deserialize)]
 pub struct PartitionwiseSampledRdd<T: Data> {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = T>>,
     vals: Arc<RddVals>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     #[serde(with = "serde_traitobject")]
     sampler: Arc<dyn RandomSampler<T>>,
     preserves_partitioning: bool,
@@ -33,10 +35,12 @@ impl<T: Data> PartitionwiseSampledRdd<T> {
                 OneToOneDependency::new(prev.get_rdd_base()),
             )));
         let vals = Arc::new(vals);
+        let ecall_ids = prev.get_ecall_ids();
 
         PartitionwiseSampledRdd {
             prev,
             vals,
+            ecall_ids,
             sampler,
             preserves_partitioning,
             _marker_t: PhantomData,
@@ -49,6 +53,7 @@ impl<T: Data> Clone for PartitionwiseSampledRdd<T> {
         PartitionwiseSampledRdd {
             prev: self.prev.clone(),
             vals: self.vals.clone(),
+            ecall_ids: self.ecall_ids.clone(),
             sampler: self.sampler.clone(),
             preserves_partitioning: self.preserves_partitioning,
             _marker_t: PhantomData,
@@ -71,6 +76,16 @@ impl<T: Data> RddBase for PartitionwiseSampledRdd<T> {
 
     fn get_secure(&self) -> bool {
         self.vals.secure
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.ecall_ids.clone()
+    }
+
+    fn insert_ecall_id(&self) {
+        if self.vals.secure {
+            self.ecall_ids.lock().push(self.vals.id);
+        }
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

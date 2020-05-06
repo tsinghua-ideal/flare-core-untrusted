@@ -24,6 +24,7 @@ use fasthash::MetroHasher;
 use rand::{Rng, SeedableRng};
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
+use parking_lot::Mutex;
 
 mod parallel_collection_rdd;
 pub use parallel_collection_rdd::*;
@@ -93,6 +94,8 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     }
     fn get_dependencies(&self) -> Vec<Dependency>;
     fn get_secure(&self) -> bool;
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>>;
+    fn insert_ecall_id(&self);
     fn preferred_locations(&self, _split: Box<dyn Split>) -> Vec<Ipv4Addr> {
         Vec::new()
     }
@@ -152,6 +155,12 @@ impl<I: Rdd + ?Sized> RddBase for SerArc<I> {
     fn get_secure(&self) -> bool {
         (**self).get_rdd_base().get_secure()
     }
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        (**self).get_rdd_base().get_ecall_ids()
+    }
+    fn insert_ecall_id(&self) {
+        (**self).get_rdd_base().insert_ecall_id();
+    }
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
@@ -186,7 +195,25 @@ pub trait Rdd: RddBase + 'static {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>>;
 
     fn iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
-        self.compute(split)
+        match self.get_secure() { 
+            false => self.compute(split),
+            true => {
+                if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<i32>>() //tmp for i32
+                {
+                    log::debug!("begin secure_iterator");
+                    let serialized_result = s.secure_iterator(self.get_ecall_ids());
+                    log::debug!("begin deserialize");
+                    let result: Vec<Self::Item> = bincode::deserialize(&serialized_result[..]).unwrap();
+                    log::debug!("begin box new into_iter");
+                    let result = Box::new(result.into_iter());
+                    Ok(result)
+                } else {
+                    panic!(
+                        "Got split object from different concrete type other than ParallelCollectionSplit"
+                    )
+                }
+            }
+        }
     }
 
     /// Return a new RDD containing only the elements that satisfy a predicate.

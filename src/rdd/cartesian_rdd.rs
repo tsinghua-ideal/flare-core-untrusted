@@ -9,6 +9,7 @@ use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use parking_lot::Mutex;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct CartesianSplit {
@@ -34,6 +35,7 @@ pub struct CartesianRdd<T: Data, U: Data> {
     rdd1: Arc<dyn Rdd<Item = T>>,
     #[serde(with = "serde_traitobject")]
     rdd2: Arc<dyn Rdd<Item = U>>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     num_partitions_in_rdd2: usize,
     _marker_t: PhantomData<T>,
     _market_u: PhantomData<U>,
@@ -45,11 +47,13 @@ impl<T: Data, U: Data> CartesianRdd<T, U> {
         rdd2: Arc<dyn Rdd<Item = U>>,
     ) -> CartesianRdd<T, U> {
         let vals = Arc::new(RddVals::new(rdd1.get_context(), rdd1.get_secure()));
+        let ecall_ids = rdd1.get_ecall_ids();
         let num_partitions_in_rdd2 = rdd2.number_of_splits();
         CartesianRdd {
             vals,
             rdd1,
             rdd2,
+            ecall_ids,
             num_partitions_in_rdd2,
             _marker_t: PhantomData,
             _market_u: PhantomData,
@@ -63,6 +67,7 @@ impl<T: Data, U: Data> Clone for CartesianRdd<T, U> {
             vals: self.vals.clone(),
             rdd1: self.rdd1.clone(),
             rdd2: self.rdd2.clone(),
+            ecall_ids: self.ecall_ids.clone(),
             num_partitions_in_rdd2: self.num_partitions_in_rdd2,
             _marker_t: PhantomData,
             _market_u: PhantomData,
@@ -85,6 +90,16 @@ impl<T: Data, U: Data> RddBase for CartesianRdd<T, U> {
 
     fn get_secure(&self) -> bool {
         self.vals.secure
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.ecall_ids.clone()
+    }
+
+    fn insert_ecall_id(&self) {
+        if self.vals.secure {
+            self.ecall_ids.lock().push(self.vals.id);
+        }
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

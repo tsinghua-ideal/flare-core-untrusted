@@ -124,6 +124,7 @@ where
     vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
     parent: Arc<dyn Rdd<Item = T>>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     max_partitions: usize,
 }
 
@@ -133,9 +134,11 @@ impl<T: Data> CoalescedRdd<T> {
     /// max_partitions: number of desired partitions in the coalesced RDD
     pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, max_partitions: usize) -> Self {
         let vals = RddVals::new(prev.get_context(), prev.get_secure());
+        let ecall_ids = prev.get_ecall_ids();
         CoalescedRdd {
             vals: Arc::new(vals),
             parent: prev,
+            ecall_ids,
             max_partitions,
         }
     }
@@ -179,6 +182,16 @@ impl<T: Data> RddBase for CoalescedRdd<T> {
 
     fn get_secure(&self) -> bool {
         self.vals.secure
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.ecall_ids.clone()
+    }
+
+    fn insert_ecall_id(&self) {
+        if self.vals.secure {
+            self.ecall_ids.lock().push(self.vals.id);
+        }
     }
 
     /// Returns the preferred machine for the partition. If split is of type CoalescedRddSplit,

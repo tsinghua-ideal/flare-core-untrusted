@@ -157,6 +157,7 @@ where
         + Clone,
 {
     fn run(&self, id: usize) -> SerBox<dyn AnyData> {
+        log::debug!("resulttask runs");
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
         SerBox::new((self.func)((context, self.rdd.iterator(split).unwrap())))

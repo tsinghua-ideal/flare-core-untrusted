@@ -13,6 +13,7 @@ use crate::serializable_traits::{AnyData, Data};
 use crate::shuffle::ShuffleFetcher;
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
+use parking_lot::Mutex;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ShuffledRddSplit {
@@ -38,6 +39,7 @@ pub struct ShuffledRdd<K: Data + Eq + Hash, V: Data, C: Data> {
     #[serde(with = "serde_traitobject")]
     aggregator: Arc<Aggregator<K, V, C>>,
     vals: Arc<RddVals>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     #[serde(with = "serde_traitobject")]
     part: Box<dyn Partitioner>,
     shuffle_id: usize,
@@ -49,6 +51,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Clone for ShuffledRdd<K, V, C> {
             parent: self.parent.clone(),
             aggregator: self.aggregator.clone(),
             vals: self.vals.clone(),
+            ecall_ids: self.ecall_ids.clone(),
             part: self.part.clone(),
             shuffle_id: self.shuffle_id,
         }
@@ -63,6 +66,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffledRdd<K, V, C> {
     ) -> Self {
         let ctx = parent.get_context();
         let secure = parent.get_secure();   //temp
+        let ecall_ids = parent.get_ecall_ids();
         let shuffle_id = ctx.new_shuffle_id();
         let mut vals = RddVals::new(ctx, secure);
 
@@ -81,6 +85,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffledRdd<K, V, C> {
             parent,
             aggregator,
             vals,
+            ecall_ids,
             part,
             shuffle_id,
         }
@@ -102,6 +107,16 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> RddBase for ShuffledRdd<K, V, C> {
 
     fn get_secure(&self) -> bool {
         self.vals.secure
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.ecall_ids.clone()
+    }
+
+    fn insert_ecall_id(&self) {
+        if self.vals.secure {
+            self.ecall_ids.lock().push(self.vals.id);
+        }
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

@@ -12,6 +12,7 @@ use crate::rdd::union_rdd::UnionVariants::{NonUniquePartitioner, PartitionerAwar
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data};
 use crate::split::Split;
+use parking_lot::Mutex;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct UnionSplit<T: 'static> {
@@ -74,6 +75,7 @@ enum UnionVariants<T: 'static> {
     NonUniquePartitioner {
         rdds: Vec<SerArc<dyn Rdd<Item = T>>>,
         vals: Arc<RddVals>,
+        ecall_ids: Arc<Mutex<Vec<usize>>>,
     },
     /// An RDD that can take multiple RDDs partitioned by the same partitioner and
     /// unify them into a single RDD while preserving the partitioner. So m RDDs with p partitions each
@@ -81,6 +83,7 @@ enum UnionVariants<T: 'static> {
     PartitionerAware {
         rdds: Vec<SerArc<dyn Rdd<Item = T>>>,
         vals: Arc<RddVals>,
+        ecall_ids: Arc<Mutex<Vec<usize>>>,
         #[serde(with = "serde_traitobject")]
         part: Box<dyn Partitioner>,
     },
@@ -89,15 +92,17 @@ enum UnionVariants<T: 'static> {
 impl<T: Data> Clone for UnionVariants<T> {
     fn clone(&self) -> Self {
         match self {
-            NonUniquePartitioner { rdds, vals, .. } => NonUniquePartitioner {
+            NonUniquePartitioner { rdds, vals, ecall_ids, .. } => NonUniquePartitioner {
                 rdds: rdds.clone(),
                 vals: vals.clone(),
+                ecall_ids: ecall_ids.clone(),
             },
             PartitionerAware {
-                rdds, vals, part, ..
+                rdds, vals, ecall_ids, part, ..
             } => PartitionerAware {
                 rdds: rdds.clone(),
                 vals: vals.clone(),
+                ecall_ids: ecall_ids.clone(),
                 part: part.clone(),
             },
         }
@@ -132,6 +137,7 @@ impl<T: Data> UnionVariants<T> {
             Ok(NonUniquePartitioner {
                 rdds: final_rdds,
                 vals,
+                ecall_ids: rdds[0].get_ecall_ids(),
             })
         } else {
             let part = rdds[0].partitioner().ok_or(Error::LackingPartitioner)?;
@@ -150,6 +156,7 @@ impl<T: Data> UnionVariants<T> {
             Ok(PartitionerAware {
                 rdds: final_rdds,
                 vals,
+                ecall_ids: rdds[0].get_ecall_ids(),
                 part,
             })
         }
@@ -220,6 +227,26 @@ impl<T: Data> RddBase for UnionRdd<T> {
         match &self.0 {
             NonUniquePartitioner { vals, .. } => vals.secure,
             PartitionerAware { vals, .. } => vals.secure,
+        }
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        match &self.0 {
+            NonUniquePartitioner { ecall_ids, .. } => ecall_ids.clone(),
+            PartitionerAware { ecall_ids, .. } => ecall_ids.clone(),
+        }
+    }
+
+    fn insert_ecall_id(&self) {
+        match &self.0 {
+            NonUniquePartitioner { vals, ecall_ids, .. } =>         
+                if vals.secure {
+                    ecall_ids.lock().push(vals.id);
+                }
+            PartitionerAware { vals, ecall_ids, .. } =>
+                if vals.secure {
+                    ecall_ids.lock().push(vals.id);
+                }
         }
     }
 

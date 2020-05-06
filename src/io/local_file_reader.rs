@@ -16,6 +16,7 @@ use crate::Fn;
 use log::debug;
 use rand::prelude::*;
 use serde_derive::{Deserialize, Serialize};
+use parking_lot::Mutex;
 
 pub struct LocalFsReaderConfig {
     filter_ext: Option<std::ffi::OsString>,
@@ -107,6 +108,7 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
 pub struct LocalFsReader<T> {
     id: usize,
     secure: bool,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     path: PathBuf,
     is_single_file: bool,
     filter_ext: Option<std::ffi::OsString>,
@@ -142,6 +144,7 @@ impl<T: Data> LocalFsReader<T> {
             filter_ext,
             expect_dir,
             secure,
+            ecall_ids: Arc::new(Mutex::new(Vec::new())),
             executor_partitions,
             splits: context.address_map.clone(),
             context,
@@ -324,6 +327,16 @@ macro_rules! impl_common_lfs_rddb_funcs {
 
         fn get_secure (&self) -> bool {
             self.secure
+        }
+
+        fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+            self.ecall_ids.clone()
+        }
+
+        fn insert_ecall_id(&self) {
+            if self.secure {
+                self.ecall_ids.lock().push(self.id);
+            }
         }
 
         fn is_pinned(&self) -> bool {

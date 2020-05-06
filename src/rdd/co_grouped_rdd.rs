@@ -66,6 +66,7 @@ impl Split for CoGroupSplit {
 pub struct CoGroupedRdd<K: Data> {
     pub(crate) vals: Arc<RddVals>,
     pub(crate) rdds: Vec<SerArc<dyn RddBase>>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     #[serde(with = "serde_traitobject")]
     pub(crate) part: Box<dyn Partitioner>,
     _marker: PhantomData<K>,
@@ -127,9 +128,11 @@ impl<K: Data + Eq + Hash> CoGroupedRdd<K> {
         }
         vals.dependencies = deps;
         let vals = Arc::new(vals);
+        let ecall_ids = rdds[0].get_ecall_ids();
         CoGroupedRdd {
             vals,
             rdds,
+            ecall_ids,
             part,
             _marker: PhantomData,
         }
@@ -151,6 +154,16 @@ impl<K: Data + Eq + Hash> RddBase for CoGroupedRdd<K> {
 
     fn get_secure(&self) -> bool {
         self.vals.secure
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.ecall_ids.clone()
+    }
+
+    fn insert_ecall_id(&self) {
+        if self.vals.secure {
+            self.ecall_ids.lock().push(self.vals.id);
+        }
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {

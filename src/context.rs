@@ -343,6 +343,10 @@ impl Context {
             }
             Err(err) => Context::worker_clean_up_directives(Err(err), work_dir)?,
         }
+        
+        if (*env::Env::get().enclave).lock().unwrap().is_some() {
+            log::debug!("worker inits enclave successfully");
+        }
 
         log::debug!("starting worker");
         let port = match env::Configuration::get()
@@ -360,6 +364,9 @@ impl Context {
 
     fn worker_clean_up_directives(run_result: Result<Signal>, work_dir: PathBuf) -> Result<!> {
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
+        if let Some(enclave) = std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None) {
+            enclave.destroy();
+        } 
         utils::clean_up_work_dir(&work_dir);
         match run_result {
             Err(err) => {

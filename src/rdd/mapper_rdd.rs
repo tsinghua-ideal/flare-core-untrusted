@@ -21,6 +21,7 @@ where
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = T>>,
     vals: Arc<RddVals>,
+    ecall_ids: Arc<Mutex<Vec<usize>>>,
     f: F,
     pinned: AtomicBool,
     _marker_t: PhantomData<T>, // phantom data is necessary because of type parameter T
@@ -35,6 +36,7 @@ where
         MapperRdd {
             name: Mutex::new(self.name.lock().clone()),
             prev: self.prev.clone(),
+            ecall_ids: self.ecall_ids.clone(),
             vals: self.vals.clone(),
             f: self.f.clone(),
             pinned: AtomicBool::new(self.pinned.load(SeqCst)),
@@ -54,9 +56,11 @@ where
                 OneToOneDependency::new(prev.get_rdd_base()),
             )));
         let vals = Arc::new(vals);
+        let ecall_ids = prev.get_ecall_ids();
         MapperRdd {
             name: Mutex::new("map".to_owned()),
             prev,
+            ecall_ids,
             vals,
             f,
             pinned: AtomicBool::new(false),
@@ -97,6 +101,16 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
+    }
+
+    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.ecall_ids.clone()
+    }
+
+    fn insert_ecall_id(&self) {
+        if self.vals.secure {
+            self.ecall_ids.lock().push(self.vals.id);
+        }
     }
 
     fn preferred_locations(&self, split: Box<dyn Split>) -> Vec<Ipv4Addr> {
