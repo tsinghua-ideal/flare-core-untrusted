@@ -21,7 +21,6 @@ use sgx_urts::SgxEnclave;
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
 type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
 
-pub const ENCLAVE_FILE: &str = "enclave.signed.so";
 const ENV_VAR_PREFIX: &str = "VEGA_";
 pub(crate) const THREAD_PREFIX: &str = "_VEGA";
 static CONF: OnceCell<Configuration> = OnceCell::new();
@@ -38,6 +37,7 @@ pub(crate) struct Env {
     pub shuffle_fetcher: ShuffleFetcher,
     pub cache_tracker: Arc<CacheTracker>,
     pub enclave: Arc<Mutex<Option<SgxEnclave>>>,
+    pub enclave_path: PathBuf,
 }
 
 impl Env {
@@ -87,9 +87,22 @@ impl Env {
             let shuffle_manager =
                 ShuffleManager::new().expect("fatal error: failed creating shuffle manager");
 
+            let binary_path = std::env::current_exe()
+                .unwrap_or_else(|_| panic!("CurrentBinaryPath error"));
+            let mut enclave_path  = PathBuf::from("");
+            if let Some(dir) = binary_path.parent() {
+                enclave_path = dir.join("enclave.signed.so");
+            }
+            if !enclave_path.exists(){
+                log::debug!("enclave.signed.so not found");
+                panic!("enclave.signed.so not found!");
+            }
+            let enclave_path_str = enclave_path
+                .to_str()
+                .unwrap_or_else(|| panic!("env::Env enclave PathBuf2str error"));
             let enclave = match conf.deployment_mode == DeploymentMode::Distributed  && conf.is_driver == true {
                 true => Arc::new(Mutex::new(None)),
-                false => Arc::new(Mutex::new(Some(Env::init_enclave()
+                false => Arc::new(Mutex::new(Some(Env::init_enclave(&enclave_path_str)
                               .unwrap_or_else(|x| panic!("[-] Init Enclave Failed {}!", x.as_str()))))),
             };
 
@@ -105,19 +118,20 @@ impl Env {
                 )
                 .expect("fatal error: failed creating cache tracker"),
                 enclave,
+                enclave_path,
             }
         })
     }
 
     //whether secure flag is set or not, the enclave should be inited and destroyed in the end.
-    fn init_enclave() -> SgxResult<SgxEnclave> {
+    fn init_enclave(enclave_path_str: &str) -> SgxResult<SgxEnclave> {
         let mut launch_token: sgx_launch_token_t = [0; 1024];
         let mut launch_token_updated: i32 = 0;
         // call sgx_create_enclave to initialize an enclave instance
         // Debug Support: set 2nd parameter to 1
         let debug = 1;
         let mut misc_attr = sgx_misc_attribute_t {secs_attr: sgx_attributes_t { flags:0, xfrm:0}, misc_select:0};
-        SgxEnclave::create(ENCLAVE_FILE,
+        SgxEnclave::create(enclave_path_str,
                            debug,
                            &mut launch_token,
                            &mut launch_token_updated,

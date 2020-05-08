@@ -231,7 +231,7 @@ impl Context {
 
         let mut enclave_path  = PathBuf::from("");
         if let Some(dir) = binary_path.parent() {
-            enclave_path = dir.join(env::ENCLAVE_FILE);
+            enclave_path = dir.join("enclave.signed.so");
         }
         let enclave_path = enclave_path;
         
