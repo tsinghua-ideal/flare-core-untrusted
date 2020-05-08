@@ -26,6 +26,7 @@ use simplelog::*;
 use uuid::Uuid;
 use Schedulers::*;
 
+pub const PRI_KEY_LOC: &str =  "/home/lixiang/.ssh/124.9";
 // There is a problem with this approach since T needs to satisfy PartialEq, Eq for Range
 // No such restrictions are needed for Vec
 pub enum Sequence<T> {
@@ -220,8 +221,7 @@ impl Context {
         let binary_path = std::env::current_exe().map_err(|_| Error::CurrentBinaryPath)?;
         let binary_path_str = binary_path
             .to_str()
-            .ok_or_else(|| Error::PathToString(binary_path.clone()))?
-            .into();
+            .ok_or_else(|| Error::PathToString(binary_path.clone()))?;
         let binary_name = binary_path
             .file_name()
             .ok_or(Error::CurrentBinaryName)?
@@ -237,8 +237,7 @@ impl Context {
         
         let enclave_path_str = enclave_path
             .to_str()
-            .ok_or_else(|| Error::PathToString(enclave_path.clone()))?
-            .into();
+            .ok_or_else(|| Error::PathToString(enclave_path.clone()))?;
         let enclave_name = enclave_path
             .file_name()
             .ok_or(Error::CurrentEnclaveName)?
@@ -261,30 +260,33 @@ impl Context {
                 .map_err(|x| Error::ParseHostAddress(format!("{}", x)))?;
             address_map.push(SocketAddrV4::new(address_ip, port));
 
+            log::debug!("creating workdir");
             // Create work dir:
             Command::new("ssh")
-                .args(&[address, "mkdir", &job_work_dir_str])
+                .args(&["-i", PRI_KEY_LOC, address, "mkdir", &job_work_dir_str])
                 .output()
                 .map_err(|e| Error::CommandOutput {
                     source: e,
                     command: "ssh mkdir".into(),
                 })?;
 
+            log::debug!("copy conf file to remote");
             // Copy conf file to remote:
             Context::create_workers_config_file(address_ip, port, conf_path)?;
             let remote_path = format!("{}:{}/config.toml", address, job_work_dir_str);
             Command::new("scp")
-                .args(&[conf_path, &remote_path])
+                .args(&["-i", PRI_KEY_LOC, conf_path, &remote_path])
                 .output()
                 .map_err(|e| Error::CommandOutput {
                     source: e,
                     command: "scp config".into(),
                 })?;
 
+            log::debug!("copy binary");
             // Copy binary:
             let remote_path = format!("{}:{}/{}", address, job_work_dir_str, binary_name);
             Command::new("scp")
-                .args(&[&binary_path_str, &remote_path])
+                .args(&["-i", PRI_KEY_LOC, &binary_path_str, &remote_path])
                 .output()
                 .map_err(|e| Error::CommandOutput {
                     source: e,
@@ -293,9 +295,9 @@ impl Context {
 
             // Copy enclave
             let remote_path = format!("{}:{}/{}", address, job_work_dir_str, enclave_name);
-            
+            log::debug!("copy enclave");
             Command::new("scp")
-                .args(&[&enclave_path_str, &remote_path])
+                .args(&["-i", PRI_KEY_LOC, &enclave_path_str, &remote_path])
                 .output()
                 .map_err(|e| Error::CommandOutput {
                     source: e,
@@ -303,11 +305,12 @@ impl Context {
                 })?;
             // Copy pem??
 
+            log::debug!("deploy a remote slave");
             // Deploy a remote slave:
             let path = format!("{}/{}", job_work_dir_str, binary_name);
             log::debug!("remote path {}", path);
             Command::new("ssh")
-                .args(&[address, &path])
+                .args(&["-i", PRI_KEY_LOC, address, &path])
                 .spawn()
                 .map_err(|e| Error::CommandOutput {
                     source: e,

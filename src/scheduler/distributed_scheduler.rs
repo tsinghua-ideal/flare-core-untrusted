@@ -395,6 +395,7 @@ impl NativeScheduler for DistributedScheduler {
         tokio::spawn(async move {
             let mut num_retries = 0;
             loop {
+                log::debug!("target_executor: {:?}", target_executor);
                 match TcpStream::connect(&target_executor).await {
                     Ok(mut stream) => {
                         let (reader, writer) = stream.split();
