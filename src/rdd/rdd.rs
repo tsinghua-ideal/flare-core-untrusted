@@ -198,13 +198,11 @@ pub trait Rdd: RddBase + 'static {
         match self.get_secure() { 
             false => self.compute(split),
             true => {
-                if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<i32>>() //tmp for i32
+                //TODO: i32 may need revised.
+                if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<i32>>() 
                 {
-                    log::debug!("begin secure_iterator");
                     let serialized_result = s.secure_iterator(self.get_ecall_ids());
-                    log::debug!("begin deserialize");
                     let result: Vec<Self::Item> = bincode::deserialize(&serialized_result[..]).unwrap();
-                    log::debug!("begin box new into_iter");
                     let result = Box::new(result.into_iter());
                     Ok(result)
                 } else {
