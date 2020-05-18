@@ -201,10 +201,7 @@ pub trait Rdd: RddBase + 'static {
                 //TODO: i32 may need revised.
                 if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<i32>>() 
                 {
-                    let serialized_result = s.secure_iterator(self.get_ecall_ids());
-                    let result: Vec<Self::Item> = bincode::deserialize(&serialized_result[..]).unwrap();
-                    let result = Box::new(result.into_iter());
-                    Ok(result)
+                    s.secure_iterator::<Self::Item>(self.get_ecall_ids())
                 } else {
                     panic!(
                         "Got split object from different concrete type other than ParallelCollectionSplit"

@@ -28,16 +28,12 @@ where
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-pub struct DataAndFuncId<T> { //need to be revised
-    pub data: Vec<T>,
-    pub ecall_ids: Vec<usize>,
-}
-
 extern "C" {
     fn secure_executing(
         eid: sgx_enclave_id_t,
         retval: *mut usize,
+        ecall_ids: *const u8,
+        id_len: usize,
         input: *const u8,
         in_len: usize,
         output: *mut u8,
@@ -72,47 +68,62 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    pub fn secure_iterator(&self, ecall_ids: Arc<Mutex<Vec<usize>>>) -> Vec<u8> {
+    pub fn secure_iterator<R: Data>(&self, ecall_ids: Arc<Mutex<Vec<usize>>>) -> Result<Box<dyn Iterator<Item = R>>> {
         let data = self.values.clone();  
         let len = data.len();
-        
-        let ecall_ids = (*ecall_ids.lock()).clone();
-        let data_and_fid = DataAndFuncId { 
-            data: (0..len).map(move |i| data[i].clone()).collect(),
-            ecall_ids, 
-        };
-        
-        let serialized_data_and_fid: Vec<u8> = bincode::serialize(&data_and_fid).unwrap();
+        let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
+        let data_size = std::mem::size_of_val(&data[0]);  //may need revising when the type of element is not trivial
+
+        let ecall_ids: Vec<usize> = (*ecall_ids.lock()).clone();
+        let id_size = std::mem::size_of::<usize>();
+
         let cap = 1 << (7+10+10);  //128MB
         
-        let mut serialized_result = Vec::<u8>::with_capacity(cap);
-        //let p = serialized_result.as_mut_ptr();
-        let (ptr, _, cap) = serialized_result.into_raw_parts();
-        let mut retval = cap;
-        log::debug!("ecall");
-        let sgx_status = unsafe {
-            secure_executing(
-                Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                &mut retval,
-                serialized_data_and_fid.as_ptr() as *const u8,
-                serialized_data_and_fid.len(),
-                ptr as *mut u8,
-            )
-        };
-        serialized_result = unsafe { 
-            Vec::from_raw_parts(ptr, retval, cap)
-        };
-        log::debug!("retval = {}, result = {:?}, len = {}, cap = {}", retval, serialized_result, serialized_result.len(), serialized_result.capacity());
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            },
-        };
-        log::debug!("shrink");
-        serialized_result.shrink_to_fit();
-        log::debug!("out secure_iterator");
-        serialized_result
+        //it's needed without partition
+        //let cap = cap << 5; 
+        
+        //partition
+        let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
+        //let block_len = (1 << (5)) / data_size; 
+        let mut cur = 0;
+        let mut result: Vec<R> = Vec::new();
+        while cur < len {
+            let next = match cur + block_len > len {
+                true => len,
+                false => cur + block_len,
+            };
+
+            let serialized_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
+            let mut serialized_result_bl = Vec::<u8>::with_capacity(cap);
+            let ptr = serialized_result_bl.as_mut_ptr();
+            let mut retval = cap;
+            let sgx_status = unsafe {
+                secure_executing(
+                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                    &mut retval,
+                    ecall_ids.as_ptr() as *const u8,
+                    ecall_ids.len() * id_size,
+                    serialized_block.as_ptr() as *const u8,
+                    serialized_block.len(),
+                    ptr as *mut u8,
+                )
+            };
+            unsafe {
+                serialized_result_bl.set_len(retval);
+            }
+            //log::info!("retval = {}, result = {:?}, len = {}, cap = {}", retval, serialized_result_bl, serialized_result_bl.len(), serialized_result_bl.capacity());
+            match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            serialized_result_bl.shrink_to_fit();
+            let mut result_bl: Vec<R> = bincode::deserialize(&serialized_result_bl[..]).unwrap();
+            result.append(&mut result_bl);
+            cur = next;  
+        }
+        Ok(Box::new(result.into_iter()))
 
     }
 }
