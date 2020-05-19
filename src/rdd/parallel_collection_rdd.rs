@@ -68,7 +68,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    pub fn secure_iterator<R: Data>(&self, ecall_ids: Arc<Mutex<Vec<usize>>>) -> Result<Box<dyn Iterator<Item = R>>> {
+    fn secure_iterator(&self, ecall_ids: Arc<Mutex<Vec<usize>>>) -> Vec<Vec<u8>> {
         let data = self.values.clone();  
         let len = data.len();
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
@@ -86,7 +86,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
         //let block_len = (1 << (5)) / data_size; 
         let mut cur = 0;
-        let mut result: Vec<R> = Vec::new();
+        let mut serialized_result = Vec::new();
         while cur < len {
             let next = match cur + block_len > len {
                 true => len,
@@ -119,12 +119,11 @@ impl<T: Data> ParallelCollectionSplit<T> {
                 },
             };
             serialized_result_bl.shrink_to_fit();
-            let mut result_bl: Vec<R> = bincode::deserialize(&serialized_result_bl[..]).unwrap();
-            result.append(&mut result_bl);
+            serialized_result.push(serialized_result_bl);
+
             cur = next;  
         }
-        Ok(Box::new(result.into_iter()))
-
+        serialized_result  
     }
 }
 
@@ -325,4 +324,15 @@ impl<T: Data> Rdd for ParallelCollection<T> {
             )
         }
     }
+
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<T>>() {
+            s.secure_iterator(self.get_ecall_ids())
+        } else {
+            panic!(
+                "Got split object from different concrete type other than ParallelCollectionSplit"
+            )
+        }
+    }
+
 }

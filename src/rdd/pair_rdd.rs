@@ -305,6 +305,9 @@ where
             self.prev.iterator(split)?.map(move |(k, v)| (k, f(v))),
         ))
     }
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        self.prev.secure_compute(split)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -436,5 +439,8 @@ where
                 .iterator(split)?
                 .flat_map(move |(k, v)| f(v).map(move |x| (k.clone(), x))),
         ))
+    }
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        self.prev.secure_compute(split)
     }
 }

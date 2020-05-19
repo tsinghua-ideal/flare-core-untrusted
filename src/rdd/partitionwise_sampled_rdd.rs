@@ -150,4 +150,8 @@ impl<T: Data> Rdd for PartitionwiseSampledRdd<T> {
         let iter = self.prev.iterator(split)?;
         Ok(Box::new(sampler_func(iter).into_iter()) as Box<dyn Iterator<Item = T>>)
     }
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        self.prev.secure_compute(split)
+    }
+
 }

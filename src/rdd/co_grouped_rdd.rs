@@ -265,4 +265,10 @@ impl<K: Data + Eq + Hash> Rdd for CoGroupedRdd<K> {
             panic!("Got split object from different concrete type other than CoGroupSplit")
         }
     }
+    
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        //TODO
+        Vec::new()
+    }
+
 }

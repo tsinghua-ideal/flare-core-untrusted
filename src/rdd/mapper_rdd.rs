@@ -179,4 +179,9 @@ where
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         Ok(Box::new(self.prev.iterator(split)?.map(self.f.clone())))
     }
+
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        self.prev.secure_compute(split)
+    }
+     
 }

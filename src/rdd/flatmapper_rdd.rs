@@ -148,4 +148,8 @@ where
         let f = self.f.clone();
         Ok(Box::new(self.prev.iterator(split)?.flat_map(f)))
     }
+
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        self.prev.secure_compute(split)
+    }
 }

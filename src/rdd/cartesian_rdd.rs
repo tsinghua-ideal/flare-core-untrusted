@@ -155,4 +155,10 @@ impl<T: Data, U: Data> Rdd for CartesianRdd<T, U> {
         let iter2: Vec<_> = self.rdd2.iterator(current_split.s2)?.collect();
         Ok(Box::new(iter1.cartesian_product(iter2.into_iter())))
     }
+
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        //TODO
+        Vec::new()
+    }
+
 }

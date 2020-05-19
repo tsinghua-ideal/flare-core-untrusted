@@ -188,4 +188,8 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        //TODO
+        Vec::new()
+    }
 }

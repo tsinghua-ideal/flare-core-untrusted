@@ -183,6 +183,10 @@ impl<I: Rdd + ?Sized> Rdd for SerArc<I> {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        (**self).secure_compute(split)
+    }
+
 }
 
 // Rdd containing methods associated with processing
@@ -198,6 +202,7 @@ pub trait Rdd: RddBase + 'static {
         match self.get_secure() { 
             false => self.compute(split),
             true => {
+                /*
                 //TODO: i32 may need revised.
                 if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<i32>>() 
                 {
@@ -207,9 +212,19 @@ pub trait Rdd: RddBase + 'static {
                         "Got split object from different concrete type other than ParallelCollectionSplit"
                     )
                 }
+                */
+                let serialized_result = self.secure_compute(split);
+                let mut result = Vec::new();
+                for serialized_result_bl in serialized_result {
+                    let mut result_bl : Vec<Self::Item> = bincode::deserialize(&serialized_result_bl[..]).unwrap();
+                    result.append(&mut result_bl);
+                }
+                Ok(Box::new(result.into_iter()))
             }
         }
     }
+
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> ;
 
     /// Return a new RDD containing only the elements that satisfy a predicate.
     fn filter<F>(&self, predicate: F) -> SerArc<dyn Rdd<Item = Self::Item>>

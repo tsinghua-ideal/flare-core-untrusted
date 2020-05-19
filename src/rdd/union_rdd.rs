@@ -377,4 +377,10 @@ impl<T: Data> Rdd for UnionRdd<T> {
             }
         }
     }
+
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        //TODO
+        Vec::new()
+    }
+
 }

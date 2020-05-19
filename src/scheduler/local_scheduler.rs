@@ -273,9 +273,7 @@ impl LocalScheduler {
     ) where
         F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
     {
-        log::debug!("deserialize");
         let des_task: TaskOption = bincode::deserialize(&task).unwrap();
-        log::debug!("deserialize finished");
         let result = des_task.run(attempt_id);
         match des_task {
             TaskOption::ResultTask(tsk) => {
@@ -348,7 +346,6 @@ impl NativeScheduler for LocalScheduler {
         let event_queues = self.event_queues.clone();
         let task = bincode::serialize(&task).unwrap();
 
-        log::debug!("launch run-task thread");
         tokio::task::spawn_blocking(move || {
             LocalScheduler::run_task::<T, U, F>(event_queues, task, id_in_job, my_attempt_id)
         });

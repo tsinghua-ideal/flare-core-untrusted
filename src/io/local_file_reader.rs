@@ -430,6 +430,12 @@ impl Rdd for LocalFsReader<BytesReader> {
                 .map(move |files| BytesReader { files, host, idx }),
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
+
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        //TODO
+        Vec::new()
+    }
+
 }
 
 impl Rdd for LocalFsReader<FileReader> {
@@ -448,6 +454,12 @@ impl Rdd for LocalFsReader<FileReader> {
                 .map(move |files| FileReader { files, host, idx }),
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
+
+    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        //TODO
+        Vec::new()
+    }
+
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
