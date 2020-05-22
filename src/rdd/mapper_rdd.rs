@@ -181,6 +181,7 @@ where
     }
 
     fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        self.insert_ecall_id();
         self.prev.secure_compute(split)
     }
      

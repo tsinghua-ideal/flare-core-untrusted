@@ -82,9 +82,8 @@ impl<T: Data> ParallelCollectionSplit<T> {
         //it's needed without partition
         //let cap = cap << 5; 
         
-        //partition
+        //sub-partition
         let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
-        //let block_len = (1 << (5)) / data_size; 
         let mut cur = 0;
         let mut serialized_result = Vec::new();
         while cur < len {
@@ -327,6 +326,7 @@ impl<T: Data> Rdd for ParallelCollection<T> {
 
     fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<T>>() {
+            self.insert_ecall_id();
             s.secure_iterator(self.get_ecall_ids())
         } else {
             panic!(

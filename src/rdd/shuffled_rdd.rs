@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::aggregator::Aggregator;
 use crate::context::Context;
+use crate::env::Env;
 use crate::dependency::{Dependency, ShuffleDependency};
 use crate::error::Result;
 use crate::partitioner::Partitioner;
@@ -14,6 +15,19 @@ use crate::shuffle::ShuffleFetcher;
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
 use parking_lot::Mutex;
+use sgx_types::*;
+
+extern "C" {
+    fn secure_executing(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        ecall_ids: *const u8,
+        id_len: usize,
+        input: *const u8,
+        in_len: usize,
+        output: *mut u8,
+    ) -> sgx_status_t;
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ShuffledRddSplit {
@@ -189,7 +203,78 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
         ))
     }
     fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
-        //TODO
-        Vec::new()
+        self.insert_ecall_id();
+        //TODO K, V both need encryption?
+        log::debug!("compute inside shuffled rdd");
+        let start = Instant::now();
+
+        let fut = ShuffleFetcher::fetch::<K, C>(self.shuffle_id, split.get_index());
+        let mut combiners: HashMap<K, Option<C>> = HashMap::new();
+        for (k, c) in futures::executor::block_on(fut).unwrap().into_iter() {
+            if let Some(old_c) = combiners.get_mut(&k) {
+                let old = old_c.take().unwrap();
+                let input = ((old, c),);
+                let output = self.aggregator.merge_combiners.call(input);
+                *old_c = Some(output);
+            } else {
+                combiners.insert(k, Some(c));
+            }
+        }
+
+        let data = combiners.into_iter().map(|(k, v)| (k, v.unwrap())).collect::<Vec<Self::Item>>();        
+        let len = data.len();
+        let data_size = std::mem::size_of_val(&data[0]);  //may need revising when the type of element is not trivial
+        
+        let ecall_ids: Vec<usize> = (self.ecall_ids.lock()).clone();
+        let id_size = std::mem::size_of::<usize>();
+
+        let cap = 1 << (7+10+10);  //128MB
+
+        //it's needed without partition
+        //let cap = cap << 5; 
+
+        //partition
+        let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
+        //let block_len = (1 << (5)) / data_size; 
+        let mut cur = 0;
+        let mut serialized_result = Vec::new();
+        while cur < len {
+            let next = match cur + block_len > len {
+                true => len,
+                false => cur + block_len,
+            };
+
+            let serialized_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
+            let mut serialized_result_bl = Vec::<u8>::with_capacity(cap);
+            let ptr = serialized_result_bl.as_mut_ptr();
+            let mut retval = cap;
+            let sgx_status = unsafe {
+                secure_executing(
+                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                    &mut retval,
+                    ecall_ids.as_ptr() as *const u8,
+                    ecall_ids.len() * id_size,
+                    serialized_block.as_ptr() as *const u8,
+                    serialized_block.len(),
+                    ptr as *mut u8,
+                )
+            };
+            unsafe {
+                serialized_result_bl.set_len(retval);
+            }
+            //log::info!("retval = {}, result = {:?}, len = {}, cap = {}", retval, serialized_result_bl, serialized_result_bl.len(), serialized_result_bl.capacity());
+            match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            serialized_result_bl.shrink_to_fit();
+            serialized_result.push(serialized_result_bl);
+
+            cur = next;
+        }
+        serialized_result        
+
     }
 }
