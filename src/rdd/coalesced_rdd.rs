@@ -245,8 +245,8 @@ impl<T: Data> Rdd for CoalescedRdd<T> {
         Ok(Box::new(iter.into_iter().flatten()) as Box<dyn Iterator<Item = Self::Item>>)
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
-        self.parent.secure_compute(split)
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+        self.parent.secure_compute(split, id)
     }
 
 }

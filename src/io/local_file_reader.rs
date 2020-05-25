@@ -431,7 +431,7 @@ impl Rdd for LocalFsReader<BytesReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         //TODO
         Vec::new()
     }
@@ -455,7 +455,7 @@ impl Rdd for LocalFsReader<FileReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         //TODO
         Vec::new()
     }

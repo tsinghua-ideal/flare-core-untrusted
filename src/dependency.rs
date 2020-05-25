@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
+use sgx_types::*;
 
 // Revise if enum is good choice. Considering enum since down casting one trait object to another trait object is difficult.
 #[derive(Clone, Serialize, Deserialize)]
@@ -168,18 +169,6 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
             partition
         );
         let split = rdd_base.splits()[partition].clone();
-        let aggregator = self.aggregator.clone();
-        let num_output_splits = self.partitioner.get_num_of_partitions();
-        log::debug!("is cogroup rdd: {}", self.is_cogroup);
-        log::debug!("number of output splits: {}", num_output_splits);
-        let partitioner = self.partitioner.clone();
-        let mut buckets: Vec<HashMap<K, C>> = (0..num_output_splits)
-            .map(|_| HashMap::new())
-            .collect::<Vec<_>>();
-        log::debug!(
-            "before iterating while executing shuffle map task for partition #{}",
-            partition
-        );
         log::debug!("split index: {}", split.get_index());
 
         let iter = if self.is_cogroup {
@@ -187,44 +176,115 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
         } else {
             rdd_base.iterator_any(split.clone())
         };
-
-        for (count, i) in iter.unwrap().enumerate() {
-            let b = i.into_any().downcast::<(K, V)>().unwrap();
-            let (k, v) = *b;
-            if count == 0 {
-                log::debug!(
-                    "iterating inside dependency map task after downcasting: key: {:?}, value: {:?}",
-                    k,
-                    v
-                );
+        
+        if rdd_base.get_secure() {
+            let data = iter.unwrap()
+                .map(|i| i.into_any().downcast::<(K, V)>().unwrap())
+                .collect::<Vec<_>>();
+            let cap = 1 << (2+10+10+10);   //4G 
+            let ser_data: Vec<u8> = bincode::serialize(&data[..]).unwrap();
+            let ser_data_idx: Vec<usize> = vec![ser_data.len()];
+            let mut ser_result = Vec::<u8>::with_capacity(cap); 
+            let mut ser_result_idx = Vec::<usize>::with_capacity(cap>>3);
+            let mut retval = cap;
+            let sgx_status = unsafe {
+                secure_executing(
+                    env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                    &mut retval,
+                    rdd_base.get_rdd_id(),
+                    1,   //is_shuffle = true
+                    ser_data.as_ptr() as *const u8,
+                    ser_data_idx.as_ptr() as *const usize,
+                    ser_data_idx.len(),
+                    ser_result.as_mut_ptr() as *mut u8,
+                    ser_result_idx.as_mut_ptr() as *mut usize,
+                )
+            };
+            unsafe {
+                ser_result_idx.set_len(retval);
+                ser_result.set_len(ser_result_idx[retval-1]);
             }
-            let bucket_id = partitioner.get_partition(&k);
-            let bucket = &mut buckets[bucket_id];
-            if let Some(old_v) = bucket.get_mut(&k) {
-                let input = ((old_v.clone(), v),);
-                let output = aggregator.merge_value.call(input);
-                *old_v = output;
-            } else {
-                bucket.insert(k, aggregator.create_combiner.call((v,)));
+            match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            ser_result_idx.shrink_to_fit();
+            ser_result.shrink_to_fit();
+            let mut pre_idx: usize = 0;
+            for (i, idx) in ser_result_idx.into_iter().enumerate() {
+                let ser_bytes = (&ser_result[pre_idx..idx]).to_vec(); 
+                pre_idx = idx;
+                env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
             }
-        }
-
-        for (i, bucket) in buckets.into_iter().enumerate() {
-            let set: Vec<(K, C)> = bucket.into_iter().collect();
-            let ser_bytes = bincode::serialize(&set).unwrap();
+            env::Env::get().shuffle_manager.get_server_uri()    
+        } else {
+            let aggregator = self.aggregator.clone();
+            let num_output_splits = self.partitioner.get_num_of_partitions();
+            log::debug!("is cogroup rdd: {}", self.is_cogroup);
+            log::debug!("number of output splits: {}", num_output_splits);
+            let partitioner = self.partitioner.clone();
+            let mut buckets: Vec<HashMap<K, C>> = (0..num_output_splits)
+                .map(|_| HashMap::new())
+                .collect::<Vec<_>>();
             log::debug!(
-                "shuffle dependency map task set from bucket #{} in shuffle id #{}, partition #{}: {:?}",
-                i,
-                self.shuffle_id,
-                partition,
-                set.get(0)
+                "before iterating while executing shuffle map task for partition #{}",
+                partition
             );
-            env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
+
+            for (count, i) in iter.unwrap().enumerate() {
+                let b = i.into_any().downcast::<(K, V)>().unwrap();
+                let (k, v) = *b;
+                if count == 0 {
+                    log::debug!(
+                        "iterating inside dependency map task after downcasting: key: {:?}, value: {:?}",
+                        k,
+                        v
+                    );
+                }
+                let bucket_id = partitioner.get_partition(&k);
+                let bucket = &mut buckets[bucket_id];
+                if let Some(old_v) = bucket.get_mut(&k) {
+                    let input = ((old_v.clone(), v),);
+                    let output = aggregator.merge_value.call(input);
+                    *old_v = output;
+                } else {
+                    bucket.insert(k, aggregator.create_combiner.call((v,)));
+                }
+            }
+
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let set: Vec<(K, C)> = bucket.into_iter().collect();
+                let ser_bytes = bincode::serialize(&set).unwrap();
+                log::debug!(
+                    "shuffle dependency map task set from bucket #{} in shuffle id #{}, partition #{}: {:?}",
+                    i,
+                    self.shuffle_id,
+                    partition,
+                    set.get(0)
+                );
+                env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
+            }
+            log::debug!(
+                "returning shuffle address for shuffle task #{}",
+                self.shuffle_id
+            );
+            env::Env::get().shuffle_manager.get_server_uri()
         }
-        log::debug!(
-            "returning shuffle address for shuffle task #{}",
-            self.shuffle_id
-        );
-        env::Env::get().shuffle_manager.get_server_uri()
     }
+}
+
+extern "C" {
+    fn secure_executing(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        id: usize,
+        is_shuffle: u8,
+        input: *const u8,
+        input_idx: *const usize,
+        idx_len: usize,
+        output: *mut u8,
+        output_idx: *mut usize,
+    ) -> sgx_status_t;
 }

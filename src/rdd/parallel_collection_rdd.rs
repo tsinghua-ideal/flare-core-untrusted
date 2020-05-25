@@ -32,11 +32,13 @@ extern "C" {
     fn secure_executing(
         eid: sgx_enclave_id_t,
         retval: *mut usize,
-        ecall_ids: *const u8,
-        id_len: usize,
+        id: usize,
+        is_shuffle: u8,
         input: *const u8,
-        in_len: usize,
+        input_idx: *const usize,
+        idx_len: usize,
         output: *mut u8,
+        output_idx: *mut usize,
     ) -> sgx_status_t;
 }
 
@@ -68,61 +70,66 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, ecall_ids: Arc<Mutex<Vec<usize>>>) -> Vec<Vec<u8>> {
+    fn secure_iterator<D: Data>(&self, id: usize) -> Vec<Vec<u8>> {
         let data = self.values.clone();  
         let len = data.len();
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
-        let data_size = std::mem::size_of_val(&data[0]);  //may need revising when the type of element is not trivial
-
-        let ecall_ids: Vec<usize> = (*ecall_ids.lock()).clone();
-        let id_size = std::mem::size_of::<usize>();
+        let data_size = std::mem::size_of::<D>();  //may need revising when the type of element is not trivial
 
         let cap = 1 << (7+10+10);  //128MB
         
-        //it's needed without partition
+        //it's needed without sub-partition
         //let cap = cap << 5; 
         
         //sub-partition
         let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
         let mut cur = 0;
-        let mut serialized_result = Vec::new();
+        let mut ser_result = Vec::new();
         while cur < len {
             let next = match cur + block_len > len {
                 true => len,
                 false => cur + block_len,
             };
-
-            let serialized_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
-            let mut serialized_result_bl = Vec::<u8>::with_capacity(cap);
-            let ptr = serialized_result_bl.as_mut_ptr();
-            let mut retval = cap;
+            
+            //In future, the serialized_data is off-the-shelf, 
+            //the only thing that needs to do is sub-partition to serialized_block
+            let ser_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
+            let ser_block_idx: Vec<usize> = vec![ser_block.len()];
+            let mut ser_result_bl = Vec::<u8>::with_capacity(cap);
+            let mut ser_result_bl_idx = Vec::<usize>::with_capacity(1);
+            let mut retval = 1;
             let sgx_status = unsafe {
                 secure_executing(
                     Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
                     &mut retval,
-                    ecall_ids.as_ptr() as *const u8,
-                    ecall_ids.len() * id_size,
-                    serialized_block.as_ptr() as *const u8,
-                    serialized_block.len(),
-                    ptr as *mut u8,
+                    id,
+                    0,   //false
+                    ser_block.as_ptr() as *const u8,
+                    ser_block_idx.as_ptr() as *const usize,
+                    ser_block_idx.len(),
+                    ser_result_bl.as_mut_ptr() as *mut u8,
+                    ser_result_bl_idx.as_mut_ptr() as *mut usize,
                 )
             };
             unsafe {
-                serialized_result_bl.set_len(retval);
+                ser_result_bl_idx.set_len(retval);
+                ser_result_bl.set_len(ser_result_bl_idx[retval-1]);
             }
-            //log::info!("retval = {}, result = {:?}, len = {}, cap = {}", retval, serialized_result_bl, serialized_result_bl.len(), serialized_result_bl.capacity());
+            assert!(ser_result_bl_idx.len()==1 
+                    && ser_result_bl.len()==*ser_result_bl_idx.last().unwrap());
+            //log::info!("retval = {}, ser_result_bl = {:?}", retval, ser_result_bl);
             match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                 },
             };
-            serialized_result_bl.shrink_to_fit();
-            serialized_result.push(serialized_result_bl);
-
+            ser_result_bl.shrink_to_fit();
+            ser_result.push(ser_result_bl);
+            
             cur = next;  
         }
-        serialized_result  
+        ser_result  
     }
 }
 
@@ -324,10 +331,9 @@ impl<T: Data> Rdd for ParallelCollection<T> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<T>>() {
-            self.insert_ecall_id();
-            s.secure_iterator(self.get_ecall_ids())
+            s.secure_iterator::<Self::Item>(id)
         } else {
             panic!(
                 "Got split object from different concrete type other than ParallelCollectionSplit"

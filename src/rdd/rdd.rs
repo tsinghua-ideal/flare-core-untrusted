@@ -183,8 +183,8 @@ impl<I: Rdd + ?Sized> Rdd for SerArc<I> {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
-        (**self).secure_compute(split)
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+        (**self).secure_compute(split, id)
     }
 
 }
@@ -202,29 +202,20 @@ pub trait Rdd: RddBase + 'static {
         match self.get_secure() { 
             false => self.compute(split),
             true => {
-                /*
-                //TODO: i32 may need revised.
-                if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<i32>>() 
-                {
-                    s.secure_iterator::<Self::Item>(self.get_ecall_ids())
-                } else {
-                    panic!(
-                        "Got split object from different concrete type other than ParallelCollectionSplit"
-                    )
-                }
-                */
-                let serialized_result = self.secure_compute(split);
+                let ser_result = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
+                //TODO it may be not necessary to recover 
                 let mut result = Vec::new();
-                for serialized_result_bl in serialized_result {
-                    let mut result_bl : Vec<Self::Item> = bincode::deserialize(&serialized_result_bl[..]).unwrap();
+                for ser_result_bl in ser_result {
+                    let mut result_bl : Vec<Self::Item> = bincode::deserialize(&ser_result_bl[..]).unwrap();
                     result.append(&mut result_bl);
                 }
+                result.shrink_to_fit();
                 Ok(Box::new(result.into_iter()))
             }
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> ;
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> ;
 
     /// Return a new RDD containing only the elements that satisfy a predicate.
     fn filter<F>(&self, predicate: F) -> SerArc<dyn Rdd<Item = Self::Item>>

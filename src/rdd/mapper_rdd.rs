@@ -180,9 +180,8 @@ where
         Ok(Box::new(self.prev.iterator(split)?.map(self.f.clone())))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
-        self.insert_ecall_id();
-        self.prev.secure_compute(split)
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+        self.prev.secure_compute(split, id)
     }
      
 }

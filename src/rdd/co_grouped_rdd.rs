@@ -266,7 +266,7 @@ impl<K: Data + Eq + Hash> Rdd for CoGroupedRdd<K> {
         }
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         //TODO
         Vec::new()
     }
