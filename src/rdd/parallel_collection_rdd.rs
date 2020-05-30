@@ -1,5 +1,6 @@
 //! This module implements parallel collection RDD for dividing the input collection for parallel processing.
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use crate::context::Context;
 use crate::env::Env;
@@ -85,6 +86,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
         let mut cur = 0;
         let mut ser_result = Vec::new();
+        
         while cur < len {
             let next = match cur + block_len > len {
                 true => len,
@@ -129,6 +131,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
             
             cur = next;  
         }
+
         ser_result  
     }
 }

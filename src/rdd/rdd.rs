@@ -7,7 +7,7 @@ use std::io::{BufWriter, Write};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::context::Context;
 use crate::dependency::Dependency;
@@ -204,12 +204,14 @@ pub trait Rdd: RddBase + 'static {
             true => {
                 let ser_result = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
                 //TODO it may be not necessary to recover 
+
                 let mut result = Vec::new();
                 for ser_result_bl in ser_result {
                     let mut result_bl : Vec<Self::Item> = bincode::deserialize(&ser_result_bl[..]).unwrap();
                     result.append(&mut result_bl);
                 }
                 result.shrink_to_fit();
+
                 Ok(Box::new(result.into_iter()))
             }
         }
