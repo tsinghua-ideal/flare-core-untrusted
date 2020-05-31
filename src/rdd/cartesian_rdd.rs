@@ -121,6 +121,10 @@ impl<T: Data, U: Data> RddBase for CartesianRdd<T, U> {
         array
     }
 
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+        self.secure_compute(split, self.get_rdd_id())
+    }
+
     default fn iterator_any(
         &self,
         split: Box<dyn Split>,
@@ -156,7 +160,7 @@ impl<T: Data, U: Data> Rdd for CartesianRdd<T, U> {
         Ok(Box::new(iter1.cartesian_product(iter2.into_iter())))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
         //TODO
         Vec::new()
     }

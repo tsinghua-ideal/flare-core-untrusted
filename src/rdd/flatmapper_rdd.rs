@@ -97,6 +97,10 @@ where
         self.prev.number_of_splits()
     }
 
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+        self.secure_compute(split, self.get_rdd_id())
+    }
+
     default fn cogroup_iterator_any(
         &self,
         split: Box<dyn Split>,
@@ -149,7 +153,7 @@ where
         Ok(Box::new(self.prev.iterator(split)?.flat_map(f)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
         self.prev.secure_compute(split, id)
     }
 }

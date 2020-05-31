@@ -149,6 +149,10 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> RddBase for ShuffledRdd<K, V, C> {
         Some(self.part.clone())
     }
 
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+        self.secure_compute(split, self.get_rdd_id())
+    }
+
     fn iterator_any(
         &self,
         split: Box<dyn Split>,
@@ -204,7 +208,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
         //TODO K, V both need encryption?
         log::debug!("compute inside shuffled rdd");
         let start = Instant::now();
@@ -252,24 +256,17 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
         ser_result.shrink_to_fit();
 
         log::debug!("finish shuffle read");
-        assert!(ser_result_idx.len()==1 && ser_result.len()==*ser_result_idx.last().unwrap());
 
-        let data =  bincode::deserialize::<Vec<Self::Item>>(&ser_result[..]).unwrap();
-        let len = data.len();
-        let data_size = std::mem::size_of::<Self::Item>();  //may need revising when the type of element is not trivial
+        let ser_data = ser_result;
+        let ser_data_idx = ser_result_idx;
+       
         let cap = 1 << (7+10+10);  //128MB
+        let mut ser_result: Vec<u8> = vec![0; 8];
+        let mut res_len: usize = 0;
+        let mut pre_idx: usize = 0;
 
-        //sub-partition
-        let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
-        let mut cur = 0;
-        let mut ser_result = Vec::new();
-        while cur < len {
-            let next = match cur + block_len > len {
-                true => len,
-                false => cur + block_len,
-            };
-
-            let ser_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
+        for idx in ser_data_idx {
+            let ser_block = &ser_data[pre_idx..idx];
             let ser_block_idx: Vec<usize> = vec![ser_block.len()];
             let mut ser_result_bl = Vec::<u8>::with_capacity(cap);
             let mut ser_result_bl_idx = Vec::<usize>::with_capacity(1);
@@ -299,9 +296,15 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
                 },
             };
             ser_result_bl.shrink_to_fit();
-            ser_result.push(ser_result_bl);
+            let mut array: [u8; 8] = [0; 8];
+            array.clone_from_slice(&ser_result_bl[0..8]);
+            res_len += usize::from_le_bytes(array);
+            ser_result.extend_from_slice(&ser_result_bl[8..]);
 
-            cur = next;
+            pre_idx = idx;
+        }
+        for (i, v) in res_len.to_le_bytes().iter().enumerate() {
+            ser_result[i] = *v;
         }
         ser_result        
 

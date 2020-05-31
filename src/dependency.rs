@@ -170,20 +170,12 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
         );
         let split = rdd_base.splits()[partition].clone();
         log::debug!("split index: {}", split.get_index());
-
-        let iter = if self.is_cogroup {
-            rdd_base.cogroup_iterator_any(split)
-        } else {
-            rdd_base.iterator_any(split.clone())
-        };
         
         if rdd_base.get_secure() {
-            let data = iter.unwrap()
-                .map(|i| i.into_any().downcast::<(K, V)>().unwrap())
-                .collect::<Vec<_>>();
-            let cap = 1 << (2+10+10+10);   //4G 
-            let ser_data: Vec<u8> = bincode::serialize(&data[..]).unwrap();
+            let rdd_id = rdd_base.get_rdd_id();
+            let ser_data = rdd_base.iterator_ser(split);
             let ser_data_idx: Vec<usize> = vec![ser_data.len()];
+            let cap = 1 << (2+10+10+10);   //4G 
             let mut ser_result = Vec::<u8>::with_capacity(cap); 
             let mut ser_result_idx = Vec::<usize>::with_capacity(cap>>3);
             let mut retval = cap;
@@ -191,7 +183,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
                 secure_executing(
                     env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
                     &mut retval,
-                    rdd_base.get_rdd_id(),
+                    rdd_id,
                     1,   //is_shuffle = true
                     ser_data.as_ptr() as *const u8,
                     ser_data_idx.as_ptr() as *const usize,
@@ -220,6 +212,12 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
             }
             env::Env::get().shuffle_manager.get_server_uri()    
         } else {
+            let iter = if self.is_cogroup {
+                rdd_base.cogroup_iterator_any(split)
+            } else {
+                rdd_base.iterator_any(split.clone())
+            };
+
             let aggregator = self.aggregator.clone();
             let num_output_splits = self.partitioner.get_num_of_partitions();
             log::debug!("is cogroup rdd: {}", self.is_cogroup);

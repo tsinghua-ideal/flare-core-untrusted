@@ -106,6 +106,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -164,6 +165,9 @@ impl<I: Rdd + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+        (**self).get_rdd_base().iterator_ser(split)
+    }    
     fn iterator_any(
         &self,
         split: Box<dyn Split>,
@@ -183,7 +187,7 @@ impl<I: Rdd + ?Sized> Rdd for SerArc<I> {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
         (**self).secure_compute(split, id)
     }
 
@@ -204,20 +208,14 @@ pub trait Rdd: RddBase + 'static {
             true => {
                 let ser_result = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
                 //TODO it may be not necessary to recover 
-
-                let mut result = Vec::new();
-                for ser_result_bl in ser_result {
-                    let mut result_bl : Vec<Self::Item> = bincode::deserialize(&ser_result_bl[..]).unwrap();
-                    result.append(&mut result_bl);
-                }
-                result.shrink_to_fit();
+                let result: Vec<Self::Item> = bincode::deserialize(&ser_result).unwrap();
 
                 Ok(Box::new(result.into_iter()))
             }
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> ;
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> ;
 
     /// Return a new RDD containing only the elements that satisfy a predicate.
     fn filter<F>(&self, predicate: F) -> SerArc<dyn Rdd<Item = Self::Item>>
