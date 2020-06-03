@@ -200,7 +200,7 @@ impl<K: Data + Eq + Hash> RddBase for CoGroupedRdd<K> {
         Some(part)
     }
 
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -270,7 +270,7 @@ impl<K: Data + Eq + Hash> Rdd for CoGroupedRdd<K> {
         }
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         //TODO
         Vec::new()
     }

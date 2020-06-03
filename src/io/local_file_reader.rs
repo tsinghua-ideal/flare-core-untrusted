@@ -343,7 +343,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             true
         }
 
-        fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+        fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
             self.secure_compute(split, self.get_rdd_id())
         }
 
@@ -435,7 +435,7 @@ impl Rdd for LocalFsReader<BytesReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         //TODO
         Vec::new()
     }
@@ -459,7 +459,7 @@ impl Rdd for LocalFsReader<FileReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         //TODO
         Vec::new()
     }

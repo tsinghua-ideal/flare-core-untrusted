@@ -106,7 +106,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8>;
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -165,7 +165,7 @@ impl<I: Rdd + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
         (**self).get_rdd_base().iterator_ser(split)
     }    
     fn iterator_any(
@@ -187,7 +187,7 @@ impl<I: Rdd + ?Sized> Rdd for SerArc<I> {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         (**self).secure_compute(split, id)
     }
 
@@ -206,16 +206,27 @@ pub trait Rdd: RddBase + 'static {
         match self.get_secure() { 
             false => self.compute(split),
             true => {
-                let ser_result = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
+                let ser_result_bl_set = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
+                
+                let mut ser_result: Vec<u8> = vec![0; 8];
+                let mut res_len: usize = 0;
+                let mut array: [u8; 8] = [0; 8];
+                for ser_result_bl in ser_result_bl_set {
+                    array.clone_from_slice(&ser_result_bl[0..8]);
+                    res_len += usize::from_le_bytes(array);
+                    ser_result.extend_from_slice(&ser_result_bl[8..]);
+                }
+                for (i, v) in res_len.to_le_bytes().iter().enumerate() {
+                    ser_result[i] = *v;
+                }
                 //TODO it may be not necessary to recover 
                 let result: Vec<Self::Item> = bincode::deserialize(&ser_result).unwrap();
-
                 Ok(Box::new(result.into_iter()))
             }
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> ;
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> ;
 
     /// Return a new RDD containing only the elements that satisfy a predicate.
     fn filter<F>(&self, predicate: F) -> SerArc<dyn Rdd<Item = Self::Item>>

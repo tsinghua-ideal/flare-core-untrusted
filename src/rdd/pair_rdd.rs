@@ -267,7 +267,7 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -310,7 +310,7 @@ where
             self.prev.iterator(split)?.map(move |(k, v)| (k, f(v))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         self.prev.secure_compute(split, id)
     }
 }
@@ -405,7 +405,7 @@ where
         self.prev.number_of_splits()
     }
     
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -450,7 +450,7 @@ where
                 .flat_map(move |(k, v)| f(v).map(move |x| (k.clone(), x))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         self.prev.secure_compute(split, id)
     }
 }

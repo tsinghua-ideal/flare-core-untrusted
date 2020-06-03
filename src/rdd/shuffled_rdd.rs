@@ -149,7 +149,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> RddBase for ShuffledRdd<K, V, C> {
         Some(self.part.clone())
     }
 
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -208,7 +208,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         //TODO K, V both need encryption?
         log::debug!("compute inside shuffled rdd");
         let start = Instant::now();
@@ -261,8 +261,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
         let ser_data_idx = ser_result_idx;
        
         let cap = 1 << (7+10+10);  //128MB
-        let mut ser_result: Vec<u8> = vec![0; 8];
-        let mut res_len: usize = 0;
+        let mut ser_result: Vec<Vec<u8>> = Vec::new();
         let mut pre_idx: usize = 0;
 
         for idx in ser_data_idx {
@@ -296,15 +295,9 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
                 },
             };
             ser_result_bl.shrink_to_fit();
-            let mut array: [u8; 8] = [0; 8];
-            array.clone_from_slice(&ser_result_bl[0..8]);
-            res_len += usize::from_le_bytes(array);
-            ser_result.extend_from_slice(&ser_result_bl[8..]);
+            ser_result.push(ser_result_bl);
 
             pre_idx = idx;
-        }
-        for (i, v) in res_len.to_le_bytes().iter().enumerate() {
-            ser_result[i] = *v;
         }
         ser_result        
 

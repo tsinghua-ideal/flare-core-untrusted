@@ -174,41 +174,60 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
         if rdd_base.get_secure() {
             let rdd_id = rdd_base.get_rdd_id();
             let ser_data = rdd_base.iterator_ser(split);
-            let ser_data_idx: Vec<usize> = vec![ser_data.len()];
-            let cap = 1 << (2+10+10+10);   //4G 
-            let mut ser_result = Vec::<u8>::with_capacity(cap); 
-            let mut ser_result_idx = Vec::<usize>::with_capacity(cap>>3);
-            let mut retval = cap;
-            let sgx_status = unsafe {
-                secure_executing(
-                    env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut retval,
-                    rdd_id,
-                    1,   //is_shuffle = true
-                    ser_data.as_ptr() as *const u8,
-                    ser_data_idx.as_ptr() as *const usize,
-                    ser_data_idx.len(),
-                    ser_result.as_mut_ptr() as *mut u8,
-                    ser_result_idx.as_mut_ptr() as *mut usize,
-                )
-            };
-            unsafe {
-                ser_result_idx.set_len(retval);
-                ser_result.set_len(ser_result_idx[retval-1]);
+            let mut ser_result: Vec<Vec<u8>> = Vec::new();
+            let mut bucket_num = 0;
+            let mut sub_num: usize = 0;
+            for ser_block in ser_data { 
+                let ser_block_idx: Vec<usize> = vec![ser_block.len()];
+                let cap = 1 << (7+10+10);   //128M
+                let mut ser_result_bl = Vec::<u8>::with_capacity(cap); 
+                let mut ser_result_bl_idx = Vec::<usize>::with_capacity(cap>>3);
+                let mut retval = cap;
+                let sgx_status = unsafe {
+                    secure_executing(
+                        env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                        &mut retval,
+                        rdd_id,
+                        1,   //is_shuffle = true
+                        ser_block.as_ptr() as *const u8,
+                        ser_block_idx.as_ptr() as *const usize,
+                        ser_block_idx.len(),
+                        ser_result_bl.as_mut_ptr() as *mut u8,
+                        ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                    )
+                };
+                unsafe {
+                    ser_result_bl_idx.set_len(retval);
+                    ser_result_bl.set_len(ser_result_bl_idx[retval-1]);
+                }
+                match sgx_status {
+                    sgx_status_t::SGX_SUCCESS => {},
+                    _ => {
+                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                    },
+                };
+                ser_result_bl_idx.shrink_to_fit();
+                ser_result_bl.shrink_to_fit();
+                bucket_num = ser_result_bl_idx.len();
+                if ser_result.is_empty() {
+                    for i in 0..bucket_num {
+                        ser_result.push(vec![0; 8]);
+                    }
+                }
+                let mut pre_idx: usize = 0;
+                for (i, idx) in ser_result_bl_idx.into_iter().enumerate() {
+                    ser_result[i].extend_from_slice(&ser_result_bl[pre_idx..idx]);
+                    pre_idx = idx;
+                }
+                sub_num += 1;
             }
-            match sgx_status {
-                sgx_status_t::SGX_SUCCESS => {},
-                _ => {
-                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                },
-            };
-            ser_result_idx.shrink_to_fit();
-            ser_result.shrink_to_fit();
-            let mut pre_idx: usize = 0;
-            for (i, idx) in ser_result_idx.into_iter().enumerate() {
-                let ser_bytes = (&ser_result[pre_idx..idx]).to_vec(); 
-                pre_idx = idx;
-                env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
+            
+            let sub_num = sub_num.to_le_bytes();
+            for i in 0..bucket_num { 
+                for (j, v) in sub_num.iter().enumerate() {
+                    ser_result[i][j] = *v;
+                }
+                env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_result[i].clone());
             }
             env::Env::get().shuffle_manager.get_server_uri()    
         } else {

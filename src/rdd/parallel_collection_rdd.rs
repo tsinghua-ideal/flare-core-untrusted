@@ -71,7 +71,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, id: usize) -> Vec<u8> {
+    fn secure_iterator(&self, id: usize) -> Vec<Vec<u8>> {
         let data = self.values.clone();  
         let len = data.len();
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
@@ -85,8 +85,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         //sub-partition
         let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
         let mut cur = 0;
-        let mut ser_result: Vec<u8> = vec![0; 8];
-        let mut res_len: usize = 0;
+        let mut ser_result: Vec<Vec<u8>> = Vec::new();
 
         while cur < len {
             let next = match cur + block_len > len {
@@ -128,15 +127,9 @@ impl<T: Data> ParallelCollectionSplit<T> {
                 },
             };
             ser_result_bl.shrink_to_fit();
-            let mut array: [u8; 8] = [0; 8];
-            array.clone_from_slice(&ser_result_bl[0..8]);
-            res_len += usize::from_le_bytes(array); 
-            ser_result.extend_from_slice(&ser_result_bl[8..]);
+            ser_result.push(ser_result_bl);
             
             cur = next;  
-        }
-        for (i, v) in res_len.to_le_bytes().iter().enumerate() {
-            ser_result[i] = *v;
         }
         ser_result  
     }
@@ -298,7 +291,7 @@ impl<T: Data> RddBase for ParallelCollection<T> {
         self.rdd_vals.splits_.len()
     }
 
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<u8> {
+    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -344,7 +337,7 @@ impl<T: Data> Rdd for ParallelCollection<T> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<u8> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<T>>() {
             s.secure_iterator(id)
         } else {
