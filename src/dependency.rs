@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use sgx_types::*;
 
 // Revise if enum is good choice. Considering enum since down casting one trait object to another trait object is difficult.
@@ -170,14 +171,19 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
         );
         let split = rdd_base.splits()[partition].clone();
         log::debug!("split index: {}", split.get_index());
-        
+      
         if rdd_base.get_secure() {
+            let now = Instant::now();
+            
             let rdd_id = rdd_base.get_rdd_id();
             let ser_data = rdd_base.iterator_ser(split);
             let mut ser_result: Vec<Vec<u8>> = Vec::new();
             let mut bucket_num = 0;
             let mut sub_num: usize = 0;
             for ser_block in ser_data { 
+                
+                let now = Instant::now();
+                println!("sub-partition {:?}", sub_num);
                 let ser_block_idx: Vec<usize> = vec![ser_block.len()];
                 let cap = 1 << (7+10+10);   //128M
                 let mut ser_result_bl = Vec::<u8>::with_capacity(cap); 
@@ -208,6 +214,9 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
                 };
                 ser_result_bl_idx.shrink_to_fit();
                 ser_result_bl.shrink_to_fit();
+                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                println!("in dependency, shuffle write {:?}", dur);
+                
                 bucket_num = ser_result_bl_idx.len();
                 if ser_result.is_empty() {
                     for i in 0..bucket_num {
@@ -229,6 +238,8 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
                 }
                 env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_result[i].clone());
             }
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("in dependency, total {:?}", dur);
             env::Env::get().shuffle_manager.get_server_uri()    
         } else {
             let iter = if self.is_cogroup {
@@ -237,6 +248,8 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
                 rdd_base.iterator_any(split.clone())
             };
 
+            let now = Instant::now();
+            
             let aggregator = self.aggregator.clone();
             let num_output_splits = self.partitioner.get_num_of_partitions();
             log::debug!("is cogroup rdd: {}", self.is_cogroup);
@@ -287,6 +300,8 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
                 "returning shuffle address for shuffle task #{}",
                 self.shuffle_id
             );
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("in dependency, shuffle write {:?}", dur);
             env::Env::get().shuffle_manager.get_server_uri()
         }
     }

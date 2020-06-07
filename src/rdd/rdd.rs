@@ -208,6 +208,7 @@ pub trait Rdd: RddBase + 'static {
             true => {
                 let ser_result_bl_set = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
                 
+                let now = Instant::now();
                 let mut ser_result: Vec<u8> = vec![0; 8];
                 let mut res_len: usize = 0;
                 let mut array: [u8; 8] = [0; 8];
@@ -219,8 +220,14 @@ pub trait Rdd: RddBase + 'static {
                 for (i, v) in res_len.to_le_bytes().iter().enumerate() {
                     ser_result[i] = *v;
                 }
+                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                println!("in Rdd, merge ser result {:?}", dur);
+                let now = Instant::now();
                 //TODO it may be not necessary to recover 
                 let result: Vec<Self::Item> = bincode::deserialize(&ser_result).unwrap();
+                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                println!("in Rdd, deser ser result {:?}", dur);
+
                 Ok(Box::new(result.into_iter()))
             }
         }

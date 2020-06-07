@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::aggregator::Aggregator;
 use crate::context::Context;
@@ -188,7 +188,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
 
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         log::debug!("compute inside shuffled rdd");
-        let start = Instant::now();
+        let now = Instant::now();
 
         let fut = ShuffleFetcher::fetch::<K, C>(self.shuffle_id, split.get_index());
         let mut combiners: HashMap<K, Option<C>> = HashMap::new();
@@ -203,7 +203,8 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
             }
         }
 
-        log::debug!("time taken for fetching {}", start.elapsed().as_millis());
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in ShuffledRdd shuffle read {:?}", dur);
         Ok(Box::new(
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
@@ -211,11 +212,14 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
     fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
         //TODO K, V both need encryption?
         log::debug!("compute inside shuffled rdd");
-        let start = Instant::now();
 
+        let now = Instant::now();
         let fut = ShuffleFetcher::secure_fetch(self.shuffle_id, split.get_index());
         let ser_data_set = futures::executor::block_on(fut).unwrap();
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in ShuffledRdd, fetch {:?}", dur);
 
+        let now = Instant::now();
         let cap = 1 << (2+10+10+10);   //4G  
         let mut ser_data = Vec::<u8>::with_capacity(cap);
         let mut ser_data_idx = Vec::<usize>::with_capacity(cap>>3);
@@ -225,7 +229,10 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
             ser_data.append(&mut ser_data_bl);
             ser_data_idx.push(idx);
         } 
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in ShuffledRdd, merge ser data {:?}", dur);
 
+        let now = Instant::now();
         let mut ser_result = Vec::<u8>::with_capacity(cap);
         let mut ser_result_idx = Vec::<usize>::with_capacity(cap>>3);
         let mut retval = cap;
@@ -254,9 +261,12 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
         };
         ser_result_idx.shrink_to_fit();
         ser_result.shrink_to_fit();
-
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in ShuffledRdd, shuffle read {:?}", dur);
+        
         log::debug!("finish shuffle read");
 
+        let now = Instant::now();
         let ser_data = ser_result;
         let ser_data_idx = ser_result_idx;
        
@@ -299,6 +309,9 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
 
             pre_idx = idx;
         }
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in ShuffledRdd, compute {:?}", dur);
+
         ser_result        
 
     }

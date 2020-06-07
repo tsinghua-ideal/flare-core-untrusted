@@ -83,23 +83,30 @@ impl<T: Data> ParallelCollectionSplit<T> {
         //let cap = cap << 5; 
         
         //sub-partition
-        let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
+        let block_len = (1 << (3+10+10)) / data_size;  //each block: 8MB
         let mut cur = 0;
         let mut ser_result: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0;
 
         while cur < len {
             let next = match cur + block_len > len {
                 true => len,
                 false => cur + block_len,
             };
-            
+            let now = Instant::now(); 
             //In future, the serialized_data is off-the-shelf, 
             //the only thing that needs to do is sub-partition to serialized_block
             let ser_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
+            
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("sub-partition {:?}", i);
+            println!("in ParallelCollectionRdd, ser before entering {:?}", dur);
+
             let ser_block_idx: Vec<usize> = vec![ser_block.len()];
             let mut ser_result_bl = Vec::<u8>::with_capacity(cap);
             let mut ser_result_bl_idx = Vec::<usize>::with_capacity(1);
             let mut retval = 1;
+            let now = Instant::now();
             let sgx_status = unsafe {
                 secure_executing(
                     Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
@@ -128,7 +135,10 @@ impl<T: Data> ParallelCollectionSplit<T> {
             };
             ser_result_bl.shrink_to_fit();
             ser_result.push(ser_result_bl);
-            
+           
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("in ParallelCollectionRdd, compute {:?}", dur);
+            i += 1;
             cur = next;  
         }
         ser_result  
