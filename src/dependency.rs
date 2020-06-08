@@ -171,7 +171,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
         );
         let split = rdd_base.splits()[partition].clone();
         log::debug!("split index: {}", split.get_index());
-      
+        log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
         if rdd_base.get_secure() {
             let now = Instant::now();
             

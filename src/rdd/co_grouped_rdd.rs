@@ -11,6 +11,7 @@ use crate::dependency::{
     Dependency, NarrowDependencyTrait, OneToOneDependency, ShuffleDependency,
     ShuffleDependencyTrait,
 };
+use crate::env::Env;
 use crate::error::Result;
 use crate::partitioner::Partitioner;
 use crate::rdd::*;
@@ -18,6 +19,21 @@ use crate::serializable_traits::{AnyData, Data};
 use crate::shuffle::ShuffleFetcher;
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
+use sgx_types::*;
+
+extern "C" {
+    fn secure_executing(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        id: usize,
+        is_shuffle: u8,
+        input: *const u8,
+        input_idx: *const usize,
+        idx_len: usize,
+        output: *mut u8,
+        output_idx: *mut usize,
+    ) -> sgx_status_t;
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 enum CoGroupSplitDep {
@@ -271,8 +287,95 @@ impl<K: Data + Eq + Hash> Rdd for CoGroupedRdd<K> {
     }
     
     fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
-        //TODO
-        Vec::new()
+        if let Ok(split) = split.downcast::<CoGroupSplit>() {
+            //first 8 element: the byte length of the first vector
+            let mut ser_data: Vec<u8> = vec![0; 8];    
+            let mut idx = 8;
+            let mut ser_data_idx: Vec<usize> = vec![idx];
+            
+            println!("secure_compute in co_group_rdd");
+            for (dep_num, dep) in split.clone().deps.into_iter().enumerate() {
+                match dep {
+                    CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
+                        let ser_result_bl_set = rdd.iterator_ser(split);
+                        let mut ser_result: Vec<u8> = vec![0; 8];
+                        let mut res_len: usize = 0;
+                        let mut array: [u8; 8] = [0; 8];
+                        for ser_result_bl in ser_result_bl_set {
+                            array.clone_from_slice(&ser_result_bl[0..8]);
+                            res_len += usize::from_le_bytes(array);
+                            ser_result.extend_from_slice(&ser_result_bl[8..]);
+                        }
+                        for (i, v) in res_len.to_le_bytes().iter().enumerate() {
+                            ser_result[i] = *v;
+                        }
+                        let byte_len = ser_result.len();
+                        idx += byte_len;
+                        ser_data.append(&mut ser_result); 
+                        ser_data_idx.push(idx);
+                        if dep_num == 0 {
+                            for (i, v) in byte_len.to_le_bytes().iter().enumerate() {
+                                ser_data[i] = *v;
+                            } 
+                        };
+                    }
+                    CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
+                        let fut = ShuffleFetcher::secure_fetch(
+                            shuffle_id,
+                            split.get_index(),
+                        );
+                        let input_set = futures::executor::block_on(fut).unwrap();
+                        let cap = 1 << (2+10+10+10);   //4G
+                        let mut input = Vec::<u8>::with_capacity(cap);
+                        for (i, mut input_bl) in input_set.into_iter().enumerate() {
+                            idx += input_bl.len();
+                            input.append(&mut input_bl);
+                            ser_data_idx.push(idx);
+                        }
+                        let byte_len = input.len();
+                        ser_data.append(&mut input);
+                        if dep_num == 0 {
+                            for (i, v) in byte_len.to_le_bytes().iter().enumerate() {
+                                ser_data[i] = *v;
+                            }
+                        };
+                    }
+                }
+            };
+        
+            let cap = 1 << (2+10+10+10);   //4G
+            let mut ser_result = Vec::<u8>::with_capacity(cap);
+            let mut ser_result_idx = Vec::<usize>::with_capacity(cap>>3);
+            let mut retval = cap;
+            let sgx_status = unsafe {
+                secure_executing(
+                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                    &mut retval,
+                    id,  
+                    0,   //is_shuffle = false
+                    ser_data.as_ptr() as *const u8,
+                    ser_data_idx.as_ptr() as *const usize,
+                    ser_data_idx.len(),
+                    ser_result.as_mut_ptr() as *mut u8,
+                    ser_result_idx.as_mut_ptr() as *mut usize,
+                )
+            };
+            unsafe {
+                ser_result_idx.set_len(retval);
+                ser_result.set_len(ser_result_idx[retval-1]);
+            }
+            match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            ser_result_idx.shrink_to_fit();
+            ser_result.shrink_to_fit();
+            vec![ser_result]
+        } else {
+            panic!("Got split object from different concrete type other than CoGroupSplit")
+        }
     }
 
 }
