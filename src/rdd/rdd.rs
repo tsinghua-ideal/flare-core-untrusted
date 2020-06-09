@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::context::Context;
 use crate::dependency::Dependency;
+use crate::env::Env;
 use crate::error::{Error, Result};
 use crate::partial::{BoundedDouble, CountEvaluator, GroupedCountEvaluator, PartialResult};
 use crate::partitioner::{HashPartitioner, Partitioner};
@@ -25,6 +26,7 @@ use rand::{Rng, SeedableRng};
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 use parking_lot::Mutex;
+use sgx_types::*;
 
 mod parallel_collection_rdd;
 pub use parallel_collection_rdd::*;
@@ -50,6 +52,20 @@ mod zip_rdd;
 pub use zip_rdd::*;
 mod union_rdd;
 pub use union_rdd::*;
+
+extern "C" {
+    fn secure_executing(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        id: usize,
+        is_shuffle: u8,
+        input: *const u8,
+        input_idx: *const usize,
+        idx_len: usize,
+        output: *mut u8,
+        output_idx: *mut usize,
+    ) -> sgx_status_t;
+}
 
 // Values which are needed for all RDDs
 #[derive(Serialize, Deserialize)]
@@ -331,15 +347,58 @@ pub trait Rdd: RddBase + 'static {
     {
         // cloned cause we will use `f` later.
         let cf = f.clone();
-        let reduce_partition = Fn!(move |iter: Box<dyn Iterator<Item = Self::Item>>| {
-            let acc = iter.reduce(&cf);
-            match acc {
-                None => vec![],
-                Some(e) => vec![e],
+        if self.get_secure() {
+            let cl = Fn!(|iter: Box<dyn Iterator<Item = Self::Item>>| iter.collect::<Vec<Self::Item>>());
+            let data = self.get_context().run_job(self.get_rdd(), cl)?
+                .into_iter().flatten().collect::<Vec<Self::Item>>();
+            let ser_data =  bincode::serialize(&data[..]).unwrap(); //no sub-partition now
+            let ser_data_idx = vec![ser_data.len()];
+            let cap = 1 << (7+10+10);   //128MB
+            let mut ser_result = Vec::<u8>::with_capacity(cap);
+            let mut ser_result_idx = Vec::<usize>::with_capacity(1);
+            let mut retval = cap;
+            let sgx_status = unsafe {
+                secure_executing(
+                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                    &mut retval,
+                    self.get_rdd_id(),  //shuffle rdd id
+                    2,   //reduce
+                    ser_data.as_ptr() as *const u8,
+                    ser_data_idx.as_ptr() as *const usize,
+                    ser_data_idx.len(),
+                    ser_result.as_mut_ptr() as *mut u8,
+                    ser_result_idx.as_mut_ptr() as *mut usize,
+                )
+            };
+            unsafe {
+                ser_result_idx.set_len(retval);
+                ser_result.set_len(ser_result_idx[retval-1]);
             }
-        });
-        let results = self.get_context().run_job(self.get_rdd(), reduce_partition);
-        Ok(results?.into_iter().flatten().reduce(f))
+            match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            ser_result_idx.shrink_to_fit();
+            ser_result.shrink_to_fit();
+            let temp: Vec<Self::Item> = bincode::deserialize(&ser_result).unwrap();
+            let result = match temp.is_empty() {
+                true => None,
+                false => Some(temp[0].clone()),
+            };
+            Ok(result)
+        } else {
+            let reduce_partition = Fn!(move |iter: Box<dyn Iterator<Item = Self::Item>>| {
+                let acc = iter.reduce(&cf);
+                match acc {
+                    None => vec![],
+                    Some(e) => vec![e],
+                }
+            });
+            let results = self.get_context().run_job(self.get_rdd(), reduce_partition);
+            Ok(results?.into_iter().flatten().reduce(f))
+        }
     }
 
     /// Aggregate the elements of each partition, and then the results for all the partitions, using a
