@@ -64,6 +64,7 @@ extern "C" {
         idx_len: usize,
         output: *mut u8,
         output_idx: *mut usize,
+        captured_vars: *const u8,
     ) -> sgx_status_t;
 }
 
@@ -353,6 +354,7 @@ pub trait Rdd: RddBase + 'static {
                 .into_iter().flatten().collect::<Vec<Self::Item>>();
             let ser_data =  bincode::serialize(&data[..]).unwrap(); //no sub-partition now
             let ser_data_idx = vec![ser_data.len()];
+            let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let cap = 1 << (7+10+10);   //128MB
             let mut ser_result = Vec::<u8>::with_capacity(cap);
             let mut ser_result_idx = Vec::<usize>::with_capacity(1);
@@ -368,6 +370,7 @@ pub trait Rdd: RddBase + 'static {
                     ser_data_idx.len(),
                     ser_result.as_mut_ptr() as *mut u8,
                     ser_result_idx.as_mut_ptr() as *mut usize,
+                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
             unsafe {

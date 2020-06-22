@@ -8,7 +8,8 @@
     unboxed_closures,
     unsize,
     binary_heap_into_iter_sorted,
-    vec_resize_default
+    vec_resize_default,
+    proc_macro_hygiene
 )]
 #![allow(dead_code, where_clauses_object_safety, deprecated)]
 #![allow(clippy::single_component_path_imports)]

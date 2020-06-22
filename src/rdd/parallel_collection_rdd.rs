@@ -1,4 +1,5 @@
 //! This module implements parallel collection RDD for dividing the input collection for parallel processing.
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ extern "C" {
         idx_len: usize,
         output: *mut u8,
         output_idx: *mut usize,
+        captured_vars: *const u8,
     ) -> sgx_status_t;
 }
 
@@ -76,7 +78,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let len = data.len();
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
         let data_size = std::mem::size_of::<T>();  //may need revising when the type of element is not trivial
-
+        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cap = 1 << (7+10+10);  //128MB
         
         //it's needed without sub-partition
@@ -118,6 +120,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     ser_block_idx.len(),
                     ser_result_bl.as_mut_ptr() as *mut u8,
                     ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
             unsafe {

@@ -5,6 +5,7 @@ use std::{
     boxed, error, fmt, marker,
     ops::{self, Deref, DerefMut},
 };
+pub use serde_closure::structs::Peep;
 
 // Data passing through RDD needs to satisfy the following traits.
 // Debug is only added here for debugging convenience during development stage but is not necessary.
@@ -288,6 +289,7 @@ pub trait SerFunc<Args>:
     + 'static
     + Serialize
     + Deserialize
+    + Peep
 {
 }
 
@@ -301,16 +303,17 @@ impl<Args, T> SerFunc<Args> for T where
         + 'static
         + Serialize
         + Deserialize
+        + Peep
 {
 }
 
 pub trait Func<Args>:
-    ops::Fn<Args> + Serialize + Deserialize + Send + Sync + 'static + dyn_clone::DynClone
+    ops::Fn<Args> + Serialize + Deserialize + Send + Sync + 'static + dyn_clone::DynClone + Peep 
 {
 }
 
 impl<T: ?Sized, Args> Func<Args> for T where
-    T: ops::Fn<Args> + Serialize + Deserialize + Send + Sync + 'static + dyn_clone::DynClone
+    T: ops::Fn<Args> + Serialize + Deserialize + Send + Sync + 'static + dyn_clone::DynClone + Peep
 {
 }
 
@@ -345,5 +348,13 @@ impl<'de, Args: 'static, Output: 'static> serde::de::Deserialize<'de>
         D: serde::Deserializer<'de>,
     {
         <Box<dyn Func<Args, Output = Output> + 'static>>::deserialize(deserializer).map(|x| x.0)
+    }
+}
+
+impl<Args: 'static, Output: 'static> Peep 
+    for boxed::Box<dyn Func<Args, Output = Output>>
+{
+    fn get_ser_captured_var(&self) -> Vec<u8> {
+        (**self).get_ser_captured_var()
     }
 }

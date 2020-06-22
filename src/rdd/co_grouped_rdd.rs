@@ -32,6 +32,7 @@ extern "C" {
         idx_len: usize,
         output: *mut u8,
         output_idx: *mut usize,
+        captured_vars: *const u8,
     ) -> sgx_status_t;
 }
 
@@ -292,7 +293,7 @@ impl<K: Data + Eq + Hash> Rdd for CoGroupedRdd<K> {
             let mut ser_data: Vec<u8> = vec![0; 8];    
             let mut idx = 8;
             let mut ser_data_idx: Vec<usize> = vec![idx];
-            
+            let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             println!("secure_compute in co_group_rdd");
             for (dep_num, dep) in split.clone().deps.into_iter().enumerate() {
                 match dep {
@@ -358,6 +359,7 @@ impl<K: Data + Eq + Hash> Rdd for CoGroupedRdd<K> {
                     ser_data_idx.len(),
                     ser_result.as_mut_ptr() as *mut u8,
                     ser_result_idx.as_mut_ptr() as *mut usize,
+                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
             unsafe {

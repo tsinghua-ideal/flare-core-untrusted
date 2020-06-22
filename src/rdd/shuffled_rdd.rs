@@ -28,6 +28,7 @@ extern "C" {
         idx_len: usize,
         output: *mut u8,
         output_idx: *mut usize,
+        captured_vars: *const u8,
     ) -> sgx_status_t;
 }
 
@@ -231,7 +232,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
         } 
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in ShuffledRdd, merge ser data {:?}", dur);
-
+        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new()); 
         let now = Instant::now();
         let mut ser_result = Vec::<u8>::with_capacity(cap);
         let mut ser_result_idx = Vec::<usize>::with_capacity(cap>>3);
@@ -247,6 +248,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
                 ser_data_idx.len(),
                 ser_result.as_mut_ptr() as *mut u8,
                 ser_result_idx.as_mut_ptr() as *mut usize,
+                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )
         };
         unsafe {
@@ -291,6 +293,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
                     ser_block_idx.len(),
                     ser_result_bl.as_mut_ptr() as *mut u8,
                     ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
             unsafe {

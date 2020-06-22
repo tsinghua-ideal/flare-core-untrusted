@@ -5,6 +5,7 @@ use std::sync::{atomic::AtomicBool, atomic::Ordering::SeqCst, Arc};
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
 use crate::error::Result;
+use crate::env::Env;
 use crate::rdd::{Rdd, RddBase, RddVals};
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
@@ -185,6 +186,10 @@ where
     }
 
     fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+        Env::get().captured_vars
+            .lock()
+            .unwrap()
+            .insert(self.get_rdd_id(), self.f.get_ser_captured_var()); 
         self.prev.secure_compute(split, id)
     }
      

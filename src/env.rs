@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -38,6 +39,7 @@ pub(crate) struct Env {
     pub cache_tracker: Arc<CacheTracker>,
     pub enclave: Arc<Mutex<Option<SgxEnclave>>>,
     pub enclave_path: PathBuf,
+    pub captured_vars: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
 }
 
 impl Env {
@@ -119,6 +121,7 @@ impl Env {
                 .expect("fatal error: failed creating cache tracker"),
                 enclave,
                 enclave_path,
+                captured_vars: Arc::new(Mutex::new(HashMap::new()))
             }
         })
     }

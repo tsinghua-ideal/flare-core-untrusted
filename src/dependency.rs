@@ -177,6 +177,8 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
             
             let rdd_id = rdd_base.get_rdd_id();
             let ser_data = rdd_base.iterator_ser(split);
+            let captured_vars = std::mem::replace(&mut *env::Env::get().captured_vars.lock().unwrap(), HashMap::new());
+
             let mut ser_result: Vec<Vec<u8>> = Vec::new();
             let mut bucket_num = 0;
             let mut sub_num: usize = 0;
@@ -200,6 +202,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
                         ser_block_idx.len(),
                         ser_result_bl.as_mut_ptr() as *mut u8,
                         ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                     )
                 };
                 unsafe {
@@ -318,5 +321,6 @@ extern "C" {
         idx_len: usize,
         output: *mut u8,
         output_idx: *mut usize,
+        captured_vars: *const u8,
     ) -> sgx_status_t;
 }
