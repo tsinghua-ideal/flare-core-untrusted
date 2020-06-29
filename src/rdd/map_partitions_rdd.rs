@@ -184,10 +184,13 @@ where
         Ok(Box::new(f_result))
     }
     fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
-        Env::get().captured_vars
-            .lock()
-            .unwrap()
-            .insert(self.get_rdd_id(), self.f.get_ser_captured_var()); 
+        let captured_vars = self.f.get_ser_captured_var(); 
+        if !captured_vars.is_empty() {
+            Env::get().captured_vars
+                .lock()
+                .unwrap()
+                .insert(self.get_rdd_id(), captured_vars);
+        } 
         self.prev.secure_compute(split, id)
     }
 
