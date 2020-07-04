@@ -352,8 +352,14 @@ pub trait Rdd: RddBase + 'static {
             let cl = Fn!(|iter: Box<dyn Iterator<Item = Self::Item>>| iter.collect::<Vec<Self::Item>>());
             let data = self.get_context().run_job(self.get_rdd(), cl)?
                 .into_iter().flatten().collect::<Vec<Self::Item>>();
+            
+            let now = Instant::now();
             let ser_data =  bincode::serialize(&data[..]).unwrap(); //no sub-partition now
             let ser_data_idx = vec![ser_data.len()];
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("in reduce, ser before entering {:?}s", dur);
+            let now = Instant::now();
+
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let cap = 1 << (7+10+10);   //128MB
             let mut ser_result = Vec::<u8>::with_capacity(cap);
@@ -385,7 +391,14 @@ pub trait Rdd: RddBase + 'static {
             };
             ser_result_idx.shrink_to_fit();
             ser_result.shrink_to_fit();
+            
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("in reduce, ecall {:?}s", dur);
+            let now = Instant::now();
             let temp: Vec<Self::Item> = bincode::deserialize(&ser_result).unwrap();
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("in reduce, deserialize after entering {:?}s", dur);
+
             let result = match temp.is_empty() {
                 true => None,
                 false => Some(temp[0].clone()),

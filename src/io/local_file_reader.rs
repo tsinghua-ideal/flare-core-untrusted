@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Read};
 use std::marker::PhantomData;
@@ -7,6 +8,7 @@ use std::sync::Arc;
 
 use crate::context::Context;
 use crate::dependency::Dependency;
+use crate::env::Env;
 use crate::error::{Error, Result};
 use crate::io::*;
 use crate::rdd::{MapPartitionsRdd, MapperRdd, Rdd, RddBase};
@@ -17,6 +19,22 @@ use log::debug;
 use rand::prelude::*;
 use serde_derive::{Deserialize, Serialize};
 use parking_lot::Mutex;
+use sgx_types::*;
+
+extern "C" {
+    fn secure_executing(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        id: usize,
+        is_shuffle: u8,
+        input: *const u8,
+        input_idx: *const usize,
+        idx_len: usize,
+        output: *mut u8,
+        output_idx: *mut usize,
+        captured_vars: *const u8,
+    ) -> sgx_status_t;
+}
 
 pub struct LocalFsReaderConfig {
     filter_ext: Option<std::ffi::OsString>,
@@ -436,10 +454,8 @@ impl Rdd for LocalFsReader<BytesReader> {
     }
 
     fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
-        //TODO
         Vec::new()
     }
-
 }
 
 impl Rdd for LocalFsReader<FileReader> {
@@ -460,8 +476,70 @@ impl Rdd for LocalFsReader<FileReader> {
     }
 
     fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
-        //TODO
-        Vec::new()
+        let split = split.downcast_ref::<FileReader>().unwrap();
+        let files_by_part = self.load_local_files().unwrap();
+        let idx = split.idx;
+        let host = split.host;
+        let data = files_by_part
+            .into_iter()
+            .map(move |files| FileReader { files, host, idx })
+            .collect::<Vec<_>>();
+        let len = data.len();
+        let data_size = std::mem::size_of::<FileReader>();  //may need revising when the type of element is not trivial
+        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cap = 1 << (7+10+10);  //128MB
+        let block_len = (1 << (3+10+10)) / data_size;  //each block: 8MB
+        let mut cur = 0;
+        let mut ser_result: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0;
+        
+        while cur < len {
+            let next = match cur + block_len > len {
+                true => len,
+                false => cur + block_len,
+            };
+            //In future, the serialized_data is off-the-shelf, 
+            //the only thing that needs to do is sub-partition to serialized_block
+            let ser_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
+            let ser_block_idx: Vec<usize> = vec![ser_block.len()];
+            let mut ser_result_bl = Vec::<u8>::with_capacity(cap);
+            let mut ser_result_bl_idx = Vec::<usize>::with_capacity(1);
+            let mut retval = 1;
+            let sgx_status = unsafe {
+                secure_executing(
+                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                    &mut retval,
+                    id,
+                    0,   //false
+                    ser_block.as_ptr() as *const u8,
+                    ser_block_idx.as_ptr() as *const usize,
+                    ser_block_idx.len(),
+                    ser_result_bl.as_mut_ptr() as *mut u8,
+                    ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                )
+            };
+            unsafe {
+                ser_result_bl_idx.set_len(retval);
+                ser_result_bl.set_len(ser_result_bl_idx[retval-1]);
+            }
+            assert!(ser_result_bl_idx.len()==1
+                    && ser_result_bl.len()==*ser_result_bl_idx.last().unwrap());
+            //log::info!("retval = {}, ser_result_bl = {:?}", retval, ser_result_bl);
+            match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            ser_result_bl.shrink_to_fit();
+            ser_result.push(ser_result_bl);
+
+            i += 1;
+            cur = next;
+        }
+        ser_result
+
     }
 
 }

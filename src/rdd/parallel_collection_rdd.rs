@@ -4,8 +4,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::context::Context;
-use crate::env::Env;
 use crate::dependency::Dependency;
+use crate::env::Env;
 use crate::error::Result;
 use crate::rdd::{Rdd, RddBase, RddVals};
 use crate::serializable_traits::{AnyData, Data};
@@ -85,7 +85,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         //let cap = cap << 5; 
         
         //sub-partition
-        let block_len = (1 << (3+10+10)) / data_size;  //each block: 8MB
+        let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
         let mut cur = 0;
         let mut ser_result: Vec<Vec<u8>> = Vec::new();
         let mut i = 0;
