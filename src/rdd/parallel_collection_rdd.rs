@@ -85,7 +85,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         //let cap = cap << 5; 
         
         //sub-partition
-        let block_len = (1 << (5+10+10)) / data_size;  //each block: 32MB
+        let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
         let mut cur = 0;
         let mut ser_result: Vec<Vec<u8>> = Vec::new();
         let mut i = 0;

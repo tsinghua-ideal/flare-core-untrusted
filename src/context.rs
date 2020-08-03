@@ -9,6 +9,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -25,7 +26,15 @@ use once_cell::sync::OnceCell;
 use simplelog::*;
 use uuid::Uuid;
 use Schedulers::*;
+use sgx_types::*;
 
+extern "C" {
+    fn pre_touching(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        zero: u8,
+    ) -> sgx_status_t; 
+}
 pub const PRI_KEY_LOC: &str =  "/home/lixiang/.ssh/124.9";
 // There is a problem with this approach since T needs to satisfy PartialEq, Eq for Range
 // No such restrictions are needed for Vec
@@ -164,6 +173,21 @@ impl Context {
         }
     }
 
+    pub fn launch_pre_touching() {
+        let eid = env::Env::get()
+            .enclave
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .geteid();
+        let child = thread::spawn(move || {
+            let mut retval = 1;
+            let sgx_status_t = unsafe {
+                pre_touching(eid, &mut retval, 0)
+            };
+        });
+    }
     /// Sets a handler to receives any external signal to stop the process
     /// and shuts down gracefully any ongoing op
     fn set_cleanup_process(&self) {
@@ -183,6 +207,7 @@ impl Context {
     }
 
     fn init_local_scheduler() -> Result<Arc<Self>> {
+        Context::launch_pre_touching();
         let job_id = Uuid::new_v4().to_string();
         let job_work_dir = env::Configuration::get()
             .local_dir
@@ -335,6 +360,7 @@ impl Context {
     }
 
     fn init_distributed_worker() -> Result<!> {
+        Context::launch_pre_touching();
         let mut work_dir = PathBuf::from("");
         match std::env::current_exe().map_err(|_| Error::CurrentBinaryPath) {
             Ok(binary_path) => {
