@@ -454,54 +454,28 @@ impl Rdd for LocalFsReader<BytesReader> {
     }
 
     fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
-        Vec::new()
-    }
-}
-
-impl Rdd for LocalFsReader<FileReader> {
-    type Item = FileReader;
-
-    impl_common_lfs_rdd_funcs!();
-
-    fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
-        let split = split.downcast_ref::<FileReader>().unwrap();
-        let files_by_part = self.load_local_files()?;
-        let idx = split.idx;
-        let host = split.host;
-        Ok(Box::new(
-            files_by_part
-                .into_iter()
-                .map(move |files| FileReader { files, host, idx }),
-        ) as Box<dyn Iterator<Item = Self::Item>>)
-    }
-
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
-        let split = split.downcast_ref::<FileReader>().unwrap();
+        let split = split.downcast_ref::<BytesReader>().unwrap();
         let files_by_part = self.load_local_files().unwrap();
         let idx = split.idx;
         let host = split.host;
+        // Assumption data is encrypted and serialized
         let data = files_by_part
             .into_iter()
-            .map(move |files| FileReader { files, host, idx })
-            .collect::<Vec<_>>();
-        let len = data.len();
-        let data_size = std::mem::size_of::<FileReader>();  //may need revising when the type of element is not trivial
+            .map(move |files| BytesReader { files, host, idx });
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cap = 1 << (7+10+10);  //128MB
-        let block_len = (1 << (3+10+10)) / data_size;  //each block: 8MB
-        let mut cur = 0;
         let mut ser_result: Vec<Vec<u8>> = Vec::new();
-        let mut i = 0;
         
-        while cur < len {
-            let next = match cur + block_len > len {
-                true => len,
-                false => cur + block_len,
-            };
-            //In future, the serialized_data is off-the-shelf, 
-            //the only thing that needs to do is sub-partition to serialized_block
-            let ser_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
-            let ser_block_idx: Vec<usize> = vec![ser_block.len()];
+        for ser_block_tmp in data { 
+            let mut ser_block = Vec::with_capacity(cap); 
+            let mut ser_block_idx = Vec::with_capacity(ser_block_tmp.files.len());
+            let mut idx: usize = 0;
+            for mut t in ser_block_tmp {
+                idx += t.len();
+                ser_block.append(&mut t);
+                ser_block_idx.push(idx);
+            }
+                        
             let mut ser_result_bl = Vec::<u8>::with_capacity(cap);
             let mut ser_result_bl_idx = Vec::<usize>::with_capacity(1);
             let mut retval = 1;
@@ -534,19 +508,36 @@ impl Rdd for LocalFsReader<FileReader> {
             };
             ser_result_bl.shrink_to_fit();
             ser_result.push(ser_result_bl);
-
-            i += 1;
-            cur = next;
         }
         ser_result
+    }
+}
 
+impl Rdd for LocalFsReader<FileReader> {
+    type Item = FileReader;
+
+    impl_common_lfs_rdd_funcs!();
+
+    fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+        let split = split.downcast_ref::<FileReader>().unwrap();
+        let files_by_part = self.load_local_files()?;
+        let idx = split.idx;
+        let host = split.host;
+        Ok(Box::new(
+            files_by_part
+                .into_iter()
+                .map(move |files| FileReader { files, host, idx }),
+        ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BytesReader {
-    files: Vec<PathBuf>,
+    pub files: Vec<PathBuf>,
     idx: usize,
     host: Ipv4Addr,
 }
