@@ -416,7 +416,11 @@ pub trait Rdd: RddBase + 'static {
             let results = self.get_context().run_job(self.get_rdd(), reduce_partition);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("mapper {:?}s", dur);
-            Ok(results?.into_iter().flatten().reduce(f))
+            let now = Instant::now();
+            let result = Ok(results?.into_iter().flatten().reduce(f));
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("reducer {:?}s", dur);
+            result
         }
     }
 
