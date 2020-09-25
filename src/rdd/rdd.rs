@@ -1,3 +1,4 @@
+use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -59,11 +60,7 @@ extern "C" {
         retval: *mut usize,
         id: usize,
         is_shuffle: u8,
-        input: *const u8,
-        input_idx: *const usize,
-        idx_len: usize,
-        output: *mut u8,
-        output_idx: *mut usize,
+        input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
 }
@@ -123,7 +120,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>>;
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -182,8 +179,8 @@ impl<I: Rdd + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
-        (**self).get_rdd_base().iterator_ser(split)
+    fn iterator_raw(&self, split: Box<dyn Split>) ->  Vec<usize> {
+        (**self).get_rdd_base().iterator_raw(split)
     }    
     fn iterator_any(
         &self,
@@ -204,7 +201,7 @@ impl<I: Rdd + ?Sized> Rdd for SerArc<I> {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
         (**self).secure_compute(split, id)
     }
 
@@ -223,34 +220,18 @@ pub trait Rdd: RddBase + 'static {
         match self.get_secure() { 
             false => self.compute(split),
             true => {
-                let ser_result_bl_set = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
-                
-                let now = Instant::now();
-                let mut ser_result: Vec<u8> = vec![0; 8];
-                let mut res_len: usize = 0;
-                let mut array: [u8; 8] = [0; 8];
-                for ser_result_bl in ser_result_bl_set {
-                    array.clone_from_slice(&ser_result_bl[0..8]);
-                    res_len += usize::from_le_bytes(array);
-                    ser_result.extend_from_slice(&ser_result_bl[8..]);
+                let result_ptr = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
+                let mut result = Vec::new(); 
+                for result_bl_ptr in result_ptr {
+                    let mut result_bl: Box<Vec<Self::Item>> = unsafe{ Box::from_raw(result_bl_ptr as *mut u8 as  *mut Vec<Self::Item>) };
+                    result.append(result_bl.borrow_mut())
                 }
-                for (i, v) in res_len.to_le_bytes().iter().enumerate() {
-                    ser_result[i] = *v;
-                }
-                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                println!("in Rdd, merge ser result {:?}", dur);
-                let now = Instant::now();
-                //TODO it may be not necessary to recover 
-                let result: Vec<Self::Item> = bincode::deserialize(&ser_result).unwrap();
-                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                println!("in Rdd, deser ser result {:?}", dur);
-
                 Ok(Box::new(result.into_iter()))
             }
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> ;
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> ;
 
     /// Return a new RDD containing only the elements that satisfy a predicate.
     fn filter<F>(&self, predicate: F) -> SerArc<dyn Rdd<Item = Self::Item>>
@@ -352,53 +333,32 @@ pub trait Rdd: RddBase + 'static {
             let cl = Fn!(|iter: Box<dyn Iterator<Item = Self::Item>>| iter.collect::<Vec<Self::Item>>());
             let data = self.get_context().run_job(self.get_rdd(), cl)?
                 .into_iter().flatten().collect::<Vec<Self::Item>>();
-            
-            let now = Instant::now();
-            let ser_data =  bincode::serialize(&data[..]).unwrap(); //no sub-partition now
-            let ser_data_idx = vec![ser_data.len()];
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("in reduce, ser before entering {:?}s", dur);
+           
+            let data_ptr = Box::into_raw(Box::new(data));
             let now = Instant::now();
 
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-            let cap = 1 << (7+10+10);   //128MB
-            let mut ser_result = Vec::<u8>::with_capacity(cap);
-            let mut ser_result_idx = Vec::<usize>::with_capacity(1);
-            let mut retval = cap;
+            let mut result_ptr: usize = 0;
             let sgx_status = unsafe {
                 secure_executing(
                     Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut retval,
+                    &mut result_ptr,
                     self.get_rdd_id(),  //shuffle rdd id
                     2,   //reduce
-                    ser_data.as_ptr() as *const u8,
-                    ser_data_idx.as_ptr() as *const usize,
-                    ser_data_idx.len(),
-                    ser_result.as_mut_ptr() as *mut u8,
-                    ser_result_idx.as_mut_ptr() as *mut usize,
+                    data_ptr as *mut u8 ,
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
-            unsafe {
-                ser_result_idx.set_len(retval);
-                ser_result.set_len(ser_result_idx[retval-1]);
-            }
+            let data = unsafe{ Box::from_raw(data_ptr) };
             match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                 },
             };
-            ser_result_idx.shrink_to_fit();
-            ser_result.shrink_to_fit();
-            
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("in reduce, ecall {:?}s", dur);
-            let now = Instant::now();
-            let temp: Vec<Self::Item> = bincode::deserialize(&ser_result).unwrap();
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("in reduce, deserialize after entering {:?}s", dur);
-
+            let temp = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<Self::Item>) };
             let result = match temp.is_empty() {
                 true => None,
                 false => Some(temp[0].clone()),

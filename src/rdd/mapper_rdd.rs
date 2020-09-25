@@ -126,7 +126,7 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -185,7 +185,7 @@ where
         Ok(Box::new(self.prev.iterator(split)?.map(self.f.clone())))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
         let captured_vars = self.f.get_ser_captured_var();
         if !captured_vars.is_empty() {
             Env::get().captured_vars

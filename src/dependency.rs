@@ -8,6 +8,7 @@ use serde_traitobject::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::mem::forget;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sgx_types::*;
@@ -174,72 +175,51 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
         log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
         if rdd_base.get_secure() {
             let now = Instant::now();
-            
             let rdd_id = rdd_base.get_rdd_id();
-            let ser_data = rdd_base.iterator_ser(split);
+            let data_ptr = rdd_base.iterator_raw(split);
+            //let data = rdd_base.iterator_any(split).unwrap().collect::<Vec<_>>();
+            //println!("data = {:?}", data);
             let captured_vars = std::mem::replace(&mut *env::Env::get().captured_vars.lock().unwrap(), HashMap::new());
+            let num_output_splits = self.partitioner.get_num_of_partitions();
+            let mut buckets: Vec<Vec<(K, C)>> = (0..num_output_splits)
+            //let mut buckets: Vec<Vec<(K, Vec<String>)>> = (0..num_output_splits)
+                .map(|_| Vec::new())
+                .collect::<Vec<_>>();
 
-            let mut ser_result: Vec<Vec<u8>> = Vec::new();
-            let mut bucket_num = 0;
-            let mut sub_num: usize = 0;
-            for ser_block in ser_data { 
-                
+            for block_ptr in data_ptr { 
                 let now = Instant::now();
-                println!("sub-partition {:?}", sub_num);
-                let ser_block_idx: Vec<usize> = vec![ser_block.len()];
-                let cap = 1 << (7+10+10);   //128M
-                let mut ser_result_bl = Vec::<u8>::with_capacity(cap); 
-                let mut ser_result_bl_idx = Vec::<usize>::with_capacity(cap>>3);
-                let mut retval = cap;
+                let mut buckets_bl_ptr: usize = 0;
+                log::debug!("enter enclave");
                 let sgx_status = unsafe {
                     secure_executing(
                         env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                        &mut retval,
+                        &mut buckets_bl_ptr,
                         rdd_id,
                         1,   //is_shuffle = true
-                        ser_block.as_ptr() as *const u8,
-                        ser_block_idx.as_ptr() as *const usize,
-                        ser_block_idx.len(),
-                        ser_result_bl.as_mut_ptr() as *mut u8,
-                        ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                        block_ptr as *mut u8,
                         &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                     )
                 };
-                unsafe {
-                    ser_result_bl_idx.set_len(retval);
-                    ser_result_bl.set_len(ser_result_bl_idx[retval-1]);
-                }
                 match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {},
+                    sgx_status_t::SGX_SUCCESS => (),
                     _ => {
                         panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                     },
                 };
-                ser_result_bl_idx.shrink_to_fit();
-                ser_result_bl.shrink_to_fit();
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                println!("in dependency, shuffle write {:?}", dur);
+                log::debug!("in dependency, rdd_id {:?}, shuffle write {:?}", rdd_id, dur);
+                let buckets_bl = unsafe{ Box::from_raw(buckets_bl_ptr as *mut u8 as *mut Vec<Vec<(K, C)>>) };
+                //let buckets_bl = unsafe{ Box::from_raw(buckets_bl_ptr as *mut u8 as *mut Vec<Vec<(K, Vec<String>)>>) };
                 
-                bucket_num = ser_result_bl_idx.len();
-                if ser_result.is_empty() {
-                    for i in 0..bucket_num {
-                        ser_result.push(vec![0; 8]);
-                    }
+                for (i, mut bucket) in buckets_bl.into_iter().enumerate() {
+                    buckets[i].append(&mut bucket); 
                 }
-                let mut pre_idx: usize = 0;
-                for (i, idx) in ser_result_bl_idx.into_iter().enumerate() {
-                    ser_result[i].extend_from_slice(&ser_result_bl[pre_idx..idx]);
-                    pre_idx = idx;
-                }
-                sub_num += 1;
+                log::debug!("success!");
             }
-            
-            let sub_num = sub_num.to_le_bytes();
-            for i in 0..bucket_num { 
-                for (j, v) in sub_num.iter().enumerate() {
-                    ser_result[i][j] = *v;
-                }
-                env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_result[i].clone());
+           
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let ser_bytes = bincode::serialize(&bucket).unwrap();
+                env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
             }
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("in dependency, total {:?}", dur);
@@ -304,7 +284,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
                 self.shuffle_id
             );
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("in dependency, shuffle write {:?}", dur);
+            log::info!("in dependency, shuffle write {:?}", dur);
             env::Env::get().shuffle_manager.get_server_uri()
         }
     }
@@ -316,11 +296,7 @@ extern "C" {
         retval: *mut usize,
         id: usize,
         is_shuffle: u8,
-        input: *const u8,
-        input_idx: *const usize,
-        idx_len: usize,
-        output: *mut u8,
-        output_idx: *mut usize,
+        input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
 }

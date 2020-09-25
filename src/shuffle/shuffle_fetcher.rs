@@ -50,6 +50,7 @@ impl ShuffleFetcher {
             server_queue
         );
         let num_tasks = server_queue.len();
+        println!("num_tasks {:?}", num_tasks);
         let server_queue = Arc::new(Mutex::new(server_queue));
         let failure = Arc::new(AtomicBool::new(false));
         let mut tasks = Vec::with_capacity(num_tasks);
@@ -65,7 +66,7 @@ impl ShuffleFetcher {
                     let mut chunk_uri_str = String::with_capacity(server_uri.len() + 12);
                     chunk_uri_str.push_str(&server_uri);
                     let mut shuffle_chunks = Vec::with_capacity(input_ids.len());
-                    for input_id in input_ids {
+                    for input_id in input_ids.clone() {
                         if failure.load(atomic::Ordering::Acquire) {
                             // Abort early since the work failed in an other future
                             return Err(ShuffleError::Other);
@@ -89,6 +90,7 @@ impl ShuffleFetcher {
                             return Err(ShuffleError::FailedFetchOp);
                         }
                     }
+                    println!("input_ids {:?}, shuffle chunks len {:?}", input_ids, shuffle_chunks.len());
                     Ok::<Box<dyn Iterator<Item = (K, V)> + Send>, _>(Box::new(
                         shuffle_chunks.into_iter().flatten(),
                     ))

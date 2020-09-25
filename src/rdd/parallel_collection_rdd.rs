@@ -36,11 +36,7 @@ extern "C" {
         retval: *mut usize,
         id: usize,
         is_shuffle: u8,
-        input: *const u8,
-        input_idx: *const usize,
-        idx_len: usize,
-        output: *mut u8,
-        output_idx: *mut usize,
+        input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
 }
@@ -73,78 +69,50 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, id: usize) -> Vec<Vec<u8>> {
+    fn secure_iterator(&self, id: usize) -> Vec<usize> {
         let data = self.values.clone();  
         let len = data.len();
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
         let data_size = std::mem::size_of::<T>();  //may need revising when the type of element is not trivial
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cap = 1 << (7+10+10);  //128MB
-        
-        //it's needed without sub-partition
-        //let cap = cap << 5; 
         
         //sub-partition
         let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
         let mut cur = 0;
-        let mut ser_result: Vec<Vec<u8>> = Vec::new();
-        let mut i = 0;
-
+        let mut result_ptr = Vec::new();
         while cur < len {
             let next = match cur + block_len > len {
                 true => len,
                 false => cur + block_len,
             };
-            let now = Instant::now(); 
-            //In future, the serialized_data is off-the-shelf, 
-            //the only thing that needs to do is sub-partition to serialized_block
-            let ser_block: Vec<u8> = bincode::serialize(&data[cur..next]).unwrap();
-            
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("sub-partition {:?}", i);
-            println!("in ParallelCollectionRdd, ser before entering {:?}", dur);
-
-            let ser_block_idx: Vec<usize> = vec![ser_block.len()];
-            let mut ser_result_bl = Vec::<u8>::with_capacity(cap);
-            let mut ser_result_bl_idx = Vec::<usize>::with_capacity(1);
-            let mut retval = 1;
+            let block = Box::new((&data[cur..next]).to_vec());
+            let block_ptr = Box::into_raw(block);
+            let mut result_bl_ptr: usize = 0;
             let now = Instant::now();
             let sgx_status = unsafe {
                 secure_executing(
                     Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut retval,
+                    &mut result_bl_ptr,
                     id,
                     0,   //false
-                    ser_block.as_ptr() as *const u8,
-                    ser_block_idx.as_ptr() as *const usize,
-                    ser_block_idx.len(),
-                    ser_result_bl.as_mut_ptr() as *mut u8,
-                    ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                    block_ptr as *mut u8,
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
-            unsafe {
-                ser_result_bl_idx.set_len(retval);
-                ser_result_bl.set_len(ser_result_bl_idx[retval-1]);
-            }
-            assert!(ser_result_bl_idx.len()==1 
-                    && ser_result_bl.len()==*ser_result_bl_idx.last().unwrap());
-            //log::info!("retval = {}, ser_result_bl = {:?}", retval, ser_result_bl);
+            let block = unsafe{ Box::from_raw(block_ptr) };
             match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                 },
             };
-            ser_result_bl.shrink_to_fit();
-            ser_result.push(ser_result_bl);
+            result_ptr.push(result_bl_ptr);
            
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("in ParallelCollectionRdd, compute {:?}", dur);
-            i += 1;
             cur = next;  
         }
-        ser_result  
+        result_ptr  
     }
 }
 
@@ -304,7 +272,7 @@ impl<T: Data> RddBase for ParallelCollection<T> {
         self.rdd_vals.splits_.len()
     }
 
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -350,7 +318,7 @@ impl<T: Data> Rdd for ParallelCollection<T> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<T>>() {
             s.secure_iterator(id)
         } else {

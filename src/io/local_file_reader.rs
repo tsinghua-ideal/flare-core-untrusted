@@ -27,11 +27,7 @@ extern "C" {
         retval: *mut usize,
         id: usize,
         is_shuffle: u8,
-        input: *const u8,
-        input_idx: *const usize,
-        idx_len: usize,
-        output: *mut u8,
-        output_idx: *mut usize,
+        input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
 }
@@ -361,7 +357,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             true
         }
 
-        fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+        fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
             self.secure_compute(split, self.get_rdd_id())
         }
 
@@ -453,7 +449,7 @@ impl Rdd for LocalFsReader<BytesReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let files_by_part = self.load_local_files().unwrap();
         let idx = split.idx;
@@ -464,8 +460,9 @@ impl Rdd for LocalFsReader<BytesReader> {
             .map(move |files| BytesReader { files, host, idx });
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cap = 1 << (7+10+10);  //128MB
-        let mut ser_result: Vec<Vec<u8>> = Vec::new();
-        
+        let ser_result = Vec::new();
+
+        /*
         for ser_block_tmp in data { 
             let mut ser_block = Vec::with_capacity(cap); 
             let mut ser_block_idx = Vec::with_capacity(ser_block_tmp.files.len());
@@ -509,6 +506,7 @@ impl Rdd for LocalFsReader<BytesReader> {
             ser_result_bl.shrink_to_fit();
             ser_result.push(ser_result_bl);
         }
+        */
         ser_result
     }
 }
@@ -530,7 +528,7 @@ impl Rdd for LocalFsReader<FileReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
         Vec::new()
     }
 }

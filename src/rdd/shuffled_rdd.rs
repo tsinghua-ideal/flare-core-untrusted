@@ -23,11 +23,7 @@ extern "C" {
         retval: *mut usize,
         id: usize,
         is_shuffle: u8,
-        input: *const u8,
-        input_idx: *const usize,
-        idx_len: usize,
-        output: *mut u8,
-        output_idx: *mut usize,
+        input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
 }
@@ -150,7 +146,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> RddBase for ShuffledRdd<K, V, C> {
         Some(self.part.clone())
     }
 
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -210,112 +206,83 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
         //TODO K, V both need encryption?
         log::debug!("compute inside shuffled rdd");
 
         let now = Instant::now();
-        let fut = ShuffleFetcher::secure_fetch(self.shuffle_id, split.get_index());
-        let ser_data_set = futures::executor::block_on(fut).unwrap();
+        //let fut = ShuffleFetcher::secure_fetch(self.shuffle_id, split.get_index());
+        let fut = ShuffleFetcher::fetch::<K, C>(self.shuffle_id, split.get_index());
+        let buckets: Vec<(K, C)> = futures::executor::block_on(fut).unwrap().into_iter().collect();
+        let data_ptr = Box::into_raw(Box::new(buckets));
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in ShuffledRdd, fetch {:?}", dur);
-
-        let now = Instant::now();
-        let cap = 1 << (2+10+10+10);   //4G  
-        let mut ser_data = Vec::<u8>::with_capacity(cap);
-        let mut ser_data_idx = Vec::<usize>::with_capacity(cap>>3);
-        let mut idx: usize = 0;
-        for (i, mut ser_data_bl) in ser_data_set.into_iter().enumerate() {
-            idx += ser_data_bl.len();
-            ser_data.append(&mut ser_data_bl);
-            ser_data_idx.push(idx);
-        } 
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in ShuffledRdd, merge ser data {:?}", dur);
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new()); 
         let now = Instant::now();
-        let mut ser_result = Vec::<u8>::with_capacity(cap);
-        let mut ser_result_idx = Vec::<usize>::with_capacity(cap>>3);
-        let mut retval = cap;
+        let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_executing(
                 Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                &mut retval,
+                &mut result_ptr,
                 self.get_rdd_id(),  //shuffle rdd id
                 1,   //is_shuffle = true
-                ser_data.as_ptr() as *const u8,
-                ser_data_idx.as_ptr() as *const usize,
-                ser_data_idx.len(),
-                ser_result.as_mut_ptr() as *mut u8,
-                ser_result_idx.as_mut_ptr() as *mut usize,
+                data_ptr as *mut u8, 
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )
         };
-        unsafe {
-            ser_result_idx.set_len(retval);
-            ser_result.set_len(ser_result_idx[retval-1]);
-        }
+        let buckets = unsafe{ Box::from_raw(data_ptr) };
         match sgx_status {
             sgx_status_t::SGX_SUCCESS => {},
             _ => {
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
             },
         };
-        ser_result_idx.shrink_to_fit();
-        ser_result.shrink_to_fit();
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in ShuffledRdd, shuffle read {:?}", dur);
         
         log::debug!("finish shuffle read");
 
-        let now = Instant::now();
-        let ser_data = ser_result;
-        let ser_data_idx = ser_result_idx;
-       
-        let cap = 1 << (7+10+10);  //128MB
-        let mut ser_result: Vec<Vec<u8>> = Vec::new();
-        let mut pre_idx: usize = 0;
+        let data = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<Self::Item>) };
+        let data_size = std::mem::size_of::<Self::Item>();
+        let len = data.len();
 
-        for idx in ser_data_idx {
-            let ser_block = &ser_data[pre_idx..idx];
-            let ser_block_idx: Vec<usize> = vec![ser_block.len()];
-            let mut ser_result_bl = Vec::<u8>::with_capacity(cap);
-            let mut ser_result_bl_idx = Vec::<usize>::with_capacity(1);
-            let mut retval = 1;
+        //sub-partition
+        let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
+        let mut cur = 0;
+        let mut result_ptr = Vec::new();
+        while cur < len {
+            let next = match cur + block_len > len {
+                true => len,
+                false => cur + block_len,
+            };
+            let block = Box::new((&data[cur..next]).to_vec());
+            let block_ptr = Box::into_raw(block);
+            let mut result_bl_ptr: usize = 0;
+            let now = Instant::now();
             let sgx_status = unsafe {
                 secure_executing(
                     Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut retval,
+                    &mut result_bl_ptr,
                     id,
-                    0,
-                    ser_block.as_ptr() as *const u8,
-                    ser_block_idx.as_ptr() as *const usize,
-                    ser_block_idx.len(),
-                    ser_result_bl.as_mut_ptr() as *mut u8,
-                    ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                    0,   //false
+                    block_ptr as *mut u8,
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
-            unsafe {
-                ser_result_bl_idx.set_len(retval);
-                ser_result_bl.set_len(ser_result_bl_idx[retval-1]);
-            }
-            //log::info!("retval = {}, result = {:?}, len = {}, cap = {}", retval, serialized_result_bl, serialized_result_bl.len(), serialized_result_bl.capacity());
+            let block = unsafe{ Box::from_raw(block_ptr) };
             match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                 },
             };
-            ser_result_bl.shrink_to_fit();
-            ser_result.push(ser_result_bl);
 
-            pre_idx = idx;
+            result_ptr.push(result_bl_ptr);
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("in ParallelCollectionRdd, compute {:?}", dur);
+            cur = next;
         }
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in ShuffledRdd, compute {:?}", dur);
-
-        ser_result        
+        result_ptr       
 
     }
 }

@@ -325,7 +325,7 @@ impl<T: Data> RddBase for UnionRdd<T> {
         }
     }
 
-    fn iterator_ser(&self, split: Box<dyn Split>) -> Vec<Vec<u8>> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -382,7 +382,7 @@ impl<T: Data> Rdd for UnionRdd<T> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<Vec<u8>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
         //TODO
         Vec::new()
     }
