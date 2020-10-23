@@ -53,4 +53,4 @@ pub use context::Context;
 pub use error::*;
 pub use io::LocalFsReaderConfig;
 pub use partial::BoundedDouble;
-pub use rdd::{PairRdd, Rdd};
+pub use rdd::{PairRdd, Rdd, encrypt, divide_ct, decrypt, recover_ct};

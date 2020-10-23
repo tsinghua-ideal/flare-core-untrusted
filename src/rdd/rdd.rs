@@ -2,6 +2,7 @@ use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::fs;
 use std::hash::Hash;
 use std::io::{BufWriter, Write};
@@ -22,11 +23,20 @@ use crate::split::Split;
 use crate::utils::bounded_priority_queue::BoundedPriorityQueue;
 use crate::utils::random::{BernoulliCellSampler, BernoulliSampler, PoissonSampler, RandomSampler};
 use crate::{utils, Fn, SerArc, SerBox};
+
+use aes_gcm::Aes128Gcm;
+use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
 use fasthash::MetroHasher;
+use frunk::Generic;
+use frunk::{HNil, HCons};
+use frunk::indices::Here;
+use frunk::monoid::combine_all;
+use frunk::prelude::*;
+use frunk_column::*;
+use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
-use parking_lot::Mutex;
 use sgx_types::*;
 
 mod parallel_collection_rdd;
@@ -63,6 +73,53 @@ extern "C" {
         input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
+}
+
+#[inline(always)]
+fn read_le_u64(input: &mut &[u8]) -> u64 {
+    let (int_bytes, rest) = input.split_at(std::mem::size_of::<u64>());
+    *input = rest;
+    u64::from_le_bytes(int_bytes.try_into().unwrap())
+}
+
+#[inline(always)]
+pub fn encrypt(pt: &[u8]) -> Vec<u8> {
+    let key = GenericArray::from_slice(b"abcdefg hijklmn ");
+    let cipher = Aes128Gcm::new(key);
+    let nonce = GenericArray::from_slice(b"unique nonce");
+    cipher.encrypt(nonce, pt).expect("encryption failure")
+}
+
+#[inline(always)]
+pub fn divide_ct(ct: Vec<u8>, len: usize) -> Vec<Vec<u8>> {
+    let mut ct = ct;
+    let ct_len = ct.len();
+    let step = ct_len / len;
+    let remainder = ct_len % len;
+    let mut ct_div = Vec::with_capacity(len);
+    for idx in 0..len {
+        let mut tmp_ct = ct;
+        if idx != len-1 {
+            ct = tmp_ct.split_off(step);
+        } else {
+            ct = tmp_ct.split_off(step + remainder);
+        }
+        ct_div.push(tmp_ct);
+    }
+    ct_div
+}
+
+#[inline(always)]
+pub fn decrypt(ct: &[u8]) -> Vec<u8> {
+    let key = GenericArray::from_slice(b"abcdefg hijklmn ");
+    let cipher = Aes128Gcm::new(key);
+    let nonce = GenericArray::from_slice(b"unique nonce");
+    cipher.decrypt(nonce, ct).expect("decryption failure")
+}
+
+#[inline(always)]
+pub fn recover_ct(ct_div: Vec<Vec<u8>>) -> Vec<u8> {
+    ct_div.into_iter().flatten().collect::<Vec<u8>>()
 }
 
 // Values which are needed for all RDDs
@@ -247,12 +304,14 @@ pub trait Rdd: RddBase + 'static {
         SerArc::new(MapPartitionsRdd::new(self.get_rdd(), filter_fn))
     }
 
-    fn map<U: Data, F>(&self, f: F) -> SerArc<dyn Rdd<Item = U>>
+    fn map<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = U>>
     where
         F: SerFunc(Self::Item) -> U,
+        FE: SerFunc(Vec<U>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<U>,
         Self: Sized,
     {
-        SerArc::new(MapperRdd::new(self.get_rdd(), f))
+        SerArc::new(MapperRdd::new(self.get_rdd(), f, fe, fd))
     }
 
     fn flat_map<U: Data, F>(&self, f: F) -> SerArc<dyn Rdd<Item = U>>
@@ -542,12 +601,45 @@ pub trait Rdd: RddBase + 'static {
     }
 
     /// Return the count of each unique value in this RDD as a dictionary of (value, count) pairs.
-    fn count_by_value(&self) -> SerArc<dyn Rdd<Item = (Self::Item, u64)>>
+    fn count_by_value<UE, FE, FD>(&self, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = (Self::Item, u64)>>
     where
         Self: Sized,
         Self::Item: Data + Eq + Hash,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
-        self.map(Fn!(|x| (x, 1u64))).reduce_by_key(
+        let fe_c = fe.clone();
+        let fe_wrapper_mp = Fn!(move |v: Vec<(Self::Item, u64)>| {
+            let (vx, vy): (Vec<Self::Item>, Vec<u64>) = v.into_iter().unzip();
+            let ct_x = (fe_c)(vx);
+            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_c = fd.clone();
+        let fd_wrapper_mp = Fn!(move |v: Vec<(UE, u64)>| {
+            let (vx, vy): (Vec<UE>, Vec<u64>) = v.into_iter().unzip();
+            let pt_x = (fd_c)(vx); 
+            pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+
+        let fe_wrapper_rd = Fn!(move |v: Vec<(Self::Item, u64)>| {
+            let len = v.len();
+            let (vx, vy): (Vec<Self::Item>, Vec<u64>) = v.into_iter().unzip();
+            let ct_x = (fe)(vx);
+            let ct_y = encrypt::<>(bincode::serialize(&vy).unwrap().as_ref());
+            let ct_y_div = divide_ct::<>(ct_y, len); 
+            ct_x.into_iter().zip(ct_y_div.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_wrapper_rd = Fn!(move |v: Vec<(UE, Vec<u8>)>| {
+            let (vx, vy): (Vec<UE>, Vec<Vec<u8>>) = v.into_iter().unzip();
+            let pt_x = (fd)(vx);
+            let ct_y = recover_ct::<>(vy); 
+            let pt_y: Vec<u64> = bincode::deserialize(decrypt::<>(ct_y.as_ref()).as_ref()).unwrap();
+            assert_eq!(pt_x.len(), pt_y.len());
+            pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
+        });
+        //TODO modify reduce_by_key
+        self.map(Fn!(|x| (x, 1u64)), fe_wrapper_mp, fd_wrapper_mp).reduce_by_key(
             Box::new(Fn!(|(x, y)| x + y)) as Box<dyn Func((u64, u64)) -> u64>,
             self.number_of_splits(),
         )
@@ -594,18 +686,45 @@ pub trait Rdd: RddBase + 'static {
     }
 
     /// Return a new RDD containing the distinct elements in this RDD.
-    fn distinct_with_num_partitions(
+    fn distinct_with_num_partitions<UE: Data, FE, FD>(
         &self,
         num_partitions: usize,
+        fe: FE,
+        fd: FD,
     ) -> SerArc<dyn Rdd<Item = Self::Item>>
     where
         Self: Sized,
         Self::Item: Data + Eq + Hash,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
+        let fe_c = fe.clone();
+        let fe_wrapper_mp0 = Fn!(move |v: Vec<(Option<Self::Item>, Option<Self::Item>)>| {
+            let (vx, vy): (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
+            let ct_x = (fe_c)(vx.into_iter().map(|x| x.unwrap()).collect::<Vec<_>>());
+            ct_x.into_iter().map(|x| Some(x)).zip(vy.into_iter()).collect::<Vec<_>>()
+        }); 
+        let fd_c = fd.clone();
+        let fd_wrapper_mp0 = Fn!(move |v: Vec<(Option<UE>, Option<Self::Item>)>| {
+            let (vx, vy): (Vec<Option<UE>>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
+            let pt_x = (fd_c)(vx.into_iter().map(|x| x.unwrap()).collect::<Vec<_>>());
+            pt_x.into_iter().map(|x| Some(x)).zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+        let fe_wrapper_rd = fe_wrapper_mp0.clone();
+        let fd_wrapper_rd = fd_wrapper_mp0.clone();       
+        let fe_wrapper_mp1 = Fn!(move |v: Vec<Self::Item>| {
+            let ct = (fe)(v);
+            ct
+        });
+        let fd_wrapper_mp1 = Fn!(move |v: Vec<UE>| {
+            let pt = (fd)(v);
+            pt
+        });
+
         self.map(Box::new(Fn!(|x| (Some(x), None)))
             as Box<
                 dyn Func(Self::Item) -> (Option<Self::Item>, Option<Self::Item>),
-            >)
+            >, fe_wrapper_mp0, fd_wrapper_mp0)
         .reduce_by_key(Box::new(Fn!(|(_x, y)| y)), num_partitions)
         .map(Box::new(Fn!(|x: (
             Option<Self::Item>,
@@ -613,16 +732,18 @@ pub trait Rdd: RddBase + 'static {
         )| {
             let (x, _y) = x;
             x.unwrap()
-        })))
+        })), fe_wrapper_mp1, fd_wrapper_mp1)
     }
 
     /// Return a new RDD containing the distinct elements in this RDD.
-    fn distinct(&self) -> SerArc<dyn Rdd<Item = Self::Item>>
+    fn distinct<UE: Data, FE, FD>(&self, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = Self::Item>>
     where
         Self: Sized,
         Self::Item: Data + Eq + Hash,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
-        self.distinct_with_num_partitions(self.number_of_splits())
+        self.distinct_with_num_partitions(self.number_of_splits(), fe, fd)
     }
 
     /// Return the first element in this RDD.
@@ -923,46 +1044,92 @@ pub trait Rdd: RddBase + 'static {
         ))
     }
 
-    fn intersection<T>(&self, other: Arc<T>) -> SerArc<dyn Rdd<Item = Self::Item>>
+    fn intersection<T, UE, FE, FD>(&self, other: Arc<T>, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = Self::Item>>
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
         T: Rdd<Item = Self::Item> + Sized,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
-        self.intersection_with_num_partitions(other, self.number_of_splits())
+        self.intersection_with_num_partitions(other, self.number_of_splits(), fe, fd)
     }
 
     /// subtract function, same as the one found in apache spark 
     /// example of subtract can be found in subtract.rs
     /// performs a full outer join followed by and intersection with self to get subtraction.
-    fn subtract<T>(&self, other: Arc<T>) -> SerArc<dyn Rdd<Item = Self::Item>>
+    fn subtract<T, UE, FE, FD>(&self, other: Arc<T>, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = Self::Item>>
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
         T: Rdd<Item = Self::Item> + Sized,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
-        self.subtract_with_num_partition(other, self.number_of_splits())
+        self.subtract_with_num_partition(other, self.number_of_splits(), fe, fd)
     }
     
-    fn subtract_with_num_partition<T>(
+    fn subtract_with_num_partition<T, UE, FE, FD>(
         &self,
         other: Arc<T>,
         num_splits: usize,
+        fe: FE,
+        fd: FD,
     ) -> SerArc<dyn Rdd<Item = Self::Item>>
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
         T: Rdd<Item = Self::Item> + Sized,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
+        let fe_c = fe.clone();
+        let fe_wrapper_mp0 = Fn!(move |v: Vec<(Self::Item, Option<Self::Item>)>| {
+            let (vx, vy): (Vec<Self::Item>, Vec<Option<Self::Item>>)= v.into_iter().unzip();
+            let ct_x = (fe_c)(vx);
+            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_c = fd.clone();
+        let fd_wrapper_mp0 = Fn!(move |v: Vec<(UE, Option<Self::Item>)>| {
+            let (vx, vy): (Vec<UE>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
+            let pt_x = (fd_c)(vx); 
+            pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+
+        let fe_c = fe.clone();
+        let fe_wrapper_jn = Fn!(move |v: Vec<(Self::Item, (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>))>| {
+            let (vx, vy): (Vec<Self::Item>, Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>) = v.into_iter().unzip();
+            let ct_x = (fe_c)(vx);
+            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_c = fd.clone();
+        let fd_wrapper_jn = Fn!(move |v: Vec<(UE, (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>))>| {
+            let (vx, vy): (Vec<UE>, Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>) = v.into_iter().unzip();
+            let pt_x = (fd_c)(vx); 
+            pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+
+        //TODO may need to be revised
+        let fe_wrapper_mp1 = Fn!(move |v: Vec<Option<Self::Item>>| {
+            encrypt::<>(bincode::serialize(&v).unwrap().as_ref())
+        });
+        let fd_wrapper_mp1 = Fn!(move |v: Vec<u8>| {
+            bincode::deserialize::<Vec<Option<Self::Item>>>(decrypt::<>(v.as_ref()).as_ref()).unwrap()
+        });
+
+        //TODO cogroup map_partition filter
         let other = other
             .map(Box::new(Fn!(
                 |x: Self::Item| -> (Self::Item, Option<Self::Item>) { (x, None) }
-            )))
+            )), fe_wrapper_mp0.clone(), fd_wrapper_mp0.clone())
             .clone();
         let rdd = self
-            .map(Box::new(Fn!(|x| -> (Self::Item, Option<Self::Item>) {
-                (x, None)
-            })))
+            .map(Box::new(Fn!(
+                |x| -> (Self::Item, Option<Self::Item>) { (x, None) }
+            )), fe_wrapper_mp0, fd_wrapper_mp0)
             .cogroup(
                 other,
                 Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
@@ -977,7 +1144,7 @@ pub trait Rdd: RddBase + 'static {
                 } else {
                     None
                 }
-            })))
+            })), fe_wrapper_mp1, fd_wrapper_mp1)
             .map_partitions(Box::new(Fn!(|iter: Box<
                 dyn Iterator<Item = Option<Self::Item>>,
             >|
@@ -988,30 +1155,70 @@ pub trait Rdd: RddBase + 'static {
                     as Box<dyn Iterator<Item = Self::Item>>
             })));
 
-        let subtraction = self.intersection(Arc::new(rdd));
+        let subtraction = self.intersection(Arc::new(rdd), fe, fd);
         (&*subtraction).register_op_name("subtraction");
         subtraction
     }
 
-    fn intersection_with_num_partitions<T>(
+    fn intersection_with_num_partitions<T, UE, FE, FD>(
         &self,
         other: Arc<T>,
         num_splits: usize,
+        fe: FE,
+        fd: FD,
     ) -> SerArc<dyn Rdd<Item = Self::Item>>
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
         T: Rdd<Item = Self::Item> + Sized,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
+        let fe_c = fe.clone();
+        let fe_wrapper_mp0 = Fn!(move |v: Vec<(Self::Item, Option<Self::Item>)>| {
+            let (vx, vy): (Vec<Self::Item>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
+            let ct_x = (fe_c)(vx);
+            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_c = fd.clone();
+        let fd_wrapper_mp0 = Fn!(move |v: Vec<(UE, Option<Self::Item>)>| {
+            let (vx, vy): (Vec<UE>, Vec<Option<Self::Item>>)= v.into_iter().unzip();
+            let pt_x = (fd_c)(vx); 
+            pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+
+        let fe_c = fe.clone();
+        let fe_wrapper_jn = Fn!(move |v: Vec<(Self::Item, (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>))>| {
+            let (vx, vy): (Vec<Self::Item>, Vec<(Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>)>)= v.into_iter().unzip();
+            let ct_x = (fe_c)(vx);
+            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_c = fd.clone();
+        let fd_wrapper_jn = Fn!(move |v: Vec<(UE, (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>))>| {
+            let (vx, vy): (Vec<UE>, Vec<(Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>)>) = v.into_iter().unzip();
+            let pt_x = (fd_c)(vx); 
+            pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+        });
+
+        //TODO may need to be revised
+        let fe_wrapper_mp1 = Fn!(move |v: Vec<Option<Self::Item>>| {
+            encrypt::<>(bincode::serialize(&v).unwrap().as_ref())
+        });
+        let fd_wrapper_mp1 = Fn!(move |v: Vec<u8>| {
+            bincode::deserialize::<Vec<Option<Self::Item>>>(decrypt::<>(v.as_ref()).as_ref()).unwrap()
+        });
+
+        //TODO cogroup, map_partition, filter
         let other = other
             .map(Box::new(Fn!(
                 |x: Self::Item| -> (Self::Item, Option<Self::Item>) { (x, None) }
-            )))
+            )), fe_wrapper_mp0.clone(), fd_wrapper_mp0.clone())
             .clone();
         let rdd = self
-            .map(Box::new(Fn!(|x| -> (Self::Item, Option<Self::Item>) {
-                (x, None)
-            })))
+            .map(Box::new(Fn!(
+                |x| -> (Self::Item, Option<Self::Item>) { (x, None) }
+            )), fe_wrapper_mp0, fd_wrapper_mp0)
             .cogroup(
                 other,
                 Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
@@ -1026,7 +1233,7 @@ pub trait Rdd: RddBase + 'static {
                 } else {
                     None
                 }
-            })))
+            })), fe_wrapper_mp1, fd_wrapper_mp1)
             .map_partitions(Box::new(Fn!(|iter: Box<
                 dyn Iterator<Item = Option<Self::Item>>,
             >|
@@ -1049,13 +1256,16 @@ pub trait Rdd: RddBase + 'static {
     /// This operation may be very expensive. If you are grouping in order to perform an
     /// aggregation (such as a sum or average) over each key, using `aggregate_by_key`
     /// or `reduce_by_key` will provide much better performance.
-    fn group_by<K, F>(&self, func: F) -> SerArc<dyn Rdd<Item = (K, Vec<Self::Item>)>>
+    fn group_by<K, F, UE, FE, FD>(&self, func: F, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = (K, Vec<Self::Item>)>>
     where
         Self: Sized,
         K: Data + Hash + Eq,
         F: SerFunc(&Self::Item) -> K,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
-        self.group_by_with_num_partitions(func, self.number_of_splits())
+        self.group_by_with_num_partitions(func, self.number_of_splits(), fe, fd)
     }
 
     /// Return an RDD of grouped items. Each group consists of a key and a sequence of elements
@@ -1067,20 +1277,43 @@ pub trait Rdd: RddBase + 'static {
     /// This operation may be very expensive. If you are grouping in order to perform an
     /// aggregation (such as a sum or average) over each key, using `aggregate_by_key`
     /// or `reduce_by_key` will provide much better performance.
-    fn group_by_with_num_partitions<K, F>(
+    fn group_by_with_num_partitions<K, F, UE, FE, FD>(
         &self,
         func: F,
         num_splits: usize,
+        fe: FE,
+        fd: FD,
     ) -> SerArc<dyn Rdd<Item = (K, Vec<Self::Item>)>>
     where
         Self: Sized,
         K: Data + Hash + Eq,
         F: SerFunc(&Self::Item) -> K,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
+        let fe_c = fe.clone();
+        let fe_wrapper_mp = Fn!(move |v: Vec<(K, Self::Item)>| {
+            let len = v.len();
+            let (vx, vy): (Vec<K>, Vec<Self::Item>) = v.into_iter().unzip();
+            let ct_x = encrypt::<>(bincode::serialize(&vx).unwrap().as_ref());
+            let ct_x_div = divide_ct::<>(ct_x, len);
+            let ct_y = (fe)(vy);
+            ct_x_div.into_iter().zip(ct_y.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_c = fd.clone();
+        let fd_wrapper_mp = Fn!(move |v: Vec<(Vec<u8>, UE)>| {
+            let (vx, vy): (Vec<Vec<u8>>, Vec<UE>) = v.into_iter().unzip();
+            let ct_x = recover_ct::<>(vx); 
+            let pt_x: Vec<K> = bincode::deserialize(decrypt::<>(ct_x.as_ref()).as_ref()).unwrap();
+            let pt_y = (fd)(vy);
+            pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
+        });
+
         self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
             let key = (func)(&val);
             (key, val)
-        })))
+        })), fe_wrapper_mp, fd_wrapper_mp)
         .group_by_key(num_splits)
     }
 
@@ -1093,20 +1326,43 @@ pub trait Rdd: RddBase + 'static {
     /// This operation may be very expensive. If you are grouping in order to perform an
     /// aggregation (such as a sum or average) over each key, using `aggregate_by_key`
     /// or `reduce_by_key` will provide much better performance.
-    fn group_by_with_partitioner<K, F>(
+    fn group_by_with_partitioner<K, F, UE, FE, FD>(
         &self,
         func: F,
         partitioner: Box<dyn Partitioner>,
+        fe: FE,
+        fd: FD,
     ) -> SerArc<dyn Rdd<Item = (K, Vec<Self::Item>)>>
     where
         Self: Sized,
         K: Data + Hash + Eq,
         F: SerFunc(&Self::Item) -> K,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
+        let fe_c = fe.clone();
+        let fe_wrapper_mp = Fn!(move |v: Vec<(K, Self::Item)>| {
+            let len = v.len();
+            let (vx, vy): (Vec<K>, Vec<Self::Item>) = v.into_iter().unzip();
+            let ct_x = encrypt::<>(bincode::serialize(&vx).unwrap().as_ref());
+            let ct_x_div = divide_ct::<>(ct_x, len);
+            let ct_y = (fe)(vy);
+            ct_x_div.into_iter().zip(ct_y.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_c = fd.clone();
+        let fd_wrapper_mp = Fn!(move |v: Vec<(Vec<u8>, UE)>| {
+            let (vx, vy): (Vec<Vec<u8>>, Vec<UE>) = v.into_iter().unzip();
+            let ct_x = recover_ct::<>(vx); 
+            let pt_x: Vec<K> = bincode::deserialize(decrypt::<>(ct_x.as_ref()).as_ref()).unwrap();
+            let pt_y = (fd)(vy);
+            pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
+        });
+        
         self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
             let key = (func)(&val);
             (key, val)
-        })))
+        })), fe_wrapper_mp, fd_wrapper_mp)
         .group_by_key_using_partitioner(partitioner)
     }
 
@@ -1151,16 +1407,36 @@ pub trait Rdd: RddBase + 'static {
     }
 
     /// Creates tuples of the elements in this RDD by applying `f`.
-    fn key_by<T, F>(&self, func: F) -> SerArc<dyn Rdd<Item = (Self::Item, T)>>
+    fn key_by<T, F, UE, FE, FD>(&self, func: F, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = (Self::Item, T)>>
     where
         Self: Sized,
         T: Data,
         F: SerFunc(&Self::Item) -> T,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
+        let fe_wrapper_mp = Fn!(move |v: Vec<(Self::Item, T)>| {
+            let len = v.len();
+            let (vx, vy): (Vec<Self::Item>, Vec<T>) = v.into_iter().unzip();
+            let ct_x = (fe)(vx);
+            let ct_y = encrypt::<>(bincode::serialize(&vy).unwrap().as_ref());
+            let ct_y_div = divide_ct::<>(ct_y, len); 
+            ct_x.into_iter().zip(ct_y_div.into_iter()).collect::<Vec<_>>()
+        });
+        let fd_wrapper_mp = Fn!(move |v: Vec<(UE, Vec<u8>)>| {
+            let (vx, vy): (Vec<UE>, Vec<Vec<u8>>) = v.into_iter().unzip();
+            let pt_x = (fd)(vx);
+            let ct_y = recover_ct::<>(vy); 
+            let pt_y: Vec<T> = bincode::deserialize(decrypt::<>(ct_y.as_ref()).as_ref()).unwrap();
+            assert_eq!(pt_x.len(), pt_y.len());
+            pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
+        });
+       
         self.map(Fn!(move |k: Self::Item| -> (Self::Item, T) {
             let t = (func)(&k);
             (k, t)
-        }))
+        }), fe_wrapper_mp, fd_wrapper_mp)
     }
 
     /// Check if the RDD contains no elements at all. Note that an RDD may be empty even when it
@@ -1198,13 +1474,25 @@ pub trait Rdd: RddBase + 'static {
     /// # Notes
     /// This method should only be used if the resulting array is expected to be small, as
     /// all the data is loaded into the driver's memory.
-    fn top(&self, num: usize) -> Result<Vec<Self::Item>>
+    fn top<UE, FE, FD>(&self, num: usize, fe: FE, fd: FD) -> Result<Vec<Self::Item>>
     where
         Self: Sized,
         Self::Item: Data + Ord,
+        UE: Data,
+        FE: SerFunc(Vec<Self::Item>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<Self::Item>,
     {
+        let fe_c = fe.clone();
+        let fe_wrapper_mp = Fn!(move |v: Vec<Reverse<Self::Item>>| {
+            (fe_c)(v.into_iter().map(|x| x.0).collect::<Vec<_>>())
+        });
+        let fd_c = fd.clone();
+        let fd_wrapper_mp = Fn!(move |v: Vec<UE>| {
+            (fd_c)(v).into_iter().map(|x| Reverse(x)).collect::<Vec<_>>()
+        });
+
         Ok(self
-            .map(Fn!(|x| Reverse(x)))
+            .map(Fn!(|x| Reverse(x)), fe_wrapper_mp, fd_wrapper_mp)
             .take_ordered(num)?
             .into_iter()
             .map(|x| x.0)

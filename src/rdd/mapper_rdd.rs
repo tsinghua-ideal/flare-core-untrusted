@@ -13,9 +13,11 @@ use parking_lot::Mutex;
 use serde_derive::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-pub struct MapperRdd<T: Data, U: Data, F>
+pub struct MapperRdd<T: Data, U: Data, UE: Data, F, FE, FD>
 where
     F: Func(T) -> U + Clone,
+    FE: Func(Vec<U>) -> Vec<UE> + Clone, 
+    FD: Func(Vec<UE>) -> Vec<U> + Clone,
 {
     #[serde(skip_serializing, skip_deserializing)]
     name: Mutex<String>,
@@ -26,12 +28,17 @@ where
     f: F,
     pinned: AtomicBool,
     _marker_t: PhantomData<T>, // phantom data is necessary because of type parameter T
+    _marker_ue: PhantomData<UE>,
+    _marker_fe: PhantomData<FE>,
+    _marker_fd: PhantomData<FD>,
 }
 
 // Can't derive clone automatically
-impl<T: Data, U: Data, F> Clone for MapperRdd<T, U, F>
+impl<T: Data, U: Data, UE: Data, F, FE, FD> Clone for MapperRdd<T, U, UE, F, FE, FD>
 where
     F: Func(T) -> U + Clone,
+    FE: Func(Vec<U>) -> Vec<UE> + Clone,
+    FD: Func(Vec<UE>) -> Vec<U> + Clone,
 {
     fn clone(&self) -> Self {
         MapperRdd {
@@ -42,15 +49,20 @@ where
             f: self.f.clone(),
             pinned: AtomicBool::new(self.pinned.load(SeqCst)),
             _marker_t: PhantomData,
+            _marker_ue: PhantomData,
+            _marker_fe: PhantomData,
+            _marker_fd: PhantomData,
         }
     }
 }
 
-impl<T: Data, U: Data, F> MapperRdd<T, U, F>
+impl<T: Data, U: Data, UE: Data, F, FE, FD> MapperRdd<T, U, UE, F, FE, FD>
 where
     F: SerFunc(T) -> U,
+    FE: SerFunc(Vec<U>) -> Vec<UE>,
+    FD: SerFunc(Vec<UE>) -> Vec<U>,
 {
-    pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, f: F) -> Self {
+    pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
             .push(Dependency::NarrowDependency(Arc::new(
@@ -66,6 +78,9 @@ where
             f,
             pinned: AtomicBool::new(false),
             _marker_t: PhantomData,
+            _marker_ue: PhantomData,
+            _marker_fe: PhantomData,
+            _marker_fd: PhantomData,
         }
     }
 
@@ -75,9 +90,11 @@ where
     }
 }
 
-impl<T: Data, U: Data, F> RddBase for MapperRdd<T, U, F>
+impl<T: Data, U: Data, UE: Data, F, FE, FD> RddBase for MapperRdd<T, U, UE, F, FE, FD>
 where
     F: SerFunc(T) -> U,
+    FE: SerFunc(Vec<U>) -> Vec<UE>,
+    FD: SerFunc(Vec<UE>) -> Vec<U>,
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -153,9 +170,11 @@ where
     }
 }
 
-impl<T: Data, V: Data, U: Data, F> RddBase for MapperRdd<T, (V, U), F>
+impl<T: Data, V: Data, U: Data, UE: Data, F, FE, FD> RddBase for MapperRdd<T, (V, U), UE, F, FE, FD>
 where
     F: SerFunc(T) -> (V, U),
+    FE: SerFunc(Vec<(V, U)>) -> Vec<UE>,  //need check
+    FD: SerFunc(Vec<UE>) -> Vec<(V, U)>,  //need check
 {
     fn cogroup_iterator_any(
         &self,
@@ -168,9 +187,11 @@ where
     }
 }
 
-impl<T: Data, U: Data, F: 'static> Rdd for MapperRdd<T, U, F>
+impl<T: Data, U: Data, UE: Data, F: 'static, FE: 'static, FD: 'static> Rdd for MapperRdd<T, U, UE, F, FE, FD>
 where
     F: SerFunc(T) -> U,
+    FE: SerFunc(Vec<U>) -> Vec<UE>,
+    FD: SerFunc(Vec<UE>) -> Vec<U>,
 {
     type Item = U;
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {

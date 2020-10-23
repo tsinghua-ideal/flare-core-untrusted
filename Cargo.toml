@@ -51,6 +51,9 @@ serde_closure = { git = "https://github.com/AmbitionXiang/serde_closure" }
 serde_derive = "1.0.106"
 uriparse = "0.6.1"
 
+# encryption
+aes-gcm = "0.7.0"
+
 # dynamic typing
 downcast-rs = "1.1.1"
 dyn-clone = "1.0.1"
@@ -61,9 +64,14 @@ serde_traitobject = "0.2.4"
 rusoto_core = { version = "0.43", optional = true }
 rusoto_s3 = { version = "0.43", optional = true }
 
-#rust sgx sdk
+# rust sgx sdk
 sgx_types = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
 sgx_urts = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
+
+# transpose
+frunk = "0.3.1"
+frunk_core = "0.3.1"
+frunk-column = { git = "https://github.com/AmbitionXiang/frunk-column" }
 
 [build-dependencies]
 capnpc = "0.12.1"

@@ -73,10 +73,13 @@ impl LocalFsReaderConfig {
 }
 
 impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
-    fn make_reader<F, U>(self, context: Arc<Context>, decoder: F) -> SerArc<dyn Rdd<Item = U>>
+    fn make_reader<F, U, UE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = U>>
     where
         F: SerFunc(Vec<u8>) -> U,
         U: Data,
+        UE: Data,
+        FE: SerFunc(Vec<U>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<U>,
     {
         let reader = LocalFsReader::<BytesReader>::new(self, context);
         let read_files = Fn!(
@@ -85,20 +88,24 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
                     as Box<dyn Iterator<Item = _>>
             }
         );
+        //TODO: map_partition
         let files_per_executor = Arc::new(
             MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files).pin(),
         );
-        let decoder = MapperRdd::new(files_per_executor, decoder).pin();
+        let decoder = MapperRdd::new(files_per_executor, decoder, fe, fd).pin();
         decoder.register_op_name("local_fs_reader<bytes>");
         SerArc::new(decoder)
     }
 }
 
 impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
-    fn make_reader<F, U>(self, context: Arc<Context>, decoder: F) -> SerArc<dyn Rdd<Item = U>>
+    fn make_reader<F, U, UE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = U>>
     where
         F: SerFunc(PathBuf) -> U,
         U: Data,
+        UE: Data,
+        FE: SerFunc(Vec<U>) -> Vec<UE>,
+        FD: SerFunc(Vec<UE>) -> Vec<U>,
     {
         let reader = LocalFsReader::<FileReader>::new(self, context);
         let read_files = Fn!(
@@ -107,10 +114,11 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
                     as Box<dyn Iterator<Item = _>>
             }
         );
+        //TODO map_partition
         let files_per_executor = Arc::new(
             MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files).pin(),
         );
-        let decoder = MapperRdd::new(files_per_executor, decoder).pin();
+        let decoder = MapperRdd::new(files_per_executor, decoder, fe, fd).pin();
         decoder.register_op_name("local_fs_reader<files>");
         SerArc::new(decoder)
     }

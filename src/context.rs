@@ -471,14 +471,14 @@ impl Context {
         self.next_shuffle_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub fn make_rdd<T: Data, I>(
+    pub fn make_rdd<T: Data, TT: Data, I>(   //T temp
         self: &Arc<Self>,
         seq: I,
         num_slices: usize,
         secure: bool,
     ) -> SerArc<dyn Rdd<Item = T>>
     where
-        I: IntoIterator<Item = T>,
+        I: IntoIterator<Item = TT>,
     {
         let rdd = self.parallelize(seq, num_slices, secure);
         rdd.register_op_name("make_rdd");
@@ -500,29 +500,41 @@ impl Context {
         rdd
     }
 
-    pub fn parallelize<T: Data, I>(
+    pub fn parallelize<T: Data, TT: Data, I>(
         self: &Arc<Self>,
         seq: I,
         num_slices: usize,
         secure: bool,
     ) -> SerArc<dyn Rdd<Item = T>>
     where
-        I: IntoIterator<Item = T>,
+        I: IntoIterator<Item = TT>,
     {
-        SerArc::new(ParallelCollection::new(self.clone(), seq, num_slices, secure))
+        if secure {
+            SerArc::new(ParallelCollection::<T, TT>::new(self.clone(), Vec::new(), seq, num_slices, secure))
+        } else {
+            let seq: Vec<_> = seq.into_iter().collect();
+            let p_seq = Box::into_raw(Box::new(seq));
+            // T == TT
+            let seq = *unsafe{ Box::from_raw(p_seq as *mut Vec<T>) };
+            SerArc::new(ParallelCollection::<T, TT>::new(self.clone(), seq, Vec::new(), num_slices, secure))
+        }
     }
 
     /// Load from a distributed source and turns it into a parallel collection.
-    pub fn read_source<F, C, I: Data, O: Data>(
+    pub fn read_source<F, C, FE, FD, I: Data, O: Data, OE: Data>(
         self: &Arc<Self>,
         config: C,
         func: F,
+        fe: FE,
+        fd: FD,
     ) -> impl Rdd<Item = O>
     where
         F: SerFunc(I) -> O,
         C: ReaderConfiguration<I>,
+        FE: SerFunc(Vec<O>) -> Vec<OE>,
+        FD: SerFunc(Vec<OE>) -> Vec<O>,
     {
-        config.make_reader(self.clone(), func)
+        config.make_reader(self.clone(), func, fe, fd)
     }
 
     pub fn run_job<T: Data, U: Data, F>(

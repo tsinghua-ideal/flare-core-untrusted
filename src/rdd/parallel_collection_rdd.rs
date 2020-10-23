@@ -117,23 +117,24 @@ impl<T: Data> ParallelCollectionSplit<T> {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ParallelCollectionVals<T> {
+pub struct ParallelCollectionVals<T, TE> {
     vals: Arc<RddVals>,
     ecall_ids: Arc<Mutex<Vec<usize>>>,
     #[serde(skip_serializing, skip_deserializing)]
     context: Weak<Context>,
     splits_: Vec<Arc<Vec<T>>>,
+    splits_enc_: Vec<Arc<Vec<TE>>>,
     num_slices: usize,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ParallelCollection<T> {
+pub struct ParallelCollection<T, TE> {
     #[serde(skip_serializing, skip_deserializing)]
     name: Mutex<String>,
-    rdd_vals: Arc<ParallelCollectionVals<T>>,
+    rdd_vals: Arc<ParallelCollectionVals<T, TE>>,
 }
 
-impl<T: Data> Clone for ParallelCollection<T> {
+impl<T: Data, TE: Data> Clone for ParallelCollection<T, TE> {
     fn clone(&self) -> Self {
         ParallelCollection {
             name: Mutex::new(self.name.lock().clone()),
@@ -142,23 +143,26 @@ impl<T: Data> Clone for ParallelCollection<T> {
     }
 }
 
-impl<T: Data> ParallelCollection<T> {
-    pub fn new<I>(context: Arc<Context>, data: I, num_slices: usize, secure: bool) -> Self
+impl<T: Data, TE: Data> ParallelCollection<T, TE> {
+    pub fn new<I, IE>(context: Arc<Context>, data: I, data_enc: IE, num_slices: usize, secure: bool) -> Self
     where
         I: IntoIterator<Item = T>,
-    {
+        IE: IntoIterator<Item = TE>,
+    { 
         ParallelCollection {
             name: Mutex::new("parallel_collection".to_owned()),
             rdd_vals: Arc::new(ParallelCollectionVals {
                 context: Arc::downgrade(&context),
                 vals: Arc::new(RddVals::new(context.clone(), secure)), //chain of security
                 ecall_ids: Arc::new(Mutex::new(Vec::new())),
-                splits_: ParallelCollection::slice(data, num_slices),
+                splits_: ParallelCollection::<T, TE>::slice(data, num_slices),
+                splits_enc_: ParallelCollection::<T, TE>::slice_enc(data_enc, num_slices),
                 num_slices, //field init shorthand
             }),
         }
     }
 
+    /*
     pub fn from_chunkable<C>(context: Arc<Context>, data: C, secure: bool) -> Self
     where
         C: Chunkable<T>,
@@ -176,6 +180,7 @@ impl<T: Data> ParallelCollection<T> {
             rdd_vals: Arc::new(rdd_vals),
         }
     }
+    */
 
     fn slice<I>(data: I, num_slices: usize) -> Vec<Arc<Vec<T>>>
     where
@@ -207,9 +212,41 @@ impl<T: Data> ParallelCollection<T> {
             output
         }
     }
+
+    fn slice_enc<IE>(data_enc: IE, num_slices: usize) -> Vec<Arc<Vec<TE>>>
+    where
+        IE: IntoIterator<Item = TE>,
+    {
+        if num_slices < 1 {
+            panic!("Number of slices should be greater than or equal to 1");
+        } else {
+            let mut slice_count = 0;
+            let data_enc: Vec<_> = data_enc.into_iter().collect();
+            let data_len = data_enc.len();
+            let mut end = ((slice_count + 1) * data_len) / num_slices;
+            let mut output = Vec::new();
+            let mut tmp = Vec::new();
+            let mut iter_count = 0;
+            for i in data_enc {
+                if iter_count < end {
+                    tmp.push(i);
+                    iter_count += 1;
+                } else {
+                    slice_count += 1;
+                    end = ((slice_count + 1) * data_len) / num_slices;
+                    output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
+                    tmp.push(i);
+                    iter_count += 1;
+                }
+            }
+            output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
+            output
+        }
+    }
+
 }
 
-impl<K: Data, V: Data> RddBase for ParallelCollection<(K, V)> {
+impl<K: Data, V: Data, TE: Data> RddBase for ParallelCollection<(K, V), TE> {
     fn cogroup_iterator_any(
         &self,
         split: Box<dyn Split>,
@@ -221,7 +258,7 @@ impl<K: Data, V: Data> RddBase for ParallelCollection<(K, V)> {
     }
 }
 
-impl<T: Data> RddBase for ParallelCollection<T> {
+impl<T: Data, TE: Data> RddBase for ParallelCollection<T, TE> {
     fn get_rdd_id(&self) -> usize {
         self.rdd_vals.vals.id
     }
@@ -257,19 +294,35 @@ impl<T: Data> RddBase for ParallelCollection<T> {
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
-        (0..self.rdd_vals.splits_.len())
-            .map(|i| {
-                Box::new(ParallelCollectionSplit::new(
-                    self.rdd_vals.vals.id as i64,
-                    i,
-                    self.rdd_vals.splits_[i as usize].clone(),
-                )) as Box<dyn Split>
-            })
-            .collect::<Vec<Box<dyn Split>>>()
+        if self.get_secure() {
+            (0..self.rdd_vals.splits_.len())
+                .map(|i| {
+                    Box::new(ParallelCollectionSplit::new(
+                        self.rdd_vals.vals.id as i64,
+                        i,
+                        self.rdd_vals.splits_enc_[i as usize].clone(),
+                    )) as Box<dyn Split>
+                })
+                .collect::<Vec<Box<dyn Split>>>()
+        } else {
+            (0..self.rdd_vals.splits_.len())
+                .map(|i| {
+                    Box::new(ParallelCollectionSplit::new(
+                        self.rdd_vals.vals.id as i64,
+                        i,
+                        self.rdd_vals.splits_[i as usize].clone(),
+                    )) as Box<dyn Split>
+                })
+                .collect::<Vec<Box<dyn Split>>>()
+        }
     }
 
     fn number_of_splits(&self) -> usize {
-        self.rdd_vals.splits_.len()
+        if self.get_secure() {
+            self.rdd_vals.splits_.len()
+        } else {
+            self.rdd_vals.splits_enc_.len()
+        }
     }
 
     fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
@@ -295,7 +348,7 @@ impl<T: Data> RddBase for ParallelCollection<T> {
     }
 }
 
-impl<T: Data> Rdd for ParallelCollection<T> {
+impl<T: Data, TE: Data> Rdd for ParallelCollection<T, TE> {
     type Item = T;
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
         Arc::new(ParallelCollection {
@@ -319,7 +372,7 @@ impl<T: Data> Rdd for ParallelCollection<T> {
     }
 
     fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
-        if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<T>>() {
+        if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
             s.secure_iterator(id)
         } else {
             panic!(
