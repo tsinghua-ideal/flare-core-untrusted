@@ -13,8 +13,7 @@ use crate::context::Context;
 use crate::dependency::{Dependency, NarrowDependencyTrait};
 use crate::error::{Error, Result};
 use crate::rdd::*;
-use crate::rdd::{Rdd, RddBase, RddVals};
-use crate::serializable_traits::{AnyData, Data};
+use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use crate::utils;
 
@@ -117,22 +116,33 @@ impl NarrowDependencyTrait for CoalescedSplitDep {
 /// the preferred location of each new partition overlaps with as many preferred locations of its
 /// parent partitions
 #[derive(Serialize, Deserialize, Clone)]
-pub struct CoalescedRdd<T>
+pub struct CoalescedRdd<T, TE, FE, FD>
 where
     T: Data,
+    TE: Data,
+    FE: Func(Vec<T>) -> Vec<TE> + Clone,
+    FD: Func(Vec<TE>) -> Vec<T> + Clone, 
 {
     vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
     parent: Arc<dyn Rdd<Item = T>>,
     ecall_ids: Arc<Mutex<Vec<usize>>>,
     max_partitions: usize,
+    fe: FE,
+    fd: FD,
 }
 
-impl<T: Data> CoalescedRdd<T> {
+impl<T, TE, FE, FD> CoalescedRdd<T, TE, FE, FD> 
+where
+    T: Data,
+    TE: Data,
+    FE: Func(Vec<T>) -> Vec<TE> + Clone,
+    FD: Func(Vec<TE>) -> Vec<T> + Clone, 
+{
     /// ## Arguments
     ///
     /// max_partitions: number of desired partitions in the coalesced RDD
-    pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, max_partitions: usize) -> Self {
+    pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, max_partitions: usize, fe: FE, fd: FD) -> Self {
         let vals = RddVals::new(prev.get_context(), prev.get_secure());
         let ecall_ids = prev.get_ecall_ids();
         CoalescedRdd {
@@ -140,11 +150,19 @@ impl<T: Data> CoalescedRdd<T> {
             parent: prev,
             ecall_ids,
             max_partitions,
+            fe,
+            fd,
         }
     }
 }
 
-impl<T: Data> RddBase for CoalescedRdd<T> {
+impl<T, TE, FE, FD> RddBase for CoalescedRdd<T, TE, FE, FD>
+where 
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
     fn splits(&self) -> Vec<Box<dyn Split>> {
         let partition_coalescer = DefaultPartitionCoalescer::default();
         partition_coalescer
@@ -205,7 +223,7 @@ impl<T: Data> RddBase for CoalescedRdd<T> {
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -220,7 +238,13 @@ impl<T: Data> RddBase for CoalescedRdd<T> {
     }
 }
 
-impl<T: Data> Rdd for CoalescedRdd<T> {
+impl<T, TE, FE, FD> Rdd for CoalescedRdd<T, TE, FE, FD>
+where 
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
     type Item = T;
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>>
     where
@@ -249,10 +273,32 @@ impl<T: Data> Rdd for CoalescedRdd<T> {
         Ok(Box::new(iter.into_iter().flatten()) as Box<dyn Iterator<Item = Self::Item>>)
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+        //TODO need revision
         self.parent.secure_compute(split, id)
     }
 
+}
+
+impl<T, TE, FE, FD> RddE for CoalescedRdd<T, TE, FE, FD>
+where 
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
+    type ItemE = TE;
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(self.clone())
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    }
 }
 
 type SplitIdx = usize;

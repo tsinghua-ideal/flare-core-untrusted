@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use crate::Fn;
 use crate::context::Context;
 use crate::dependency::Dependency;
 use crate::env::Env;
-use crate::error::Result;
-use crate::rdd::{Rdd, RddBase, RddVals};
-use crate::serializable_traits::{AnyData, Data};
+use crate::error::{Error, Result};
+use crate::rdd::{Rdd, RddBase, RddE, RddVals};
+use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use parking_lot::Mutex;
 use serde_derive::{Deserialize, Serialize};
@@ -39,6 +40,12 @@ extern "C" {
         input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+enum DataForm<T, TE> {
+    Plaintext(Vec<Arc<Vec<T>>>),
+    Ciphertext(Vec<Arc<Vec<TE>>>),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -122,43 +129,74 @@ pub struct ParallelCollectionVals<T, TE> {
     ecall_ids: Arc<Mutex<Vec<usize>>>,
     #[serde(skip_serializing, skip_deserializing)]
     context: Weak<Context>,
-    splits_: Vec<Arc<Vec<T>>>,
-    splits_enc_: Vec<Arc<Vec<TE>>>,
+    splits_: DataForm<T, TE>,
     num_slices: usize,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ParallelCollection<T, TE> {
+pub struct ParallelCollection<T, TE, FE, FD> 
+where
+    FE: Func(Vec<T>) -> Vec<TE> + Clone,
+    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+{
     #[serde(skip_serializing, skip_deserializing)]
     name: Mutex<String>,
     rdd_vals: Arc<ParallelCollectionVals<T, TE>>,
+    fe: FE,
+    fd: FD,
 }
 
-impl<T: Data, TE: Data> Clone for ParallelCollection<T, TE> {
+impl<T, TE, FE, FD> Clone for ParallelCollection<T, TE, FE, FD> 
+where
+    T: Data,
+    TE: Data,
+    FE: Func(Vec<T>) -> Vec<TE> + Clone,
+    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+{
     fn clone(&self) -> Self {
         ParallelCollection {
             name: Mutex::new(self.name.lock().clone()),
             rdd_vals: self.rdd_vals.clone(),
+            fe: self.fe.clone(),
+            fd: self.fd.clone(),
         }
     }
 }
 
-impl<T: Data, TE: Data> ParallelCollection<T, TE> {
-    pub fn new<I, IE>(context: Arc<Context>, data: I, data_enc: IE, num_slices: usize, secure: bool) -> Self
+impl<T, TE, FE, FD> ParallelCollection<T, TE, FE, FD> 
+where
+    T: Data,
+    TE: Data,
+    FE: Func(Vec<T>) -> Vec<TE> + Clone,
+    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+{
+    pub fn new<I, IE>(context: Arc<Context>, data: I, data_enc: IE, fe: FE, fd: FD, num_slices: usize) -> Self
     where
         I: IntoIterator<Item = T>,
         IE: IntoIterator<Item = TE>,
-    { 
+    {
+        let data: Vec<_> = data.into_iter().collect();
+        let data_len = data.len();
+        let data_enc: Vec<_> = data_enc.into_iter().collect();
+        let data_enc_len = data_enc.len();
+        let mut secure = false;
+        if data_len > 0 && data_enc_len > 0 {
+            panic!("Input invalid! Only one form (pt or ct) needs to provide!")
+        }
+        if data_enc_len > 0 {
+            secure = true;
+        }
         ParallelCollection {
             name: Mutex::new("parallel_collection".to_owned()),
             rdd_vals: Arc::new(ParallelCollectionVals {
                 context: Arc::downgrade(&context),
                 vals: Arc::new(RddVals::new(context.clone(), secure)), //chain of security
                 ecall_ids: Arc::new(Mutex::new(Vec::new())),
-                splits_: ParallelCollection::<T, TE>::slice(data, num_slices),
-                splits_enc_: ParallelCollection::<T, TE>::slice_enc(data_enc, num_slices),
+                splits_: ParallelCollection::<T, TE, FE, FD>::slice(data, data_enc, num_slices),
                 num_slices, //field init shorthand
             }),
+            fe,
+            fd,
         }
     }
 
@@ -182,71 +220,68 @@ impl<T: Data, TE: Data> ParallelCollection<T, TE> {
     }
     */
 
-    fn slice<I>(data: I, num_slices: usize) -> Vec<Arc<Vec<T>>>
-    where
-        I: IntoIterator<Item = T>,
-    {
+    fn slice(data: Vec<T>, data_enc: Vec<TE>, num_slices: usize) -> DataForm<T, TE> {
         if num_slices < 1 {
             panic!("Number of slices should be greater than or equal to 1");
         } else {
             let mut slice_count = 0;
-            let data: Vec<_> = data.into_iter().collect();
             let data_len = data.len();
-            let mut end = ((slice_count + 1) * data_len) / num_slices;
-            let mut output = Vec::new();
-            let mut tmp = Vec::new();
-            let mut iter_count = 0;
-            for i in data {
-                if iter_count < end {
-                    tmp.push(i);
-                    iter_count += 1;
-                } else {
-                    slice_count += 1;
-                    end = ((slice_count + 1) * data_len) / num_slices;
-                    output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
-                    tmp.push(i);
-                    iter_count += 1;
+            let data_enc_len = data_enc.len();
+            if data_len > 0 {
+                let mut end = ((slice_count + 1) * data_len) / num_slices;
+                let mut output = Vec::new();
+                let mut tmp = Vec::new();
+                let mut iter_count = 0;
+                for i in data {
+                    if iter_count < end {
+                        tmp.push(i);
+                        iter_count += 1;
+                    } else {
+                        slice_count += 1;
+                        end = ((slice_count + 1) * data_len) / num_slices;
+                        output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
+                        tmp.push(i);
+                        iter_count += 1;
+                    }
                 }
-            }
-            output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
-            output
-        }
-    }
-
-    fn slice_enc<IE>(data_enc: IE, num_slices: usize) -> Vec<Arc<Vec<TE>>>
-    where
-        IE: IntoIterator<Item = TE>,
-    {
-        if num_slices < 1 {
-            panic!("Number of slices should be greater than or equal to 1");
-        } else {
-            let mut slice_count = 0;
-            let data_enc: Vec<_> = data_enc.into_iter().collect();
-            let data_len = data_enc.len();
-            let mut end = ((slice_count + 1) * data_len) / num_slices;
-            let mut output = Vec::new();
-            let mut tmp = Vec::new();
-            let mut iter_count = 0;
-            for i in data_enc {
-                if iter_count < end {
-                    tmp.push(i);
-                    iter_count += 1;
-                } else {
-                    slice_count += 1;
-                    end = ((slice_count + 1) * data_len) / num_slices;
-                    output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
-                    tmp.push(i);
-                    iter_count += 1;
+                output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
+                DataForm::Plaintext(output)
+            } else if data_enc_len > 0 {
+                let mut end = ((slice_count + 1) * data_enc_len) / num_slices;
+                let mut output = Vec::new();
+                let mut tmp = Vec::new();
+                let mut iter_count = 0;
+                for i in data_enc {
+                    if iter_count < end {
+                        tmp.push(i);
+                        iter_count += 1;
+                    } else {
+                        slice_count += 1;
+                        end = ((slice_count + 1) * data_enc_len) / num_slices;
+                        output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
+                        tmp.push(i);
+                        iter_count += 1;
+                    }
                 }
+                output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
+                DataForm::Ciphertext(output)
+            } else {
+                panic!("Neither plaintext nor ciphertext is provided")
             }
-            output.push(Arc::new(tmp.drain(..).collect::<Vec<_>>()));
-            output
         }
     }
 
 }
 
-impl<K: Data, V: Data, TE: Data> RddBase for ParallelCollection<(K, V), TE> {
+impl<K, V, KE, VE, FE, FD> RddBase for ParallelCollection<(K, V), (KE, VE), FE, FD> 
+where
+    K: Data,
+    V: Data,
+    KE: Data,
+    VE: Data,
+    FE: SerFunc(Vec<(K, V)>) -> Vec<(KE, VE)>,
+    FD: SerFunc(Vec<(KE, VE)>) -> Vec<(K, V)>, 
+{
     fn cogroup_iterator_any(
         &self,
         split: Box<dyn Split>,
@@ -258,7 +293,13 @@ impl<K: Data, V: Data, TE: Data> RddBase for ParallelCollection<(K, V), TE> {
     }
 }
 
-impl<T: Data, TE: Data> RddBase for ParallelCollection<T, TE> {
+impl<T, TE, FE, FD> RddBase for ParallelCollection<T, TE, FE, FD>
+where
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
     fn get_rdd_id(&self) -> usize {
         self.rdd_vals.vals.id
     }
@@ -294,38 +335,38 @@ impl<T: Data, TE: Data> RddBase for ParallelCollection<T, TE> {
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
-        if self.get_secure() {
-            (0..self.rdd_vals.splits_.len())
+        match self.rdd_vals.splits_.clone() {
+            DataForm::Plaintext(splits) => {
+                (0..self.rdd_vals.num_slices)
                 .map(|i| {
                     Box::new(ParallelCollectionSplit::new(
                         self.rdd_vals.vals.id as i64,
                         i,
-                        self.rdd_vals.splits_enc_[i as usize].clone(),
+                        splits[i as usize].clone(),
                     )) as Box<dyn Split>
                 })
                 .collect::<Vec<Box<dyn Split>>>()
-        } else {
-            (0..self.rdd_vals.splits_.len())
+            },
+            DataForm::Ciphertext(splits) => {
+                (0..self.rdd_vals.num_slices)
                 .map(|i| {
                     Box::new(ParallelCollectionSplit::new(
                         self.rdd_vals.vals.id as i64,
                         i,
-                        self.rdd_vals.splits_[i as usize].clone(),
+                        splits[i as usize].clone(),
                     )) as Box<dyn Split>
                 })
                 .collect::<Vec<Box<dyn Split>>>()
+            },
         }
+
     }
 
     fn number_of_splits(&self) -> usize {
-        if self.get_secure() {
-            self.rdd_vals.splits_.len()
-        } else {
-            self.rdd_vals.splits_enc_.len()
-        }
+        self.rdd_vals.num_slices
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -348,12 +389,20 @@ impl<T: Data, TE: Data> RddBase for ParallelCollection<T, TE> {
     }
 }
 
-impl<T: Data, TE: Data> Rdd for ParallelCollection<T, TE> {
+impl<T, TE, FE, FD> Rdd for ParallelCollection<T, TE, FE, FD>
+where
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
     type Item = T;
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
         Arc::new(ParallelCollection {
             name: Mutex::new(self.name.lock().clone()),
             rdd_vals: self.rdd_vals.clone(),
+            fe: self.fe.clone(),
+            fd: self.fd.clone(),
         })
     }
 
@@ -365,20 +414,37 @@ impl<T: Data, TE: Data> Rdd for ParallelCollection<T, TE> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<T>>() {
             Ok(s.iterator())
         } else {
-            panic!(
-                "Got split object from different concrete type other than ParallelCollectionSplit"
-            )
+            Err(Error::DowncastFailure("ParallelCollectionSplit<T>"))
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
-            s.secure_iterator(id)
+            Ok(s.secure_iterator(id))
         } else {
-            panic!(
-                "Got split object from different concrete type other than ParallelCollectionSplit"
-            )
+            Err(Error::DowncastFailure("ParallelCollectionSplit<TE>"))
         }
     }
 
+}
+
+impl<T, TE, FE, FD> RddE for ParallelCollection<T, TE, FE, FD>
+where
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
+    type ItemE = TE;
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(self.clone())
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>    
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    } 
 }

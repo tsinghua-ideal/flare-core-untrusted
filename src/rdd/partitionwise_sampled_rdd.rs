@@ -1,9 +1,10 @@
+use crate::Fn;
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
 use crate::error::Result;
 use crate::partitioner::Partitioner;
-use crate::rdd::{Rdd, RddBase, RddVals};
-use crate::serializable_traits::{AnyData, Data};
+use crate::rdd::{Rdd, RddE, RddBase, RddVals};
+use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use crate::utils::random::RandomSampler;
 use serde_derive::{Deserialize, Serialize};
@@ -12,7 +13,13 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 #[derive(Serialize, Deserialize)]
-pub struct PartitionwiseSampledRdd<T: Data> {
+pub struct PartitionwiseSampledRdd<T, TE, FE, FD> 
+where
+    T: Data,
+    TE: Data,
+    FE: Func(Vec<T>) -> Vec<TE> + Clone,
+    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+{
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = T>>,
     vals: Arc<RddVals>,
@@ -20,14 +27,23 @@ pub struct PartitionwiseSampledRdd<T: Data> {
     #[serde(with = "serde_traitobject")]
     sampler: Arc<dyn RandomSampler<T>>,
     preserves_partitioning: bool,
-    _marker_t: PhantomData<T>,
+    fe: FE,
+    fd: FD,
 }
 
-impl<T: Data> PartitionwiseSampledRdd<T> {
+impl<T, TE, FE, FD> PartitionwiseSampledRdd<T, TE, FE, FD> 
+where 
+    T: Data,
+    TE: Data,
+    FE: Func(Vec<T>) -> Vec<TE> + Clone,
+    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+{
     pub(crate) fn new(
         prev: Arc<dyn Rdd<Item = T>>,
         sampler: Arc<dyn RandomSampler<T>>,
         preserves_partitioning: bool,
+        fe: FE,
+        fd: FD,
     ) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
@@ -43,12 +59,19 @@ impl<T: Data> PartitionwiseSampledRdd<T> {
             ecall_ids,
             sampler,
             preserves_partitioning,
-            _marker_t: PhantomData,
+            fe,
+            fd,
         }
     }
 }
 
-impl<T: Data> Clone for PartitionwiseSampledRdd<T> {
+impl<T, TE, FE, FD> Clone for PartitionwiseSampledRdd<T, TE, FE, FD> 
+where 
+    T: Data,
+    TE: Data,
+    FE: Func(Vec<T>) -> Vec<TE> + Clone,
+    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+{
     fn clone(&self) -> Self {
         PartitionwiseSampledRdd {
             prev: self.prev.clone(),
@@ -56,12 +79,19 @@ impl<T: Data> Clone for PartitionwiseSampledRdd<T> {
             ecall_ids: self.ecall_ids.clone(),
             sampler: self.sampler.clone(),
             preserves_partitioning: self.preserves_partitioning,
-            _marker_t: PhantomData,
+            fe: self.fe.clone(),
+            fd: self.fd.clone(),
         }
     }
 }
 
-impl<T: Data> RddBase for PartitionwiseSampledRdd<T> {
+impl<T, TE, FE, FD> RddBase for PartitionwiseSampledRdd<T, TE, FE, FD> 
+where
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
@@ -104,7 +134,7 @@ impl<T: Data> RddBase for PartitionwiseSampledRdd<T> {
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -127,7 +157,15 @@ impl<T: Data> RddBase for PartitionwiseSampledRdd<T> {
     }
 }
 
-impl<T: Data, V: Data> RddBase for PartitionwiseSampledRdd<(T, V)> {
+impl<T, V, TE, VE, FE, FD> RddBase for PartitionwiseSampledRdd<(T, V), (TE, VE), FE, FD> 
+where 
+    T: Data,
+    V: Data,
+    TE: Data,
+    VE: Data,
+    FE: SerFunc(Vec<(T, V)>) -> Vec<(TE, VE)>,
+    FD: SerFunc(Vec<(TE, VE)>) -> Vec<(T, V)>, 
+{
     fn cogroup_iterator_any(
         &self,
         split: Box<dyn Split>,
@@ -139,7 +177,13 @@ impl<T: Data, V: Data> RddBase for PartitionwiseSampledRdd<(T, V)> {
     }
 }
 
-impl<T: Data> Rdd for PartitionwiseSampledRdd<T> {
+impl<T, TE, FE, FD> Rdd for PartitionwiseSampledRdd<T, TE, FE, FD> 
+where
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
     type Item = T;
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
         Arc::new(self.clone()) as Arc<dyn RddBase>
@@ -154,8 +198,29 @@ impl<T: Data> Rdd for PartitionwiseSampledRdd<T> {
         let iter = self.prev.iterator(split)?;
         Ok(Box::new(sampler_func(iter).into_iter()) as Box<dyn Iterator<Item = T>>)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
         self.prev.secure_compute(split, id)
     }
 
+}
+
+impl<T, TE, FE, FD> RddE for PartitionwiseSampledRdd<T, TE, FE, FD> 
+where
+    T: Data,
+    TE: Data,
+    FE: SerFunc(Vec<T>) -> Vec<TE>,
+    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+{
+    type ItemE = TE;
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(self.clone())
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>    
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    } 
 }

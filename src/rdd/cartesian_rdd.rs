@@ -3,8 +3,8 @@ use itertools::{iproduct, Itertools};
 use crate::context::Context;
 use crate::dependency::Dependency;
 use crate::error::{Error, Result};
-use crate::rdd::{Rdd, RddBase, RddVals};
-use crate::serializable_traits::{AnyData, Data};
+use crate::rdd::{Rdd, RddE, RddBase, RddVals};
+use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
 use std::marker::PhantomData;
@@ -29,23 +29,43 @@ impl Split for CartesianSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct CartesianRdd<T: Data, U: Data> {
+pub struct CartesianRdd<T, U, TE, UE, FE, FD> 
+where 
+    T: Data,
+    U: Data,
+    TE: Data,
+    UE: Data,
+    FE: Func(Vec<(T, U)>) -> Vec<(TE, UE)> + Clone,
+    FD: Func(Vec<(TE, UE)>) -> Vec<(T, U)> + Clone,
+{
     vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
     rdd1: Arc<dyn Rdd<Item = T>>,
     #[serde(with = "serde_traitobject")]
     rdd2: Arc<dyn Rdd<Item = U>>,
+    fe: FE,
+    fd: FD,
     ecall_ids: Arc<Mutex<Vec<usize>>>,
     num_partitions_in_rdd2: usize,
     _marker_t: PhantomData<T>,
     _market_u: PhantomData<U>,
 }
 
-impl<T: Data, U: Data> CartesianRdd<T, U> {
+impl<T, U, TE, UE, FE, FD> CartesianRdd<T, U, TE, UE, FE, FD> 
+where 
+    T: Data,
+    U: Data,
+    TE: Data,
+    UE: Data,
+    FE: Func(Vec<(T, U)>) -> Vec<(TE, UE)> + Clone,
+    FD: Func(Vec<(TE, UE)>) -> Vec<(T, U)> + Clone,
+{
     pub(crate) fn new(
         rdd1: Arc<dyn Rdd<Item = T>>,
         rdd2: Arc<dyn Rdd<Item = U>>,
-    ) -> CartesianRdd<T, U> {
+        fe: FE,
+        fd: FD,
+    ) -> Self {
         let vals = Arc::new(RddVals::new(rdd1.get_context(), rdd1.get_secure()));
         let ecall_ids = rdd1.get_ecall_ids();
         let num_partitions_in_rdd2 = rdd2.number_of_splits();
@@ -53,6 +73,8 @@ impl<T: Data, U: Data> CartesianRdd<T, U> {
             vals,
             rdd1,
             rdd2,
+            fe,
+            fd,
             ecall_ids,
             num_partitions_in_rdd2,
             _marker_t: PhantomData,
@@ -61,12 +83,22 @@ impl<T: Data, U: Data> CartesianRdd<T, U> {
     }
 }
 
-impl<T: Data, U: Data> Clone for CartesianRdd<T, U> {
+impl<T, U, TE, UE, FE, FD>  Clone for CartesianRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data,
+    U: Data,
+    TE: Data,
+    UE: Data,
+    FE: Func(Vec<(T, U)>) -> Vec<(TE, UE)> + Clone,
+    FD: Func(Vec<(TE, UE)>) -> Vec<(T, U)> + Clone,
+{
     fn clone(&self) -> Self {
         CartesianRdd {
             vals: self.vals.clone(),
             rdd1: self.rdd1.clone(),
             rdd2: self.rdd2.clone(),
+            fe: self.fe.clone(),
+            fd: self.fd.clone(),
             ecall_ids: self.ecall_ids.clone(),
             num_partitions_in_rdd2: self.num_partitions_in_rdd2,
             _marker_t: PhantomData,
@@ -75,7 +107,15 @@ impl<T: Data, U: Data> Clone for CartesianRdd<T, U> {
     }
 }
 
-impl<T: Data, U: Data> RddBase for CartesianRdd<T, U> {
+impl<T, U, TE, UE, FE, FD> RddBase for CartesianRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data,
+    U: Data,
+    TE: Data,
+    UE: Data,
+    FE: SerFunc(Vec<(T, U)>) -> Vec<(TE, UE)>,
+    FD: SerFunc(Vec<(TE, UE)>) -> Vec<(T, U)>,
+{
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
@@ -121,7 +161,7 @@ impl<T: Data, U: Data> RddBase for CartesianRdd<T, U> {
         array
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -136,7 +176,15 @@ impl<T: Data, U: Data> RddBase for CartesianRdd<T, U> {
     }
 }
 
-impl<T: Data, U: Data> Rdd for CartesianRdd<T, U> {
+impl<T, U, TE, UE, FE, FD> Rdd for CartesianRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data,
+    U: Data,
+    TE: Data,
+    UE: Data,
+    FE: SerFunc(Vec<(T, U)>) -> Vec<(TE, UE)>,
+    FD: SerFunc(Vec<(TE, UE)>) -> Vec<(T, U)>,
+{
     type Item = (T, U);
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>>
     where
@@ -160,9 +208,32 @@ impl<T: Data, U: Data> Rdd for CartesianRdd<T, U> {
         Ok(Box::new(iter1.cartesian_product(iter2.into_iter())))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
         //TODO
-        Vec::new()
+        Ok(Vec::new())
     }
 
+}
+
+impl<T, U, TE, UE, FE, FD> RddE for CartesianRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data,
+    U: Data,
+    TE: Data,
+    UE: Data,
+    FE: SerFunc(Vec<(T, U)>) -> Vec<(TE, UE)>,
+    FD: SerFunc(Vec<(TE, UE)>) -> Vec<(T, U)>,
+{
+    type ItemE = (TE, UE);
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(self.clone())
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    }
 }

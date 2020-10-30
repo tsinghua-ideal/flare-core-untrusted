@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use crate::env;
-use crate::rdd::Rdd;
+use crate::rdd::RddE;
 use crate::scheduler::{Task, TaskBase, TaskContext};
 use crate::serializable_traits::{AnyData, Data};
 use crate::SerBox;
@@ -12,9 +12,9 @@ use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct ResultTask<T: Data, U: Data, F>
+pub(crate) struct ResultTask<T: Data, TE: Data, U: Data, F>
 where
-    F: Fn((TaskContext, Box<dyn Iterator<Item = T>>)) -> U
+    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
         + 'static
         + Send
         + Sync
@@ -27,17 +27,16 @@ where
     pub stage_id: usize,
     pinned: bool,
     #[serde(with = "serde_traitobject")]
-    pub rdd: Arc<dyn Rdd<Item = T>>,
+    pub rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
     pub func: Arc<F>,
     pub partition: usize,
     pub locs: Vec<Ipv4Addr>,
     pub output_id: usize,
-    _marker: PhantomData<T>,
 }
 
-impl<T: Data, U: Data, F> Display for ResultTask<T, U, F>
+impl<T: Data, TE: Data, U: Data, F> Display for ResultTask<T, TE, U, F>
 where
-    F: Fn((TaskContext, Box<dyn Iterator<Item = T>>)) -> U
+    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
         + 'static
         + Send
         + Sync
@@ -50,9 +49,9 @@ where
     }
 }
 
-impl<T: Data, U: Data, F> ResultTask<T, U, F>
+impl<T: Data, TE: Data, U: Data, F> ResultTask<T, TE, U, F>
 where
-    F: Fn((TaskContext, Box<dyn Iterator<Item = T>>)) -> U
+    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
         + 'static
         + Send
         + Sync
@@ -71,14 +70,13 @@ where
             partition: self.partition,
             locs: self.locs.clone(),
             output_id: self.output_id,
-            _marker: PhantomData,
         }
     }
 }
 
-impl<T: Data, U: Data, F> ResultTask<T, U, F>
+impl<T: Data, TE: Data, U: Data, F> ResultTask<T, TE, U, F>
 where
-    F: Fn((TaskContext, Box<dyn Iterator<Item = T>>)) -> U
+    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
         + 'static
         + Send
         + Sync
@@ -90,7 +88,7 @@ where
         task_id: usize,
         run_id: usize,
         stage_id: usize,
-        rdd: Arc<dyn Rdd<Item = T>>,
+        rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
         func: Arc<F>,
         partition: usize,
         locs: Vec<Ipv4Addr>,
@@ -106,14 +104,13 @@ where
             partition,
             locs,
             output_id,
-            _marker: PhantomData,
         }
     }
 }
 
-impl<T: Data, U: Data, F> TaskBase for ResultTask<T, U, F>
+impl<T: Data, TE: Data, U: Data, F> TaskBase for ResultTask<T, TE, U, F>
 where
-    F: Fn((TaskContext, Box<dyn Iterator<Item = T>>)) -> U
+    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
         + 'static
         + Send
         + Sync
@@ -146,9 +143,9 @@ where
     }
 }
 
-impl<T: Data, U: Data, F> Task for ResultTask<T, U, F>
+impl<T: Data, TE: Data, U: Data, F> Task for ResultTask<T, TE, U, F>
 where
-    F: Fn((TaskContext, Box<dyn Iterator<Item = T>>)) -> U
+    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
         + 'static
         + Send
         + Sync
@@ -160,7 +157,19 @@ where
         log::debug!("resulttask runs");
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
-        SerBox::new((self.func)((context, self.rdd.iterator(split).unwrap())))
+        SerBox::new((self.func)((
+            context, 
+            (
+                match self.rdd.iterator(split.clone()) {
+                    Ok(r) => r,
+                    Err(_) => Box::new(Vec::new().into_iter()),
+                }, 
+                match self.rdd.secure_iterator(split) {
+                    Ok(r) => r,
+                    Err(_) => Box::new(Vec::new().into_iter()),
+                }
+            )
+        )))
             as SerBox<dyn AnyData>
     }
 }

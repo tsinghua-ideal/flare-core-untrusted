@@ -22,11 +22,11 @@ pub(crate) type EventQueue = Arc<DashMap<usize, VecDeque<CompletionEvent>>>;
 #[async_trait::async_trait]
 pub(crate) trait NativeScheduler: Send + Sync {
     /// Fast path for execution. Runs the DD in the driver main thread if possible.
-    fn local_execution<T: Data, U: Data, F, L>(
-        jt: Arc<JobTracker<F, U, T, L>>,
+    fn local_execution<T: Data, TE: Data, U: Data, F, L>(
+        jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<Option<Vec<U>>>
     where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
         L: JobListener,
     {
         if jt.final_stage.parents.is_empty() && (jt.num_output_parts == 1) {
@@ -34,7 +34,16 @@ pub(crate) trait NativeScheduler: Send + Sync {
             let task_context = TaskContext::new(jt.final_stage.id, jt.output_parts[0], 0);
             Ok(Some(vec![(&jt.func)((
                 task_context,
-                jt.final_rdd.iterator(split)?,
+                (
+                    match jt.final_rdd.iterator(split.clone()) {
+                        Ok(r) => r,
+                        Err(_) => Box::new(Vec::new().into_iter()),
+                    }, 
+                    match jt.final_rdd.secure_iterator(split) {
+                        Ok(r) => r,
+                        Err(_) => Box::new(Vec::new().into_iter()),
+                    }
+                )
             ))]))
         } else {
             Ok(None)
@@ -169,13 +178,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         Ok(parents.into_iter().collect())
     }
 
-    async fn on_event_failure<T: Data, U: Data, F, L>(
+    async fn on_event_failure<T: Data, TE: Data, U: Data, F, L>(
         &self,
-        jt: Arc<JobTracker<F, U, T, L>>,
+        jt: Arc<JobTracker<F, U, T, TE, L>>,
         failed_vals: FetchFailedVals,
         stage_id: usize,
     ) where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
         L: JobListener,
     {
         let FetchFailedVals {
@@ -199,15 +208,15 @@ pub(crate) trait NativeScheduler: Send + Sync {
             .insert(self.fetch_from_shuffle_to_cache(shuffle_id));
     }
 
-    async fn on_event_success<T: Data, U: Data, F, L>(
+    async fn on_event_success<T: Data, TE: Data, U: Data, F, L>(
         &self,
         mut completed_event: CompletionEvent,
         results: &mut Vec<Option<U>>,
         num_finished: &mut usize,
-        jt: Arc<JobTracker<F, U, T, L>>,
+        jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<()>
     where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
         L: JobListener,
     {
         // TODO: logging
@@ -215,10 +224,10 @@ pub(crate) trait NativeScheduler: Send + Sync {
 
         let result_type = completed_event
             .task
-            .downcast_ref::<ResultTask<T, U, F>>()
+            .downcast_ref::<ResultTask<T, TE, U, F>>()
             .is_some();
         if result_type {
-            if let Ok(rt) = completed_event.task.downcast::<ResultTask<T, U, F>>() {
+            if let Ok(rt) = completed_event.task.downcast::<ResultTask<T, TE, U, F>>() {
                 let any_result = completed_event.result.take().ok_or_else(|| Error::Other)?;
                 jt.listener
                     .task_succeeded(rt.output_id, &*any_result)
@@ -344,13 +353,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         Ok(())
     }
 
-    async fn submit_stage<T: Data, U: Data, F, L>(
+    async fn submit_stage<T: Data, TE: Data, U: Data, F, L>(
         &self,
         stage: Stage,
-        jt: Arc<JobTracker<F, U, T, L>>,
+        jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<()>
     where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
         L: JobListener,
     {
         log::debug!("submitting stage #{}", stage.id);
@@ -374,13 +383,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         Ok(())
     }
 
-    async fn submit_missing_tasks<T: Data, U: Data, F, L>(
+    async fn submit_missing_tasks<T: Data, TE: Data, U: Data, F, L>(
         &self,
         stage: Stage,
-        jt: Arc<JobTracker<F, U, T, L>>,
+        jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<()>
     where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
         L: JobListener,
     {
         let mut pending_tasks = jt.pending_tasks.lock().await;
@@ -410,7 +419,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
                 let task = Box::new(result_task.clone()) as Box<dyn TaskBase>;
                 let executor = self.next_executor_server(&*task);
                 my_pending.insert(task);
-                self.submit_task::<T, U, F>(
+                self.submit_task::<T, TE, U, F>(
                     TaskOption::ResultTask(Box::new(result_task)),
                     id_in_job,
                     executor,
@@ -443,7 +452,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
                     let task = Box::new(shuffle_map_task.clone()) as Box<dyn TaskBase>;
                     let executor = self.next_executor_server(&*task);
                     my_pending.insert(task);
-                    self.submit_task::<T, U, F>(
+                    self.submit_task::<T, TE, U, F>(
                         TaskOption::ShuffleMapTask(Box::new(shuffle_map_task)),
                         p,
                         executor,
@@ -467,13 +476,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         self.get_event_queue().get_mut(&run_id)?.pop_front()
     }
 
-    fn submit_task<T: Data, U: Data, F>(
+    fn submit_task<T: Data, TE: Data, U: Data, F>(
         &self,
         task: TaskOption,
         id_in_job: usize,
         target_executor: SocketAddrV4,
     ) where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U;
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U;
 
     // mutators:
     fn add_output_loc_to_stage(&self, stage_id: usize, partition: usize, host: String);

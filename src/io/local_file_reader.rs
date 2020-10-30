@@ -11,7 +11,7 @@ use crate::dependency::Dependency;
 use crate::env::Env;
 use crate::error::{Error, Result};
 use crate::io::*;
-use crate::rdd::{MapPartitionsRdd, MapperRdd, Rdd, RddBase};
+use crate::rdd::{MapPartitionsRdd, MapperRdd, Rdd, RddE, RddBase, encrypt, decrypt};
 use crate::serializable_traits::{AnyData, Data, SerFunc};
 use crate::split::Split;
 use crate::Fn;
@@ -73,7 +73,7 @@ impl LocalFsReaderConfig {
 }
 
 impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
-    fn make_reader<F, U, UE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = U>>
+    fn make_reader<F, U, UE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Vec<u8>) -> U,
         U: Data,
@@ -84,13 +84,27 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
         let reader = LocalFsReader::<BytesReader>::new(self, context);
         let read_files = Fn!(
             |_part: usize, readers: Box<dyn Iterator<Item = BytesReader>>| {
-                Box::new(readers.into_iter().map(|file| file.into_iter()).flatten())
+                Box::new(readers.into_iter().map(|file| file.into_iter()).flatten())    //Vec<Vec<Vec<u8>>> -> Vec<Vec<u8>>
                     as Box<dyn Iterator<Item = _>>
             }
         );
-        //TODO: map_partition
+
+        let fe_mpp = Fn!(|v: Vec<Vec<u8>>| {
+            let mut ct = Vec::with_capacity(v.len()); 
+            for pt in v {
+                ct.push(encrypt::<>(pt.as_ref()));
+            }
+            ct
+        });
+        let fd_mpp = Fn!(|v: Vec<Vec<u8>>| {
+            let mut pt = Vec::with_capacity(v.len());
+            for ct in v {
+                pt.push(decrypt::<>(ct.as_ref()));
+            }
+            pt
+        });
         let files_per_executor = Arc::new(
-            MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files).pin(),
+            MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files, fe_mpp, fd_mpp).pin(),
         );
         let decoder = MapperRdd::new(files_per_executor, decoder, fe, fd).pin();
         decoder.register_op_name("local_fs_reader<bytes>");
@@ -99,7 +113,7 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
 }
 
 impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
-    fn make_reader<F, U, UE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn Rdd<Item = U>>
+    fn make_reader<F, U, UE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(PathBuf) -> U,
         U: Data,
@@ -114,9 +128,16 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
                     as Box<dyn Iterator<Item = _>>
             }
         );
-        //TODO map_partition
+        
+        //No support for LocalFsReader::<FileReader>
+        let fe_mpp = Fn!(|v: Vec<PathBuf>| {
+            v
+        });
+        let fd_mpp = Fn!(|v: Vec<PathBuf>| {
+            v
+        });
         let files_per_executor = Arc::new(
-            MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files).pin(),
+            MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files, fe_mpp, fd_mpp).pin(),
         );
         let decoder = MapperRdd::new(files_per_executor, decoder, fe, fd).pin();
         decoder.register_op_name("local_fs_reader<files>");
@@ -365,7 +386,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             true
         }
 
-        fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
+        fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
             self.secure_compute(split, self.get_rdd_id())
         }
 
@@ -457,65 +478,54 @@ impl Rdd for LocalFsReader<BytesReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
-        let files_by_part = self.load_local_files().unwrap();
+        let files_by_part = self.load_local_files()?;
         let idx = split.idx;
         let host = split.host;
-        // Assumption data is encrypted and serialized
+        // data should be decrypted first and then decoded: Vec<Vec<u8>>
         let data = files_by_part
             .into_iter()
-            .map(move |files| BytesReader { files, host, idx });
+            .map(move |files| BytesReader { files, host, idx })
+            .map(|reader| reader.into_iter())
+            .flatten()
+            .collect::<Vec<_>>();  //Vec<Vec<u8>>
+        let len = data.len();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cap = 1 << (7+10+10);  //128MB
-        let ser_result = Vec::new();
 
-        /*
-        for ser_block_tmp in data { 
-            let mut ser_block = Vec::with_capacity(cap); 
-            let mut ser_block_idx = Vec::with_capacity(ser_block_tmp.files.len());
-            let mut idx: usize = 0;
-            for mut t in ser_block_tmp {
-                idx += t.len();
-                ser_block.append(&mut t);
-                ser_block_idx.push(idx);
-            }
-                        
-            let mut ser_result_bl = Vec::<u8>::with_capacity(cap);
-            let mut ser_result_bl_idx = Vec::<usize>::with_capacity(1);
-            let mut retval = 1;
+        //TODO need to sub-partition
+        let block_len = len; //temporary 
+        let mut cur = 0;
+        let mut result_ptr = Vec::new();
+        while cur < len {
+            let next = match cur + block_len > len {
+                true => len,
+                false => cur + block_len,
+            };
+            let block = Box::new((&data[cur..next]).to_vec());
+            let block_ptr = Box::into_raw(block);
+            let mut result_bl_ptr: usize = 0;
             let sgx_status = unsafe {
                 secure_executing(
                     Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut retval,
+                    &mut result_bl_ptr,
                     id,
                     0,   //false
-                    ser_block.as_ptr() as *const u8,
-                    ser_block_idx.as_ptr() as *const usize,
-                    ser_block_idx.len(),
-                    ser_result_bl.as_mut_ptr() as *mut u8,
-                    ser_result_bl_idx.as_mut_ptr() as *mut usize,
+                    block_ptr as *mut u8,
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
-            unsafe {
-                ser_result_bl_idx.set_len(retval);
-                ser_result_bl.set_len(ser_result_bl_idx[retval-1]);
-            }
-            assert!(ser_result_bl_idx.len()==1
-                    && ser_result_bl.len()==*ser_result_bl_idx.last().unwrap());
-            //log::info!("retval = {}, ser_result_bl = {:?}", retval, ser_result_bl);
+            let block = unsafe{ Box::from_raw(block_ptr) };
             match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                 },
             };
-            ser_result_bl.shrink_to_fit();
-            ser_result.push(ser_result_bl);
-        }
-        */
-        ser_result
+            result_ptr.push(result_bl_ptr);
+        }  
+
+        Ok(result_ptr)
     }
 }
 
@@ -536,8 +546,8 @@ impl Rdd for LocalFsReader<FileReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
-        Vec::new()
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+        panic!("Don't support secure computing for LocalFsReader<FileReader>")
     }
 }
 
@@ -589,6 +599,7 @@ impl Iterator for FileReader {
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,3 +675,5 @@ mod tests {
         assert!(files[0].len() >= 3 && files[0].len() <= 5);
     }
 }
+
+*/

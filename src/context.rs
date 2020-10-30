@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::executor::{Executor, Signal};
 use crate::io::ReaderConfiguration;
 use crate::partial::{ApproximateEvaluator, PartialResult};
-use crate::rdd::{ParallelCollection, Rdd, RddBase, UnionRdd};
+use crate::rdd::{ParallelCollection, Rdd, RddE, RddBase, UnionRdd, encrypt, decrypt, divide_ct, recover_ct};
 use crate::scheduler::{DistributedScheduler, LocalScheduler, NativeScheduler, TaskContext};
 use crate::serializable_traits::{Data, SerFunc};
 use crate::serialized_data_capnp::serialized_data;
@@ -56,15 +56,15 @@ impl Default for Schedulers {
 }
 
 impl Schedulers {
-    fn run_job<T: Data, U: Data, F>(
+    fn run_job<T: Data, TE: Data, U: Data, F>(
         &self,
         func: Arc<F>,
-        final_rdd: Arc<dyn Rdd<Item = T>>,
+        final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
         partitions: Vec<usize>,
         allow_local: bool,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
     {
         let op_name = final_rdd.get_op_name();
         log::info!("starting `{}` job", op_name);
@@ -95,15 +95,15 @@ impl Schedulers {
         }
     }
 
-    fn run_approximate_job<T: Data, U: Data, R, F, E>(
+    fn run_approximate_job<T: Data, TE: Data, U: Data, R, F, E>(
         &self,
         func: Arc<F>,
-        final_rdd: Arc<dyn Rdd<Item = T>>,
+        final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
         evaluator: E,
         timeout: Duration,
     ) -> Result<PartialResult<R>>
     where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
         R: Clone + Debug + Send + Sync + 'static,
     {
@@ -471,16 +471,21 @@ impl Context {
         self.next_shuffle_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub fn make_rdd<T: Data, TT: Data, I>(   //T temp
+    pub fn make_rdd<T: Data, TE: Data, I, IE, FE, FD>(
         self: &Arc<Self>,
         seq: I,
+        seqe: IE,
+        fe: FE,
+        fd: FD,
         num_slices: usize,
-        secure: bool,
-    ) -> SerArc<dyn Rdd<Item = T>>
+    ) -> SerArc<dyn RddE<Item = T, ItemE = TE>>
     where
-        I: IntoIterator<Item = TT>,
+        I: IntoIterator<Item = T>,
+        IE: IntoIterator<Item = TE>,
+        FE: SerFunc(Vec<T>) -> Vec<TE>,
+        FD: SerFunc(Vec<TE>) -> Vec<T>,
     {
-        let rdd = self.parallelize(seq, num_slices, secure);
+        let rdd = self.parallelize(seq, seqe, fe, fd, num_slices);
         rdd.register_op_name("make_rdd");
         rdd
     }
@@ -491,33 +496,39 @@ impl Context {
         end: u64,
         step: usize,
         num_slices: usize,
-        secure: bool,
-    ) -> SerArc<dyn Rdd<Item = u64>> {
+    ) -> SerArc<dyn RddE<Item = u64, ItemE = Option<Vec<u8>>>> {
         // TODO: input validity check
         let seq = (start..=end).step_by(step);
-        let rdd = self.parallelize(seq, num_slices, secure);
+        let fe = Fn!(|v: Vec<u64>| {
+            let ct = encrypt::<>(bincode::serialize(&v).unwrap().as_ref());
+            divide_ct::<>(ct, v.len())            
+        });
+        let fd = Fn!(|v: Vec<Option<Vec<u8>>>| {
+            let ct = recover_ct::<>(v); 
+            bincode::deserialize::<Vec<u64>>(decrypt::<>(ct.as_ref()).as_ref()).unwrap()
+        });
+
+        //no need to ensure privacy
+        let rdd = self.parallelize(seq, Vec::new(), fe, fd, num_slices);
         rdd.register_op_name("range");
         rdd
     }
 
-    pub fn parallelize<T: Data, TT: Data, I>(
+    pub fn parallelize<T: Data, TE: Data, I, IE, FE, FD>(
         self: &Arc<Self>,
         seq: I,
+        seqe: IE,
+        fe: FE,
+        fd: FD,
         num_slices: usize,
-        secure: bool,
-    ) -> SerArc<dyn Rdd<Item = T>>
+    ) -> SerArc<dyn RddE<Item = T, ItemE = TE>>
     where
-        I: IntoIterator<Item = TT>,
+        I: IntoIterator<Item = T>,
+        IE: IntoIterator<Item = TE>,
+        FE: SerFunc(Vec<T>) -> Vec<TE>,
+        FD: SerFunc(Vec<TE>) -> Vec<T>,
     {
-        if secure {
-            SerArc::new(ParallelCollection::<T, TT>::new(self.clone(), Vec::new(), seq, num_slices, secure))
-        } else {
-            let seq: Vec<_> = seq.into_iter().collect();
-            let p_seq = Box::into_raw(Box::new(seq));
-            // T == TT
-            let seq = *unsafe{ Box::from_raw(p_seq as *mut Vec<T>) };
-            SerArc::new(ParallelCollection::<T, TT>::new(self.clone(), seq, Vec::new(), num_slices, secure))
-        }
+        SerArc::new(ParallelCollection::new(self.clone(), seq, seqe, fe, fd, num_slices))
     }
 
     /// Load from a distributed source and turns it into a parallel collection.
@@ -527,7 +538,7 @@ impl Context {
         func: F,
         fe: FE,
         fd: FD,
-    ) -> impl Rdd<Item = O>
+    ) -> impl RddE<Item = O, ItemE = OE>
     where
         F: SerFunc(I) -> O,
         C: ReaderConfiguration<I>,
@@ -537,15 +548,15 @@ impl Context {
         config.make_reader(self.clone(), func, fe, fd)
     }
 
-    pub fn run_job<T: Data, U: Data, F>(
+    pub fn run_job<T: Data, TE: Data, U: Data, F>(
         self: &Arc<Self>,
-        rdd: Arc<dyn Rdd<Item = T>>,
+        rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
         func: F,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc(Box<dyn Iterator<Item = T>>) -> U,
+        F: SerFunc((Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>)) -> U,
     {
-        let cl = Fn!(move |(_task_context, iter)| (func)(iter));
+        let cl = Fn!(move |(_task_context, (iter_p, iter_e))| (func)((iter_p, iter_e)));
         let func = Arc::new(cl);
         self.scheduler.run_job(
             func,
@@ -555,14 +566,14 @@ impl Context {
         )
     }
 
-    pub fn run_job_with_partitions<T: Data, U: Data, F, P>(
+    pub fn run_job_with_partitions<T: Data, TE: Data, U: Data, F, P>(
         self: &Arc<Self>,
-        rdd: Arc<dyn Rdd<Item = T>>,
+        rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
         func: F,
         partitions: P,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc(Box<dyn Iterator<Item = T>>) -> U,
+        F: SerFunc((Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>)) -> U,
         P: IntoIterator<Item = usize>,
     {
         let cl = Fn!(move |(_task_context, iter)| (func)(iter));
@@ -570,13 +581,13 @@ impl Context {
             .run_job(Arc::new(cl), rdd, partitions.into_iter().collect(), false)
     }
 
-    pub fn run_job_with_context<T: Data, U: Data, F>(
+    pub fn run_job_with_context<T: Data, TE: Data, U: Data, F>(
         self: &Arc<Self>,
-        rdd: Arc<dyn Rdd<Item = T>>,
+        rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
         func: F,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
     {
         log::debug!("inside run job in context");
         let func = Arc::new(func);
@@ -590,15 +601,16 @@ impl Context {
 
     /// Run a job that can return approximate results. Returns a partial result
     /// (how partial depends on whether the job was finished before or after timeout).
-    pub(crate) fn run_approximate_job<T: Data, U: Data, R, F, E>(
+    /// TODO need revision
+    pub(crate) fn run_approximate_job<T: Data, TE: Data, U: Data, R, F, E>(
         self: &Arc<Self>,
         func: F,
-        rdd: Arc<dyn Rdd<Item = T>>,
+        rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
         evaluator: E,
         timeout: Duration,
     ) -> Result<PartialResult<R>>
     where
-        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
         R: Clone + Debug + Send + Sync + 'static,
     {

@@ -119,7 +119,8 @@ impl ShuffleFetcher {
         )?;
         Ok(results.into_iter())
     }
-    
+  
+    /*
     pub async fn secure_fetch(
         shuffle_id: usize,
         reduce_id: usize,
@@ -224,6 +225,7 @@ impl ShuffleFetcher {
         )?;
         Ok(results.into_iter())
     }
+    */
 
     fn make_chunk_uri(
         base: &str,

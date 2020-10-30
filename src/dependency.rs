@@ -8,6 +8,7 @@ use serde_traitobject::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::mem::forget;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -120,7 +121,14 @@ impl Ord for dyn ShuffleDependencyTrait {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct ShuffleDependency<K: Data, V: Data, C: Data> {
+pub(crate) struct ShuffleDependency<K, V, C, KE, CE>
+where 
+    K: Data, 
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+{
     pub shuffle_id: usize,
     pub is_cogroup: bool,
     #[serde(with = "serde_traitobject")]
@@ -130,9 +138,18 @@ pub(crate) struct ShuffleDependency<K: Data, V: Data, C: Data> {
     #[serde(with = "serde_traitobject")]
     pub partitioner: Box<dyn Partitioner>,
     is_shuffle: bool,
+    _marker_ke: PhantomData<KE>,
+    _marker_ce: PhantomData<CE>,
 }
 
-impl<K: Data, V: Data, C: Data> ShuffleDependency<K, V, C> {
+impl<K, V, C, KE, CE> ShuffleDependency<K, V, C, KE, CE> 
+where
+    K: Data, 
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+{
     pub fn new(
         shuffle_id: usize,
         is_cogroup: bool,
@@ -147,11 +164,20 @@ impl<K: Data, V: Data, C: Data> ShuffleDependency<K, V, C> {
             aggregator,
             partitioner,
             is_shuffle: true,
+            _marker_ke: PhantomData,
+            _marker_ce: PhantomData,
         }
     }
 }
 
-impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDependency<K, V, C> {
+impl<K, V, C, KE, CE> ShuffleDependencyTrait for ShuffleDependency<K, V, C, KE, CE> 
+where 
+    K: Data + Eq + Hash, 
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+{
     fn get_shuffle_id(&self) -> usize {
         self.shuffle_id
     }
@@ -176,13 +202,12 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
         if rdd_base.get_secure() {
             let now = Instant::now();
             let rdd_id = rdd_base.get_rdd_id();
-            let data_ptr = rdd_base.iterator_raw(split);
+            let data_ptr = rdd_base.iterator_raw(split).unwrap();
             //let data = rdd_base.iterator_any(split).unwrap().collect::<Vec<_>>();
             //println!("data = {:?}", data);
             let captured_vars = std::mem::replace(&mut *env::Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let num_output_splits = self.partitioner.get_num_of_partitions();
-            let mut buckets: Vec<Vec<(K, C)>> = (0..num_output_splits)
-            //let mut buckets: Vec<Vec<(K, Vec<String>)>> = (0..num_output_splits)
+            let mut buckets: Vec<Vec<(KE, CE)>> = (0..num_output_splits)
                 .map(|_| Vec::new())
                 .collect::<Vec<_>>();
 
@@ -208,8 +233,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffleDependencyTrait for ShuffleDe
                 };
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9;
                 log::debug!("in dependency, rdd_id {:?}, shuffle write {:?}", rdd_id, dur);
-                let buckets_bl = unsafe{ Box::from_raw(buckets_bl_ptr as *mut u8 as *mut Vec<Vec<(K, C)>>) };
-                //let buckets_bl = unsafe{ Box::from_raw(buckets_bl_ptr as *mut u8 as *mut Vec<Vec<(K, Vec<String>)>>) };
+                let buckets_bl = unsafe{ Box::from_raw(buckets_bl_ptr as *mut u8 as *mut Vec<Vec<(KE, CE)>>) };
                 
                 for (i, mut bucket) in buckets_bl.into_iter().enumerate() {
                     buckets[i].append(&mut bucket); 

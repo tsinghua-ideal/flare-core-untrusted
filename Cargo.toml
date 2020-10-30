@@ -68,11 +68,6 @@ rusoto_s3 = { version = "0.43", optional = true }
 sgx_types = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
 sgx_urts = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
 
-# transpose
-frunk = "0.3.1"
-frunk_core = "0.3.1"
-frunk-column = { git = "https://github.com/AmbitionXiang/frunk-column" }
-
 [build-dependencies]
 capnpc = "0.12.1"
 

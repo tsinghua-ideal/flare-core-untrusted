@@ -104,7 +104,7 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
         self.splits().len()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -147,9 +147,9 @@ impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
         Ok(Box::new(fst_iter.zip(sec_iter)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
         //TODO
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {

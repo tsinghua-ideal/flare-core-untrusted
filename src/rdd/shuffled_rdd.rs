@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,8 +10,8 @@ use crate::env::Env;
 use crate::dependency::{Dependency, ShuffleDependency};
 use crate::error::Result;
 use crate::partitioner::Partitioner;
-use crate::rdd::{Rdd, RddBase, RddVals};
-use crate::serializable_traits::{AnyData, Data};
+use crate::rdd::{Rdd, RddBase, RddE, RddVals};
+use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::shuffle::ShuffleFetcher;
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
@@ -46,7 +47,16 @@ impl Split for ShuffledRddSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ShuffledRdd<K: Data + Eq + Hash, V: Data, C: Data> {
+pub struct ShuffledRdd<K, V, C, KE, CE, FE, FD> 
+where
+    K: Data + Eq + Hash,
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+    FE: Func(Vec<(K, C)>) -> Vec<(KE, CE)> + Clone,
+    FD: Func(Vec<(KE, CE)>) -> Vec<(K, C)> + Clone,
+{
     #[serde(with = "serde_traitobject")]
     parent: Arc<dyn Rdd<Item = (K, V)>>,
     #[serde(with = "serde_traitobject")]
@@ -56,9 +66,20 @@ pub struct ShuffledRdd<K: Data + Eq + Hash, V: Data, C: Data> {
     #[serde(with = "serde_traitobject")]
     part: Box<dyn Partitioner>,
     shuffle_id: usize,
+    fe: FE,
+    fd: FD,
 }
 
-impl<K: Data + Eq + Hash, V: Data, C: Data> Clone for ShuffledRdd<K, V, C> {
+impl<K, V, C, KE, CE, FE, FD> Clone for ShuffledRdd<K, V, C, KE, CE, FE, FD> 
+where
+    K: Data + Eq + Hash,
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+    FE: Func(Vec<(K, C)>) -> Vec<(KE, CE)> + Clone,
+    FD: Func(Vec<(KE, CE)>) -> Vec<(K, C)> + Clone, 
+{
     fn clone(&self) -> Self {
         ShuffledRdd {
             parent: self.parent.clone(),
@@ -67,15 +88,28 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Clone for ShuffledRdd<K, V, C> {
             ecall_ids: self.ecall_ids.clone(),
             part: self.part.clone(),
             shuffle_id: self.shuffle_id,
+            fe: self.fe.clone(),
+            fd: self.fd.clone(),
         }
     }
 }
 
-impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffledRdd<K, V, C> {
+impl<K, V, C, KE, CE, FE, FD> ShuffledRdd<K, V, C, KE, CE, FE, FD> 
+where 
+    K: Data + Eq + Hash,
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+    FE: Func(Vec<(K, C)>) -> Vec<(KE, CE)> + Clone,
+    FD: Func(Vec<(KE, CE)>) -> Vec<(K, C)> + Clone, 
+{
     pub(crate) fn new(
         parent: Arc<dyn Rdd<Item = (K, V)>>,
         aggregator: Arc<Aggregator<K, V, C>>,
         part: Box<dyn Partitioner>,
+        fe: FE,
+        fd: FD,
     ) -> Self {
         let ctx = parent.get_context();
         let secure = parent.get_secure();   //temp
@@ -85,7 +119,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffledRdd<K, V, C> {
 
         vals.dependencies
             .push(Dependency::ShuffleDependency(Arc::new(
-                ShuffleDependency::new(
+                ShuffleDependency::<_, _, _, KE, CE>::new(
                     shuffle_id,
                     false,
                     parent.get_rdd_base(),
@@ -101,11 +135,22 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> ShuffledRdd<K, V, C> {
             ecall_ids,
             part,
             shuffle_id,
+            fe,
+            fd,
         }
     }
 }
 
-impl<K: Data + Eq + Hash, V: Data, C: Data> RddBase for ShuffledRdd<K, V, C> {
+impl<K, V, C, KE, CE, FE, FD> RddBase for ShuffledRdd<K, V, C, KE, CE, FE, FD> 
+where
+    K: Data + Eq + Hash,
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+    FE: SerFunc(Vec<(K, C)>) -> Vec<(KE, CE)>,
+    FD: SerFunc(Vec<(KE, CE)>) -> Vec<(K, C)>, 
+{
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
@@ -146,7 +191,7 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> RddBase for ShuffledRdd<K, V, C> {
         Some(self.part.clone())
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -172,7 +217,16 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> RddBase for ShuffledRdd<K, V, C> {
     }
 }
 
-impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
+impl<K, V, C, KE, CE, FE, FD> Rdd for ShuffledRdd<K, V, C, KE, CE, FE, FD> 
+where
+    K: Data + Eq + Hash,
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+    FE: SerFunc(Vec<(K, C)>) -> Vec<(KE, CE)>,
+    FD: SerFunc(Vec<(KE, CE)>) -> Vec<(K, C)>, 
+{
     type Item = (K, C);
 
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -206,14 +260,14 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
-        //TODO K, V both need encryption?
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
         log::debug!("compute inside shuffled rdd");
 
         let now = Instant::now();
         //let fut = ShuffleFetcher::secure_fetch(self.shuffle_id, split.get_index());
-        let fut = ShuffleFetcher::fetch::<K, C>(self.shuffle_id, split.get_index());
-        let buckets: Vec<(K, C)> = futures::executor::block_on(fut).unwrap().into_iter().collect();
+        let fut = ShuffleFetcher::fetch::<KE, CE>(self.shuffle_id, split.get_index());
+        let buckets: Vec<(KE, CE)> = futures::executor::block_on(fut)?.into_iter().collect();
+        println!("buckets = {:?}", buckets);
         let data_ptr = Box::into_raw(Box::new(buckets));
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in ShuffledRdd, fetch {:?}", dur);
@@ -242,8 +296,8 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
         
         log::debug!("finish shuffle read");
 
-        let data = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<Self::Item>) };
-        let data_size = std::mem::size_of::<Self::Item>();
+        let data = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<(KE, CE)>) };
+        let data_size = std::mem::size_of::<(KE, CE)>();
         let len = data.len();
 
         //sub-partition
@@ -282,7 +336,32 @@ impl<K: Data + Eq + Hash, V: Data, C: Data> Rdd for ShuffledRdd<K, V, C> {
             println!("in ParallelCollectionRdd, compute {:?}", dur);
             cur = next;
         }
-        result_ptr       
+        Ok(result_ptr)       
 
+    }
+}
+
+impl<K, V, C, KE, CE, FE, FD> RddE for ShuffledRdd<K, V, C, KE, CE, FE, FD>
+where
+    K: Data + Eq + Hash, 
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+    FE: SerFunc(Vec<(K, C)>) -> Vec<(KE, CE)>,
+    FD: SerFunc(Vec<(KE, CE)>) -> Vec<(K, C)>,
+{
+    type ItemE = (KE, CE);
+    
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(self.clone())
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
     }
 }

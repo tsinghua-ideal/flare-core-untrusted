@@ -5,28 +5,39 @@ use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
 use crate::error::Result;
 use crate::env::Env;
-use crate::rdd::{Rdd, RddBase, RddVals};
+use crate::rdd::{Rdd, RddE, RddBase, RddVals};
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
 use parking_lot::Mutex;
 
 #[derive(Serialize, Deserialize)]
-pub struct FlatMapperRdd<T: Data, U: Data, F>
+pub struct FlatMapperRdd<T, U, UE, F, FE, FD>
 where
+    T: Data,
+    U: Data,
+    UE: Data,
     F: Func(T) -> Box<dyn Iterator<Item = U>> + Clone,
+    FE: Func(Vec<U>) -> Vec<UE> + Clone,
+    FD: Func(Vec<UE>) -> Vec<U> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = T>>,
     vals: Arc<RddVals>,
     ecall_ids: Arc<Mutex<Vec<usize>>>,
     f: F,
-    _marker_t: PhantomData<T>, // phantom data is necessary because of type parameter T
+    fe: FE,
+    fd: FD,
 }
 
-impl<T: Data, U: Data, F> Clone for FlatMapperRdd<T, U, F>
+impl<T, U, UE, F, FE, FD> Clone for FlatMapperRdd<T, U, UE, F, FE, FD>
 where
+    T: Data,
+    U: Data,
+    UE: Data,
     F: Func(T) -> Box<dyn Iterator<Item = U>> + Clone,
+    FE: Func(Vec<U>) -> Vec<UE> + Clone,
+    FD: Func(Vec<UE>) -> Vec<U> + Clone,
 {
     fn clone(&self) -> Self {
         FlatMapperRdd {
@@ -34,16 +45,22 @@ where
             vals: self.vals.clone(),
             ecall_ids: self.ecall_ids.clone(),
             f: self.f.clone(),
-            _marker_t: PhantomData,
+            fe: self.fe.clone(),
+            fd: self.fd.clone(),
         }
     }
 }
 
-impl<T: Data, U: Data, F> FlatMapperRdd<T, U, F>
+impl<T, U, UE, F, FE, FD> FlatMapperRdd<T, U, UE, F, FE, FD>
 where
-    F: SerFunc(T) -> Box<dyn Iterator<Item = U>>,
+    T: Data,
+    U: Data,
+    UE: Data,
+    F: Func(T) -> Box<dyn Iterator<Item = U>> + Clone,
+    FE: Func(Vec<U>) -> Vec<UE> + Clone,
+    FD: Func(Vec<UE>) -> Vec<U> + Clone,
 {
-    pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, f: F) -> Self {
+    pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
             .push(Dependency::NarrowDependency(Arc::new(
@@ -56,14 +73,20 @@ where
             vals,
             ecall_ids,
             f,
-            _marker_t: PhantomData,
+            fe,
+            fd,
         }
     }
 }
 
-impl<T: Data, U: Data, F> RddBase for FlatMapperRdd<T, U, F>
+impl<T, U, UE, F, FE, FD> RddBase for FlatMapperRdd<T, U, UE, F, FE, FD>
 where
+    T: Data,
+    U: Data,
+    UE: Data,
     F: SerFunc(T) -> Box<dyn Iterator<Item = U>>,
+    FE: SerFunc(Vec<U>) -> Vec<UE>,
+    FD: SerFunc(Vec<UE>) -> Vec<U>,
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -98,7 +121,7 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Vec<usize> {
+    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
         self.secure_compute(split, self.get_rdd_id())
     }
 
@@ -121,9 +144,16 @@ where
     }
 }
 
-impl<T: Data, V: Data, U: Data, F: 'static> RddBase for FlatMapperRdd<T, (V, U), F>
+impl<T, V, U, VE, UE, F, FE, FD> RddBase for FlatMapperRdd<T, (V, U), (VE, UE), F, FE, FD>
 where
+    T: Data,
+    V: Data,
+    U: Data,
+    VE: Data,
+    UE: Data,
     F: SerFunc(T) -> Box<dyn Iterator<Item = (V, U)>>,
+    FE: SerFunc(Vec<(V, U)>) -> Vec<(VE, UE)>,
+    FD: SerFunc(Vec<(VE, UE)>) -> Vec<(V, U)>,
 {
     fn cogroup_iterator_any(
         &self,
@@ -136,9 +166,14 @@ where
     }
 }
 
-impl<T: Data, U: Data, F: 'static> Rdd for FlatMapperRdd<T, U, F>
+impl<T, U, UE, F, FE, FD> Rdd for FlatMapperRdd<T, U, UE, F, FE, FD>
 where
+    T: Data,
+    U: Data,
+    UE: Data,
     F: SerFunc(T) -> Box<dyn Iterator<Item = U>>,
+    FE: SerFunc(Vec<U>) -> Vec<UE>,
+    FD: SerFunc(Vec<UE>) -> Vec<U>,
 {
     type Item = U;
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -154,7 +189,7 @@ where
         Ok(Box::new(self.prev.iterator(split)?.flat_map(f)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Vec<usize> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             Env::get().captured_vars
@@ -163,5 +198,28 @@ where
                 .insert(self.get_rdd_id(), captured_vars);
         }
         self.prev.secure_compute(split, id)
+    }
+}
+
+impl<T, U, UE, F, FE, FD> RddE for FlatMapperRdd<T, U, UE, F, FE, FD>
+where
+    T: Data,
+    U: Data,
+    UE: Data,
+    F: SerFunc(T) -> Box<dyn Iterator<Item = U>>,
+    FE: SerFunc(Vec<U>) -> Vec<UE>,
+    FD: SerFunc(Vec<UE>) -> Vec<U>,
+{
+    type ItemE = UE;
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(self.clone())
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
     }
 }
