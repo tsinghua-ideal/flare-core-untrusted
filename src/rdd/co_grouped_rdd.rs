@@ -2,7 +2,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::aggregator::Aggregator;
@@ -407,21 +406,97 @@ where
                 secure_executing(
                     Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
                     &mut result_ptr,
-                    id,  
-                    0,   //is_shuffle = false
+                    self.get_rdd_id(),  
+                    2, //shuffle write 
                     data_ptr as *mut u8,
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
+
+            //The corresponding data needs to be freed
             let result_ptr2 = unsafe{ Box::from_raw(data_ptr) };
-            //TODO the corresponding data needs to be freed
+            let mut deps = split.clone().deps;
+            for (i, v) in result_ptr2.into_iter().enumerate() {
+                if i == 0 {
+                    match deps.remove(0) {
+                        CoGroupSplitDep::NarrowCoGroupSplitDep {rdd: _, split: _} => {
+                            for ptr in v {
+                                let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, VE)>)};
+                            }
+                        },
+                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => {
+                            for ptr in v {
+                                let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, Vec<VE>)>)};
+                            }
+                        },
+                    };
+                } else if i == 1 {
+                    match deps.remove(0) {
+                        CoGroupSplitDep::NarrowCoGroupSplitDep {rdd: _, split: _} => {
+                            for ptr in v {
+                                let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, WE)>)};
+                            }
+                        },
+                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => {
+                            for ptr in v {
+                                let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, Vec<WE>)>)};
+                            }
+                        },
+                    };
+                } else {
+                    panic!("Vec of result ptrs error!")
+                }
+            }
+
             match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                 },
             };
-            Ok(vec![result_ptr])
+
+            
+            let data = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<(KE, (Vec<VE>, Vec<WE>))>) };
+            let data_size = std::mem::size_of::<(KE, (Vec<VE>, Vec<WE>))>();
+            let len = data.len();
+    
+            //sub-partition
+            let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
+            let mut cur = 0;
+            let mut result_ptr = Vec::new();
+            while cur < len {
+                let next = match cur + block_len > len {
+                    true => len,
+                    false => cur + block_len,
+                };
+                let block = Box::new((&data[cur..next]).to_vec());
+                let block_ptr = Box::into_raw(block);
+                let mut result_bl_ptr: usize = 0;
+                let now = Instant::now();
+                let sgx_status = unsafe {
+                    secure_executing(
+                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                        &mut result_bl_ptr,
+                        id,
+                        0,   //narrow
+                        block_ptr as *mut u8,
+                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                    )
+                };
+                let _block = unsafe{ Box::from_raw(block_ptr) };
+                let _r = match sgx_status {
+                    sgx_status_t::SGX_SUCCESS => {},
+                    _ => {
+                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                    },
+                };
+    
+                result_ptr.push(result_bl_ptr);
+                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                println!("in ParallelCollectionRdd, compute {:?}", dur);
+                cur = next;
+            }
+            Ok(result_ptr)
         } else {
             Err(Error::DowncastFailure("Got split object from different concrete type other than CoGroupSplit"))
         }

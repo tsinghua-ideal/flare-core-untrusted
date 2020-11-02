@@ -279,7 +279,7 @@ where
                 Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
                 &mut result_ptr,
                 self.get_rdd_id(),  //shuffle rdd id
-                1,   //is_shuffle = true
+                2,   //shuffle read
                 data_ptr as *mut u8, 
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )

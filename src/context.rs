@@ -183,7 +183,7 @@ impl Context {
             .geteid();
         let child = thread::spawn(move || {
             let mut retval = 1;
-            let sgx_status_t = unsafe {
+            let _sgx_status_t = unsafe {
                 pre_touching(eid, &mut retval, 0)
             };
         });

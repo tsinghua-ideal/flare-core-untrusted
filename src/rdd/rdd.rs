@@ -469,7 +469,7 @@ pub trait RddE: Rdd {
                 Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
                 &mut result_ptr,
                 self.get_rdd_id(),  //shuffle rdd id
-                2,   //reduce
+                3,   //3 is for reduce
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )

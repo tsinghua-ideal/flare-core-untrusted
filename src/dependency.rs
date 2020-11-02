@@ -220,7 +220,7 @@ where
                         env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
                         &mut buckets_bl_ptr,
                         rdd_id,
-                        1,   //is_shuffle = true
+                        1,   //shuffle write
                         block_ptr as *mut u8,
                         &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                     )

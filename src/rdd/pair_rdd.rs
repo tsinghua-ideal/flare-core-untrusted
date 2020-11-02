@@ -1,5 +1,4 @@
 use std::hash::Hash;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::aggregator::Aggregator;

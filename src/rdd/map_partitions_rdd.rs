@@ -1,4 +1,3 @@
-use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::sync::{atomic::AtomicBool, atomic::Ordering::SeqCst, Arc};
 

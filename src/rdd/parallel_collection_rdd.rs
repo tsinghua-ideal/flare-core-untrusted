@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use crate::Fn;
 use crate::context::Context;
 use crate::dependency::Dependency;
 use crate::env::Env;
@@ -106,8 +105,8 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
-            let block = unsafe{ Box::from_raw(block_ptr) };
-            match sgx_status {
+            let _block = unsafe{ Box::from_raw(block_ptr) };
+            let _r = match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
