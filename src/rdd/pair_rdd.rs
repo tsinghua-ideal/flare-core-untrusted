@@ -20,7 +20,7 @@ pub trait PairRdd<K, V, KE, VE>: RddE<Item = (K, V), ItemE = (KE, VE)> + Send + 
 where
     K: Data + Eq + Hash, 
     V: Data, 
-    KE: Data, 
+    KE: Data + Eq + Hash, 
     VE: Data,
 {
     fn combine_by_key<KE2: Data, C: Data, CE: Data, FE, FD>(
@@ -170,7 +170,8 @@ where
         &self,
         other: SerArc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
         num_splits: usize,
-    ) -> SerArc<dyn RddE<Item = (K, (V, W)), ItemE = (KE, (VE, WE))>> {
+    ) -> SerArc<dyn RddE<Item = (K, (V, W)), ItemE = (KE, (VE, WE))>> 
+    {
         let f = Fn!(|v: (Vec<V>, Vec<W>)| {
             let (vs, ws) = v;
             let combine = vs
@@ -227,7 +228,8 @@ where
         &self,
         other: SerArc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
         partitioner: Box<dyn Partitioner>,
-    ) -> SerArc<dyn RddE<Item = (K, (Vec<V>, Vec<W>)), ItemE = (KE, (Vec<VE>, Vec<WE>))>> {
+    ) -> SerArc<dyn RddE<Item = (K, (Vec<V>, Vec<W>)), ItemE = (KE, (Vec<VE>, Vec<WE>))>> 
+    {
         let fe0 = self.get_fe();
         let fd0 = self.get_fd();
         let fe1 = other.get_fe();
@@ -339,7 +341,7 @@ where
     T: RddE<Item = (K, V), ItemE = (KE, VE)>,
     K: Data + Eq + Hash, 
     V: Data, 
-    KE: Data, 
+    KE: Data + Eq + Hash, 
     VE: Data,
 {}
 
@@ -348,7 +350,7 @@ where
     T: RddE<Item = (K, V), ItemE = (KE, VE)>,
     K: Data + Eq + Hash, 
     V: Data, 
-    KE: Data, 
+    KE: Data + Eq + Hash, 
     VE: Data,
 {}
 

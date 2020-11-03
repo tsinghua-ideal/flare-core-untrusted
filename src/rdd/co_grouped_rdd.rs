@@ -80,7 +80,7 @@ where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data,
+    KE: Data + Eq + Hash,
     VE: Data,
     WE: Data,
     FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))> + Clone, 
@@ -99,11 +99,11 @@ where
 }
 
 impl<K, V, W, KE, VE, WE, FE, FD> CoGroupedRdd<K, V, W, KE, VE, WE, FE, FD> 
-where 
+where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data,
+    KE: Data + Eq + Hash,
     VE: Data,
     WE: Data,
     FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))> + Clone, 
@@ -186,7 +186,7 @@ where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data,
+    KE: Data + Eq + Hash,
     VE: Data,
     WE: Data,
     FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))>, 
@@ -274,7 +274,7 @@ where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data,
+    KE: Data + Eq + Hash,
     VE: Data,
     WE: Data,
     FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))>, 
@@ -412,7 +412,14 @@ where
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
-
+            
+            let _r = match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            let data_t_ptr = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<Vec<usize>>) };
             //The corresponding data needs to be freed
             let result_ptr2 = unsafe{ Box::from_raw(data_ptr) };
             let mut deps = split.clone().deps;
@@ -424,11 +431,7 @@ where
                                 let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, VE)>)};
                             }
                         },
-                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => {
-                            for ptr in v {
-                                let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, Vec<VE>)>)};
-                            }
-                        },
+                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => (),
                     };
                 } else if i == 1 {
                     match deps.remove(0) {
@@ -437,27 +440,41 @@ where
                                 let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, WE)>)};
                             }
                         },
-                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => {
-                            for ptr in v {
-                                let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, Vec<WE>)>)};
-                            }
-                        },
+                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => (),
                     };
                 } else {
-                    panic!("Vec of result ptrs error!")
+                    panic!("Vec of result ptrs error!");
                 }
             }
 
-            match sgx_status {
-                sgx_status_t::SGX_SUCCESS => {},
-                _ => {
-                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                },
-            };
+            //perform aggregation
+            let mut agg: HashMap<KE, (Vec<Vec<VE>>, Vec<Vec<WE>>)> = HashMap::new();
 
+            for i in &data_t_ptr[0] {
+                let i = unsafe { Box::from_raw(*i as *mut u8 as *mut Vec<(KE, Vec<VE>)>) };
+                for x in *i {
+                    let (k, v) = x;
+                    agg.entry(k)
+                        .or_insert_with(|| (Vec::new(), Vec::new())).0
+                        .push(v);
+                }
+            }
+
+            for i in &data_t_ptr[1] {
+                let i = unsafe { Box::from_raw(*i as *mut u8 as *mut Vec<(KE, Vec<WE>)>) };
+                for x in *i {
+                    let (k, w) = x;
+                    agg.entry(k)
+                        .or_insert_with(|| (Vec::new(), Vec::new())).1
+                        .push(w);
+                }
+            }
             
-            let data = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<(KE, (Vec<VE>, Vec<WE>))>) };
-            let data_size = std::mem::size_of::<(KE, (Vec<VE>, Vec<WE>))>();
+            let data = agg.into_iter()
+                .filter(|(_k, (v, w))| v.len() != 0 && w.len() != 0)
+                .collect::<Vec<_>>();
+            //need to revise
+            let data_size = std::mem::size_of::<(KE, (Vec<Vec<VE>>, Vec<Vec<WE>>))>();
             let len = data.len();
     
             //sub-partition
@@ -509,7 +526,7 @@ where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data,
+    KE: Data + Eq + Hash,
     VE: Data,
     WE: Data,
     FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))>, 

@@ -6,7 +6,6 @@ use std::{
     ops::{self, Deref, DerefMut},
 };
 pub use serde_closure::structs::Peep;
-use downcast_rs::{impl_downcast, DowncastSync};
 
 // Data passing through RDD needs to satisfy the following traits.
 // Debug is only added here for debugging convenience during development stage but is not necessary.

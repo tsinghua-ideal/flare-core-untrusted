@@ -123,6 +123,10 @@ pub fn recover_ct(ct_div: Vec<Option<Vec<u8>>>) -> Vec<u8> {
     ct_div[0].clone().unwrap()
 }
 
+pub fn type_eq<T1: 'static, T2: 'static>() -> bool{
+    std::any::TypeId::of::<T1>() == std::any::TypeId::of::<T2>()
+}
+
 // Values which are needed for all RDDs
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RddVals {
@@ -695,6 +699,7 @@ pub trait RddE: Rdd {
     where
         Self: Sized,
         Self::Item: Data + Eq + Hash,
+        Self::ItemE: Data + Eq + Hash,
     {
         let fe_c = self.get_fe();
         let fe_wrapper_mp = Fn!(move |v: Vec<(Self::Item, u64)>| {
@@ -788,6 +793,7 @@ pub trait RddE: Rdd {
     where
         Self: Sized,
         Self::Item: Data + Eq + Hash,
+        Self::ItemE: Data + Eq + Hash,
     {
         let fe_c = self.get_fe();
         let fe_wrapper_mp0 = Fn!(move |v: Vec<(Option<Self::Item>, Option<Self::Item>)>| {
@@ -836,6 +842,7 @@ pub trait RddE: Rdd {
     where
         Self: Sized,
         Self::Item: Data + Eq + Hash,
+        Self::ItemE: Data + Eq + Hash,
     {
         self.distinct_with_num_partitions(self.number_of_splits())
     }
@@ -1142,6 +1149,7 @@ pub trait RddE: Rdd {
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
+        Self::ItemE: Data + Eq + Hash,
         T: RddE<Item = Self::Item, ItemE = Self::ItemE> + Sized,
     {
         self.intersection_with_num_partitions(other, self.number_of_splits())
@@ -1154,6 +1162,7 @@ pub trait RddE: Rdd {
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
+        Self::ItemE: Data + Eq + Hash,
         T: RddE<Item = Self::Item, ItemE = Self::ItemE> + Sized,
     {
         self.subtract_with_num_partition(other, self.number_of_splits())
@@ -1168,6 +1177,7 @@ pub trait RddE: Rdd {
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
+        Self::ItemE: Data + Eq + Hash,
         T: RddE<Item = Self::Item, ItemE = Self::ItemE> + Sized,
     {
         let fe_c = self.get_fe();
@@ -1195,7 +1205,7 @@ pub trait RddE: Rdd {
             let (vx, vy): (Vec<Self::ItemE>, Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>) = v.into_iter().unzip();
             let pt_x = (fd_c)(vx); 
             pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
-        });
+        }); 
 
         //TODO may need to be revised
         let fe_wrapper_mp1 = Fn!(move |v: Vec<Option<Self::Item>>| {
@@ -1251,6 +1261,7 @@ pub trait RddE: Rdd {
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
+        Self::ItemE: Data + Eq + Hash,
         T: RddE<Item = Self::Item, ItemE = Self::ItemE> + Sized,
     {
         let fe_c = self.get_fe();
