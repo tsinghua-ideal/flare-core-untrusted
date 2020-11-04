@@ -10,7 +10,7 @@ use crate::env::Env;
 use crate::dependency::{Dependency, ShuffleDependency};
 use crate::error::Result;
 use crate::partitioner::Partitioner;
-use crate::rdd::{Rdd, RddBase, RddE, RddVals};
+use crate::rdd::{Rdd, RddBase, RddE, RddVals, MAX_ENC_BL};
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::shuffle::ShuffleFetcher;
 use crate::split::Split;
@@ -284,7 +284,7 @@ where
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )
         };
-        let buckets = unsafe{ Box::from_raw(data_ptr) };
+        let _buckets = unsafe{ Box::from_raw(data_ptr) };
         match sgx_status {
             sgx_status_t::SGX_SUCCESS => {},
             _ => {
@@ -302,6 +302,7 @@ where
 
         //sub-partition
         let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
+        let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size
         let mut cur = 0;
         let mut result_ptr = Vec::new();
         while cur < len {
@@ -323,7 +324,7 @@ where
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
-            let block = unsafe{ Box::from_raw(block_ptr) };
+            let _block = unsafe{ Box::from_raw(block_ptr) };
             match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {

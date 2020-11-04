@@ -7,7 +7,7 @@ use crate::context::Context;
 use crate::dependency::Dependency;
 use crate::env::Env;
 use crate::error::{Error, Result};
-use crate::rdd::{Rdd, RddBase, RddE, RddVals};
+use crate::rdd::{Rdd, RddBase, RddE, RddVals, MAX_ENC_BL};
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use parking_lot::Mutex;
@@ -84,6 +84,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         
         //sub-partition
         let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
+        let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size
         let mut cur = 0;
         let mut result_ptr = Vec::new();
         while cur < len {

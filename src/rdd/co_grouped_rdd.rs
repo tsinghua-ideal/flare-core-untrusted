@@ -446,7 +446,6 @@ where
                     panic!("Vec of result ptrs error!");
                 }
             }
-
             //perform aggregation
             let mut agg: HashMap<KE, (Vec<Vec<VE>>, Vec<Vec<WE>>)> = HashMap::new();
 
@@ -469,16 +468,32 @@ where
                         .push(w);
                 }
             }
-            
+
             let data = agg.into_iter()
                 .filter(|(_k, (v, w))| v.len() != 0 && w.len() != 0)
                 .collect::<Vec<_>>();
+
             //need to revise
-            let data_size = std::mem::size_of::<(KE, (Vec<Vec<VE>>, Vec<Vec<WE>>))>();
+            let mut klen = 0;
+            let mut vlen = 0;
+            let mut wlen = 0;
+            for (k, (vv, vw)) in data.iter() {
+                klen += 1;
+                for iv in vv.iter() {
+                    vlen += iv.len();
+                }
+                for iw in vw.iter() {
+                    wlen += iw.len();
+                }
+
+            }
+            use std::mem::size_of;
+            let data_size = klen * size_of::<KE>() + vlen * size_of::<VE>() + wlen * size_of::<WE>();
             let len = data.len();
     
             //sub-partition
             let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
+            let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size
             let mut cur = 0;
             let mut result_ptr = Vec::new();
             while cur < len {

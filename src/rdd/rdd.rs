@@ -58,6 +58,8 @@ pub use zip_rdd::*;
 mod union_rdd;
 pub use union_rdd::*;
 
+pub const MAX_ENC_BL: usize = 1000;
+
 extern "C" {
     fn secure_executing(
         eid: sgx_enclave_id_t,
@@ -120,7 +122,14 @@ pub fn recover_ct(ct_div: Vec<Option<Vec<u8>>>) -> Vec<u8> {
     /*
     ct_div.into_iter().flatten().collect::<Vec<u8>>()
     */
-    ct_div[0].clone().unwrap()
+    if ct_div.len() > 0 {
+        match ct_div[0].clone() {
+            Some(s) => return s,
+            None => panic!("invalid ciphertext vector"),
+        }
+    } else {
+        return vec![]
+    }
 }
 
 pub fn type_eq<T1: 'static, T2: 'static>() -> bool{
@@ -281,6 +290,12 @@ impl<I: RddE + ?Sized> RddE for SerArc<I> {
     fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
         (**self).get_fd()
     }
+    fn batch_encrypt(&self, data: &Vec<Self::Item>) -> Vec<Self::ItemE> {
+        (**self).batch_encrypt(data)
+    }
+    fn batch_decrypt(&self, data_enc: &Vec<Self::ItemE>) -> Vec<Self::Item> {
+        (**self).batch_decrypt(data_enc)
+    }
 }
 
 // Rdd containing methods associated with processing
@@ -307,6 +322,36 @@ pub trait RddE: Rdd {
     fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>;
 
     fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>;
+
+    fn batch_encrypt(&self, data: &Vec<Self::Item>) -> Vec<Self::ItemE> {
+        let len = data.len();
+        let mut data_enc = Vec::with_capacity(len);
+        let mut cur = 0;
+        while cur < len {
+            let next = match cur + MAX_ENC_BL > len {
+                true => len,
+                false => cur + MAX_ENC_BL ,
+            };
+            data_enc.append(&mut self.get_fe()((data[cur..next]).to_vec())); //need to check security
+            cur = next;
+        }
+        data_enc
+    }
+
+    fn batch_decrypt(&self, data_enc: &Vec<Self::ItemE>) -> Vec<Self::Item> {
+        let len = data_enc.len();
+        let mut data = Vec::with_capacity(len);
+        let mut cur = 0;
+        while cur < len {
+            let next = match cur + MAX_ENC_BL > len {
+                true => len,
+                false => cur + MAX_ENC_BL ,
+            };
+            data.append(&mut self.get_fd()((data_enc[cur..next]).to_vec())); //need to check security
+            cur = next;
+        }
+        data
+    }
 
     fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let result_ = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
