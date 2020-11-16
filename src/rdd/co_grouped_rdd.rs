@@ -487,10 +487,10 @@ where
                 }
 
             }
+            //TODO need to revise, the data_size is total size, but the expected data size is average size per item
             use std::mem::size_of;
             let data_size = klen * size_of::<KE>() + vlen * size_of::<VE>() + wlen * size_of::<WE>();
             let len = data.len();
-    
             //sub-partition
             let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
             let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size

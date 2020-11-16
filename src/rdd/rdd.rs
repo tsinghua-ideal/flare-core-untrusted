@@ -347,8 +347,13 @@ pub trait RddE: Rdd {
                 true => len,
                 false => cur + MAX_ENC_BL ,
             };
-            data.append(&mut self.get_fd()((data_enc[cur..next]).to_vec())); //need to check security
-            cur = next;
+            let mut pt = self.get_fd()((data_enc[cur..next]).to_vec());
+            //not enough for fixing bug when performing group_by, 
+            //the key part is encrypted and the value part is totally in plaintext, 
+            //therefore, the actually length of the block is hard to get
+            //result in decryption error 
+            cur += pt.len();
+            data.append(&mut pt); //need to check security
         }
         data
     }
@@ -523,7 +528,7 @@ pub trait RddE: Rdd {
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )
         };
-        let data = unsafe{ Box::from_raw(data_ptr) };
+        let _data = unsafe{ Box::from_raw(data_ptr) };
         match sgx_status {
             sgx_status_t::SGX_SUCCESS => {},
             _ => {

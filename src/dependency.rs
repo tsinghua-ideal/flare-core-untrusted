@@ -200,11 +200,11 @@ where
         log::debug!("split index: {}", split.get_index());
         log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
         if rdd_base.get_secure() {
-            let now = Instant::now();
             let rdd_id = rdd_base.get_rdd_id();
             let data_ptr = rdd_base.iterator_raw(split).unwrap();
             //let data = rdd_base.iterator_any(split).unwrap().collect::<Vec<_>>();
             //println!("data = {:?}", data);
+            let now = Instant::now();
             let captured_vars = std::mem::replace(&mut *env::Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let num_output_splits = self.partitioner.get_num_of_partitions();
             let mut buckets: Vec<Vec<(KE, CE)>> = (0..num_output_splits)
@@ -240,7 +240,6 @@ where
                 }
                 log::debug!("success!");
             }
-           
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
                 env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
