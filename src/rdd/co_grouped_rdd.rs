@@ -374,6 +374,7 @@ where
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             println!("secure_compute in co_group_rdd");
             let mut deps = split.clone().deps;
+            let now = Instant::now();
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let result_ptr = rdd.iterator_raw(split)?;  //Vec<usize>
@@ -407,19 +408,18 @@ where
                     Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
                     &mut result_ptr,
                     self.get_rdd_id(),  
-                    2, //shuffle write 
+                    2, //shuffle read
                     data_ptr as *mut u8,
                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                 )
             };
-            
             let _r = match sgx_status {
                 sgx_status_t::SGX_SUCCESS => {},
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                 },
             };
-            let data_t_ptr = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<Vec<usize>>) };
+            
             //The corresponding data needs to be freed
             let result_ptr2 = unsafe{ Box::from_raw(data_ptr) };
             let mut deps = split.clone().deps;
@@ -446,10 +446,40 @@ where
                     panic!("Vec of result ptrs error!");
                 }
             }
+
+            let mut data_t_ptr = get_encrypted_data::<Vec<usize>>(self.get_rdd_id(), 22, result_ptr as *mut u8);
+            //Fetch the encrypted data from enclave if narrow dependency
+            let mut deps = split.clone().deps;
+            for (i, v) in data_t_ptr.iter_mut().enumerate() {
+                if i == 0 {
+                    match deps.remove(0) {
+                        CoGroupSplitDep::NarrowCoGroupSplitDep {rdd: _, split: _} => {
+                            for ptr in v {
+                                let r = get_encrypted_data::<(KE, Vec<VE>)>(self.get_rdd_id(), 20, *ptr as *mut u8);
+                                *ptr = Box::into_raw(r) as usize;
+                            }
+                        },
+                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => (),
+                    };
+                } else if i == 1 {
+                    match deps.remove(0) {
+                        CoGroupSplitDep::NarrowCoGroupSplitDep {rdd: _, split: _} => {
+                            for ptr in v {
+                                let r = get_encrypted_data::<(KE, Vec<WE>)>(self.get_rdd_id(), 20, *ptr as *mut u8);
+                                *ptr = Box::into_raw(r) as usize;
+                            }
+                        },
+                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => (),
+                    };
+                } else {
+                    panic!("Vec of result ptrs error!");
+                }
+            }
+
             //perform aggregation
             let mut agg: HashMap<KE, (Vec<Vec<VE>>, Vec<Vec<WE>>)> = HashMap::new();
-
             for i in &data_t_ptr[0] {
+                //let i = get_encrypted_data(self.get_rdd_id(), 20, (*i) as *mut u8);
                 let i = unsafe { Box::from_raw(*i as *mut u8 as *mut Vec<(KE, Vec<VE>)>) };
                 for x in *i {
                     let (k, v) = x;
@@ -460,6 +490,7 @@ where
             }
 
             for i in &data_t_ptr[1] {
+                //let i = get_encrypted_data(self.get_rdd_id(), 21, (*i) as *mut u8);
                 let i = unsafe { Box::from_raw(*i as *mut u8 as *mut Vec<(KE, Vec<WE>)>) };
                 for x in *i {
                     let (k, w) = x;
@@ -473,6 +504,8 @@ where
                 .filter(|(_k, (v, w))| v.len() != 0 && w.len() != 0)
                 .collect::<Vec<_>>();
 
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("shuffle read {:?}s", dur);
             //need to revise
             let mut klen = 0;
             let mut vlen = 0;
@@ -525,7 +558,7 @@ where
     
                 result_ptr.push(result_bl_ptr);
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                println!("in ParallelCollectionRdd, compute {:?}", dur);
+                println!("in CoGroupedRdd, compute {:?}", dur);
                 cur = next;
             }
             Ok(result_ptr)

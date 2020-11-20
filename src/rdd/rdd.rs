@@ -19,6 +19,7 @@ use crate::partial::{BoundedDouble, CountEvaluator, GroupedCountEvaluator, Parti
 use crate::partitioner::{HashPartitioner, Partitioner};
 use crate::scheduler::TaskContext;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
+use crate::serialization_free::{Construct, Idx, SizeBuf};
 use crate::split::Split;
 use crate::utils::bounded_priority_queue::BoundedPriorityQueue;
 use crate::utils::random::{BernoulliCellSampler, BernoulliSampler, PoissonSampler, RandomSampler};
@@ -69,6 +70,86 @@ extern "C" {
         input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
+    fn get_sketch(
+        eid: sgx_enclave_id_t,
+        id: usize,
+        is_shuffle: u8,
+        p_buf: *mut u8,
+        p_data_enc: *mut u8,
+    ) -> sgx_status_t;
+    fn clone_out(
+        eid: sgx_enclave_id_t,
+        id: usize,
+        is_shuffle: u8,
+        p_out: usize,
+        p_data_enc: *mut u8,
+    ) -> sgx_status_t;
+}
+
+
+pub fn get_encrypted_data<T>(id: usize, is_shuffle: u8, p_data_enc: *mut u8) -> Box<Vec<T>> 
+where
+    T:  std::fmt::Debug 
+        + Clone 
+        + Serialize
+        + serde::ser::Serialize
+        + serde::de::DeserializeOwned
+{
+    let now = Instant::now();
+    let size_buf_len = 1 << (7+10+10); //128M * 8B
+    let size_buf = SizeBuf::new(size_buf_len);
+    let size_buf_ptr = Box::into_raw(Box::new(size_buf));
+    let sgx_status = unsafe {
+        get_sketch(
+            Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+            id,
+            is_shuffle,
+            size_buf_ptr as *mut u8,
+            p_data_enc,   //shuffle write
+        )
+    };
+    match sgx_status {
+        sgx_status_t::SGX_SUCCESS => (),
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+
+    let size_buf = unsafe{ Box::from_raw(size_buf_ptr) };
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("get sketch {:?}s", dur);
+    let now = Instant::now();
+    let mut v: Vec<T> = Vec::new();
+    let mut idx = Idx::new();
+    v.recv(&size_buf, &mut idx);
+    let ptr_out = Box::into_raw(Box::new(v)) as *mut u8 as usize; 
+    let result = unsafe {
+        clone_out(
+            Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+            id,
+            is_shuffle,
+            ptr_out,
+            p_data_enc,
+        )
+    };
+    let v = unsafe { Box::from_raw(ptr_out as *mut u8 as *mut Vec<T>) };
+    match result {
+        sgx_status_t::SGX_SUCCESS => {},
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        }
+    }
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("copy out {:?}s", dur);
+    let now = Instant::now();
+    let _v = bincode::serialize(&*v).unwrap();
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("serialize {:?}", dur);
+    let now = Instant::now();
+    let _v = v.clone();
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("clone {:?}", dur);
+    v
 }
 
 #[inline(always)]
@@ -359,12 +440,13 @@ pub trait RddE: Rdd {
     }
 
     fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
-        let result_ = self.secure_compute(split, self.get_rdd_base().get_rdd_id());
+        let result_ = self.secure_compute(split, self.get_rdd_id());
         match result_ {
             Ok(result_ptr) => {
                 let mut result = Vec::new(); 
                 for result_bl_ptr in result_ptr {
-                    let mut result_bl: Box<Vec<Self::ItemE>> = unsafe{ Box::from_raw(result_bl_ptr as *mut u8 as  *mut Vec<Self::ItemE>) };
+                    println!("in secure_iterator");
+                    let mut result_bl = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 0, result_bl_ptr as *mut u8);
                     result.append(result_bl.borrow_mut())
                 }
                 Ok(Box::new(result.into_iter()))
@@ -537,7 +619,7 @@ pub trait RddE: Rdd {
         };
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in reduce, ecall {:?}s", dur);
-        let temp = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<Self::ItemE>) };
+        let temp = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 3, result_ptr as *mut u8);
         let result = match temp.is_empty() {
             true => None,
             false => Some(temp[0].clone()),

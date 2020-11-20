@@ -32,6 +32,7 @@ pub mod partitioner;
 #[path = "rdd/rdd.rs"]
 pub mod rdd;
 mod scheduler;
+mod serialization_free;
 mod serializable_traits;
 mod shuffle;
 mod split;

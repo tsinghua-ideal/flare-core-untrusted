@@ -1,7 +1,7 @@
 use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
-use crate::rdd::RddBase;
+use crate::rdd::{get_encrypted_data, RddBase};
 use crate::serializable_traits::Data;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
@@ -225,20 +225,20 @@ where
                         &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                     )
                 };
+
                 match sgx_status {
                     sgx_status_t::SGX_SUCCESS => (),
                     _ => {
                         panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                     },
                 };
-                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                log::debug!("in dependency, rdd_id {:?}, shuffle write {:?}", rdd_id, dur);
-                let buckets_bl = unsafe{ Box::from_raw(buckets_bl_ptr as *mut u8 as *mut Vec<Vec<(KE, CE)>>) };
-                
+
+                let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_id, 1, buckets_bl_ptr as *mut u8);
                 for (i, mut bucket) in buckets_bl.into_iter().enumerate() {
                     buckets[i].append(&mut bucket); 
                 }
-                log::debug!("success!");
+                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                log::debug!("in dependency, shuffle write {:?}", dur);
             }
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
