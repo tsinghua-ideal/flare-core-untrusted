@@ -1,15 +1,16 @@
 #![feature(
     arbitrary_self_types,
+    binary_heap_into_iter_sorted,
     coerce_unsized,
     core_intrinsics,
     fn_traits,
     never_type,
+    proc_macro_hygiene,
     specialization,
+    thread_id_value,
     unboxed_closures,
     unsize,
-    binary_heap_into_iter_sorted,
-    vec_resize_default,
-    proc_macro_hygiene
+    vec_resize_default
 )]
 #![allow(dead_code, where_clauses_object_safety, deprecated)]
 #![allow(clippy::single_component_path_imports)]

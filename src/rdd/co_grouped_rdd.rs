@@ -1,8 +1,9 @@
 use std::any::Any;
 use std::collections::HashMap;
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::slice::Chunks;
+use std::sync::{Arc, mpsc::{self, Sender}};
+use std::thread::{JoinHandle, self};
 
 use crate::aggregator::Aggregator;
 use crate::context::Context;
@@ -25,6 +26,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         id: usize,
+        tid: u64,
         is_shuffle: u8,
         input: *mut u8,
         captured_vars: *const u8,
@@ -255,8 +257,8 @@ where
         Some(part)
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     fn iterator_any(
@@ -368,200 +370,124 @@ where
         }
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
-            let mut result_ptr2 = Vec::new();
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+            let cur_id = self.get_rdd_id();
             println!("secure_compute in co_group_rdd");
             let mut deps = split.clone().deps;
-            let now = Instant::now();
+
+            let mut kv = (Vec::new(), Vec::new());
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
-                    let result_ptr = rdd.iterator_raw(split)?;  //Vec<usize>
-                    result_ptr2.push(result_ptr);
+                    let (tx, rx) = mpsc::channel();
+                    let handle = rdd.iterator_raw(split,  tx,0)?;  //TODO need sorted
+                    for received in rx {
+                        let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_rdd_id(), 0, received as *mut u8);
+                        kv.0.push(*result_bl)
+                    }
+                    handle.join().unwrap();
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
-                    let fut = ShuffleFetcher::fetch::<KE, Vec<VE>>(shuffle_id, split.get_index());
-                    let buckets = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
-                    let result_ptr = Box::into_raw(Box::new(buckets));  //memory leak
-                    result_ptr2.push(vec![result_ptr as *mut u8 as usize]);
+                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<VE>>(shuffle_id, split.get_index());
+                    kv.1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
                 }
             };
             
+            let mut kw = (Vec::new(), Vec::new());
             match deps.remove(0) {    //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
-                    let result_ptr = rdd.iterator_raw(split)?;  //Vec<usize>
-                    result_ptr2.push(result_ptr);
+                    let (tx, rx) = mpsc::channel();
+                    let handle = rdd.iterator_raw(split,  tx,0)?;  //TODO need sorted
+                    for received in rx {
+                        let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_rdd_id(), 0, received as *mut u8);
+                        kw.0.push(*result_bl)
+                    }
+                    handle.join().unwrap();
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
-                    let fut = ShuffleFetcher::fetch::<KE, Vec<WE>>(shuffle_id, split.get_index());
-                    let buckets = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
-                    let result_ptr = Box::into_raw(Box::new(buckets));  //memory leak
-                    result_ptr2.push(vec![result_ptr as *mut u8 as usize]);
+                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<WE>>(shuffle_id, split.get_index());
+                    kw.1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
                 }
             }
             
-            let data_ptr = Box::into_raw(Box::new(result_ptr2));
-            let mut result_ptr: usize = 0;
-            let sgx_status = unsafe {
-                secure_executing(
-                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut result_ptr,
-                    self.get_rdd_id(),  
-                    2, //shuffle read
-                    data_ptr as *mut u8,
-                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                )
-            };
-            let _r = match sgx_status {
-                sgx_status_t::SGX_SUCCESS => {},
-                _ => {
-                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                },
-            };
-            
-            //The corresponding data needs to be freed
-            let result_ptr2 = unsafe{ Box::from_raw(data_ptr) };
-            let mut deps = split.clone().deps;
-            for (i, v) in result_ptr2.into_iter().enumerate() {
-                if i == 0 {
-                    match deps.remove(0) {
-                        CoGroupSplitDep::NarrowCoGroupSplitDep {rdd: _, split: _} => {
-                            for ptr in v {
-                                let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, VE)>)};
-                            }
-                        },
-                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => (),
-                    };
-                } else if i == 1 {
-                    match deps.remove(0) {
-                        CoGroupSplitDep::NarrowCoGroupSplitDep {rdd: _, split: _} => {
-                            for ptr in v {
-                                let _r = unsafe{ Box::from_raw(ptr as *mut Vec<(KE, WE)>)};
-                            }
-                        },
-                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => (),
-                    };
-                } else {
-                    panic!("Vec of result ptrs error!");
-                }
-            }
-
-            let mut data_t_ptr = get_encrypted_data::<Vec<usize>>(self.get_rdd_id(), 22, result_ptr as *mut u8);
-            //Fetch the encrypted data from enclave if narrow dependency
-            let mut deps = split.clone().deps;
-            for (i, v) in data_t_ptr.iter_mut().enumerate() {
-                if i == 0 {
-                    match deps.remove(0) {
-                        CoGroupSplitDep::NarrowCoGroupSplitDep {rdd: _, split: _} => {
-                            for ptr in v {
-                                let r = get_encrypted_data::<(KE, Vec<VE>)>(self.get_rdd_id(), 20, *ptr as *mut u8);
-                                *ptr = Box::into_raw(r) as usize;
-                            }
-                        },
-                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => (),
-                    };
-                } else if i == 1 {
-                    match deps.remove(0) {
-                        CoGroupSplitDep::NarrowCoGroupSplitDep {rdd: _, split: _} => {
-                            for ptr in v {
-                                let r = get_encrypted_data::<(KE, Vec<WE>)>(self.get_rdd_id(), 20, *ptr as *mut u8);
-                                *ptr = Box::into_raw(r) as usize;
-                            }
-                        },
-                        CoGroupSplitDep::ShuffleCoGroupSplitDep {shuffle_id: _} => (),
-                    };
-                } else {
-                    panic!("Vec of result ptrs error!");
-                }
-            }
-
-            //perform aggregation
-            let mut agg: HashMap<KE, (Vec<Vec<VE>>, Vec<Vec<WE>>)> = HashMap::new();
-            for i in &data_t_ptr[0] {
-                //let i = get_encrypted_data(self.get_rdd_id(), 20, (*i) as *mut u8);
-                let i = unsafe { Box::from_raw(*i as *mut u8 as *mut Vec<(KE, Vec<VE>)>) };
-                for x in *i {
-                    let (k, v) = x;
-                    agg.entry(k)
-                        .or_insert_with(|| (Vec::new(), Vec::new())).0
-                        .push(v);
-                }
-            }
-
-            for i in &data_t_ptr[1] {
-                //let i = get_encrypted_data(self.get_rdd_id(), 21, (*i) as *mut u8);
-                let i = unsafe { Box::from_raw(*i as *mut u8 as *mut Vec<(KE, Vec<WE>)>) };
-                for x in *i {
-                    let (k, w) = x;
-                    agg.entry(k)
-                        .or_insert_with(|| (Vec::new(), Vec::new())).1
-                        .push(w);
-                }
-            }
-
-            let data = agg.into_iter()
-                .filter(|(_k, (v, w))| v.len() != 0 && w.len() != 0)
-                .collect::<Vec<_>>();
-
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("shuffle read {:?}s", dur);
-            //need to revise
-            let mut klen = 0;
-            let mut vlen = 0;
-            let mut wlen = 0;
-            for (k, (vv, vw)) in data.iter() {
-                klen += 1;
-                for iv in vv.iter() {
-                    vlen += iv.len();
-                }
-                for iw in vw.iter() {
-                    wlen += iw.len();
-                }
-
-            }
-            //TODO need to revise, the data_size is total size, but the expected data size is average size per item
-            use std::mem::size_of;
-            let data_size = klen * size_of::<KE>() + vlen * size_of::<VE>() + wlen * size_of::<WE>();
-            let len = data.len();
-            //sub-partition
-            let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
-            let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size
-            let mut cur = 0;
-            let mut result_ptr = Vec::new();
-            while cur < len {
-                let next = match cur + block_len > len {
-                    true => len,
-                    false => cur + block_len,
-                };
-                let block = Box::new((&data[cur..next]).to_vec());
-                let block_ptr = Box::into_raw(block);
-                let mut result_bl_ptr: usize = 0;
+            let handle = std::thread::spawn(move || {
+                let tid: u64 = thread::current().id().as_u64().into();
                 let now = Instant::now();
-                let sgx_status = unsafe {
-                    secure_executing(
-                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                        &mut result_bl_ptr,
-                        id,
-                        0,   //narrow
-                        block_ptr as *mut u8,
-                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                    )
-                };
-                let _block = unsafe{ Box::from_raw(block_ptr) };
-                let _r = match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {},
-                    _ => {
-                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                    },
-                };
+                let mut kv_iter = (Vec::new(), Vec::new());
+                let mut kw_iter = (Vec::new(), Vec::new());
+                init_chunks(&kv.0, &mut kv_iter.0);
+                init_chunks(&kv.1, &mut kv_iter.1);
+                init_chunks(&kw.0, &mut kw_iter.0);
+                init_chunks(&kw.1, &mut kw_iter.1);
+
+                let mut block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     
-                result_ptr.push(result_bl_ptr);
+                while !(kv_iter.0.is_empty() && kv_iter.1.is_empty() && 
+                        kw_iter.0.is_empty() && kw_iter.1.is_empty() ) 
+                {
+                    //get block (memory inefficient)
+                    step_forward(&mut block.0, &mut kv_iter.0);
+                    step_forward(&mut block.1, &mut kv_iter.1);
+                    step_forward(&mut block.2, &mut kw_iter.0);
+                    step_forward(&mut block.3, &mut kw_iter.1);
+                    let block_ptr = Box::into_raw(Box::new((block.0, block.1, block.2, block.3)));
+                    let mut result_bl_ptr: usize = 0;
+                    let sgx_status = unsafe {
+                        secure_executing(
+                            Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                            &mut result_bl_ptr,
+                            cur_id,
+                            tid,
+                            2, //shuffle read
+                            block_ptr as *mut u8,
+                            &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                        )
+                    };
+                    let _r = match sgx_status {
+                        sgx_status_t::SGX_SUCCESS => {},
+                        _ => {
+                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                        },
+                    };
+                                    
+                    block = *unsafe{ Box::from_raw(block_ptr) };
+                    let _r = match sgx_status {
+                        sgx_status_t::SGX_SUCCESS => {},
+                        _ => {
+                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                        },
+                    };
+                    
+                    // this block is in enclave, cannot access
+                    let block_ptr = result_bl_ptr as *mut u8;
+                    result_bl_ptr = 0;
+                    let sgx_status = unsafe {
+                        secure_executing(
+                            Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                            &mut result_bl_ptr,
+                            id,
+                            tid,
+                            is_shuffle,  
+                            block_ptr,
+                            &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                        )
+                    };
+                    match sgx_status {
+                        sgx_status_t::SGX_SUCCESS => {},
+                        _ => {
+                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                        },
+                    };
+                    tx.send(result_bl_ptr).unwrap();
+
+                } 
+
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                println!("in CoGroupedRdd, compute {:?}", dur);
-                cur = next;
-            }
-            Ok(result_ptr)
+                println!("in CoGroupedRdd, shuffle read + narrow {:?}", dur);  
+            });
+            Ok(handle)
+
         } else {
             Err(Error::DowncastFailure("Got split object from different concrete type other than CoGroupSplit"))
         }
@@ -591,5 +517,31 @@ where
 
     fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
         Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    }
+}
+
+pub fn init_chunks<'a, T: Clone>(v: &'a Vec<Vec<T>>, iter_vec: &mut Vec<Chunks<'a, T>>) {
+    let num_subpar = v.len();
+    let chunk_size = MAX_ENC_BL;   //max num of entries = MAX_ENC_BL * num_subpar
+    for idx_subpar in 0..num_subpar {
+        iter_vec.push(v[idx_subpar].chunks(chunk_size));        
+    }
+}
+
+pub fn step_forward<T: Clone>(blocks: &mut Vec<Vec<T>>, iter_vec: &mut Vec<Chunks<T>>) {
+    blocks.clear();
+    let mut empty_idxs = Vec::new();
+    for (idx, iter) in iter_vec.iter_mut().enumerate() {
+        let nxt = iter.next();
+        if nxt.is_none() {
+            empty_idxs.push(idx);
+            continue;
+        }
+        let slice = nxt.unwrap();
+        blocks.push(slice.to_vec());
+    }
+    empty_idxs.reverse();
+    for idx in empty_idxs {
+        iter_vec.remove(idx);
     }
 }

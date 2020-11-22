@@ -1,6 +1,7 @@
 use std::cmp::min;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+use std::thread::JoinHandle;
 
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
@@ -104,8 +105,8 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
         self.splits().len()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     fn iterator_any(
@@ -147,9 +148,9 @@ impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
         Ok(Box::new(fst_iter.zip(sec_iter)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         //TODO
-        Ok(Vec::new())
+        Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }
 
     fn iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {

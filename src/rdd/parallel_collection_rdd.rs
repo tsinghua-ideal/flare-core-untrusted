@@ -1,7 +1,8 @@
 //! This module implements parallel collection RDD for dividing the input collection for parallel processing.
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, mpsc::Sender, Weak};
 use std::time::{Duration, Instant};
+use std::thread::{JoinHandle, self};
 
 use crate::context::Context;
 use crate::dependency::Dependency;
@@ -35,6 +36,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         id: usize,
+        tid: u64,
         is_shuffle: u8,
         input: *mut u8,
         captured_vars: *const u8,
@@ -75,7 +77,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, id: usize) -> Vec<usize> {
+    fn secure_iterator(&self, id: usize, tx: Sender<usize>, is_shuffle: u8) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
@@ -83,43 +85,46 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         
         //sub-partition
-        let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
-        let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size
-        let mut cur = 0;
-        let mut result_ptr = Vec::new();
-        while cur < len {
-            let next = match cur + block_len > len {
-                true => len,
-                false => cur + block_len,
-            };
-            let block = Box::new((&data[cur..next]).to_vec());
-            let block_ptr = Box::into_raw(block);
-            let mut result_bl_ptr: usize = 0;
-            let now = Instant::now();
-            let sgx_status = unsafe {
-                secure_executing(
-                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut result_bl_ptr,
-                    id,
-                    0,   //false
-                    block_ptr as *mut u8,
-                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                )
-            };
-            let _block = unsafe{ Box::from_raw(block_ptr) };
-            let _r = match sgx_status {
-                sgx_status_t::SGX_SUCCESS => {},
-                _ => {
-                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                },
-            };
-            result_ptr.push(result_bl_ptr);
-           
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("in ParallelCollectionRdd, compute {:?}", dur);
-            cur = next;  
-        }
-        result_ptr  
+        let handle = std::thread::spawn(move || {
+            let tid: u64 = thread::current().id().as_u64().into();
+            let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
+            let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size
+            let mut cur = 0;
+            while cur < len {
+                let next = match cur + block_len > len {
+                    true => len,
+                    false => cur + block_len,
+                };
+                let block = Box::new((&data[cur..next]).to_vec());
+                let block_ptr = Box::into_raw(block);
+                let mut result_bl_ptr: usize = 0;
+                let now = Instant::now();
+                let sgx_status = unsafe {
+                    secure_executing(
+                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                        &mut result_bl_ptr,
+                        id,
+                        tid,
+                        is_shuffle,  
+                        block_ptr as *mut u8,
+                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                    )
+                };
+                let _block = unsafe{ Box::from_raw(block_ptr) };
+                let _r = match sgx_status {
+                    sgx_status_t::SGX_SUCCESS => {},
+                    _ => {
+                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                    },
+                };
+                tx.send(result_bl_ptr).unwrap();
+               
+                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                println!("in ParallelCollectionRdd, compute {:?}", dur);
+                cur = next;  
+            }
+        });
+        handle 
     }
 }
 
@@ -366,8 +371,8 @@ where
         self.rdd_vals.num_slices
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     default fn cogroup_iterator_any(
@@ -418,9 +423,9 @@ where
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
-            Ok(s.secure_iterator(id))
+            Ok(s.secure_iterator(id, tx, is_shuffle))
         } else {
             Err(Error::DowncastFailure("ParallelCollectionSplit<TE>"))
         }

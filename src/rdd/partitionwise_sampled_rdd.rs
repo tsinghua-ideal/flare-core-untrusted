@@ -8,8 +8,8 @@ use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use crate::utils::random::RandomSampler;
 use serde_derive::{Deserialize, Serialize};
-use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+use std::thread::JoinHandle;
 use parking_lot::Mutex;
 
 #[derive(Serialize, Deserialize)]
@@ -134,8 +134,8 @@ where
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     default fn cogroup_iterator_any(
@@ -198,8 +198,8 @@ where
         let iter = self.prev.iterator(split)?;
         Ok(Box::new(sampler_func(iter).into_iter()) as Box<dyn Iterator<Item = T>>)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
-        self.prev.secure_compute(split, id)
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.prev.secure_compute(split, id, tx, is_shuffle)
     }
 
 }

@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
-use std::sync::{atomic::AtomicBool, atomic::Ordering::SeqCst, Arc};
+use std::sync::{atomic::{AtomicBool, Ordering::SeqCst}, Arc, mpsc::Sender};
+use std::thread::JoinHandle;
 
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
@@ -148,8 +149,8 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     default fn cogroup_iterator_any(
@@ -217,7 +218,7 @@ where
         let f_result = self.f.clone()(split.get_index(), self.prev.iterator(split)?);
         Ok(Box::new(f_result))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             Env::get().captured_vars
@@ -225,7 +226,7 @@ where
                 .unwrap()
                 .insert(self.get_rdd_id(), captured_vars);
         } 
-        self.prev.secure_compute(split, id)
+        self.prev.secure_compute(split, id, tx, is_shuffle)
     }
 }
 

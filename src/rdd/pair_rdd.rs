@@ -1,5 +1,6 @@
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+use std::thread::JoinHandle;
 
 use crate::aggregator::Aggregator;
 use crate::context::Context;
@@ -471,8 +472,8 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     // TODO: Analyze the possible error in invariance here
@@ -521,8 +522,8 @@ where
             self.prev.iterator(split)?.map(move |(k, v)| (k, f(v))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
-        self.prev.secure_compute(split, id)
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.prev.secure_compute(split, id, tx, is_shuffle)
     }
 }
 
@@ -666,8 +667,8 @@ where
         self.prev.number_of_splits()
     }
     
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     // TODO: Analyze the possible error in invariance here
@@ -718,8 +719,8 @@ where
                 .flat_map(move |(k, v)| f(v).map(move |x| (k.clone(), x))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
-        self.prev.secure_compute(split, id)
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.prev.secure_compute(split, id, tx, is_shuffle)
     }
 }
 

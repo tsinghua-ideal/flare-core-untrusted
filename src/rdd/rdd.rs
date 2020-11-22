@@ -8,8 +8,10 @@ use std::hash::Hash;
 use std::io::{BufWriter, Write};
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, mpsc::{channel, Sender}, Weak};
+use std::thread::{JoinHandle, self};
 use std::time::{Duration, Instant};
+
 
 use crate::context::Context;
 use crate::dependency::Dependency;
@@ -66,6 +68,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         id: usize,
+        tid: u64,
         is_shuffle: u8,
         input: *mut u8,
         captured_vars: *const u8,
@@ -95,6 +98,7 @@ where
         + serde::ser::Serialize
         + serde::de::DeserializeOwned
 {
+    let tid: u64 = thread::current().id().as_u64().into();
     let now = Instant::now();
     let size_buf_len = 1 << (7+10+10); //128M * 8B
     let size_buf = SizeBuf::new(size_buf_len);
@@ -272,7 +276,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>>;
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -331,8 +335,8 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        (**self).get_rdd_base().iterator_raw(split)
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        (**self).get_rdd_base().iterator_raw(split, tx, is_shuffle)
     }    
     fn iterator_any(
         &self,
@@ -354,8 +358,8 @@ impl<I: RddE + ?Sized> Rdd for SerArc<I> {
         (**self).compute(split)
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
-        (**self).secure_compute(split, id)
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        (**self).secure_compute(split, id, tx, is_shuffle)
     }
 
 }
@@ -392,7 +396,7 @@ pub trait Rdd: RddBase + 'static {
         self.compute(split)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>>;
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>>;
 }
 
 pub trait RddE: Rdd {
@@ -440,15 +444,18 @@ pub trait RddE: Rdd {
     }
 
     fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
-        let result_ = self.secure_compute(split, self.get_rdd_id());
+        let (tx, rx) = channel();
+        let result_ = self.secure_compute(split, self.get_rdd_id(), tx, 0);
+
         match result_ {
             Ok(result_ptr) => {
-                let mut result = Vec::new(); 
-                for result_bl_ptr in result_ptr {
+                let mut result = Vec::new();
+                for received in rx {
                     println!("in secure_iterator");
-                    let mut result_bl = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 0, result_bl_ptr as *mut u8);
+                    let mut result_bl = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 0, received as *mut u8);
                     result.append(result_bl.borrow_mut())
                 }
+                result_ptr.join().unwrap();
                 Ok(Box::new(result.into_iter()))
             },
             Err(e) => return Err(e),
@@ -597,7 +604,7 @@ pub trait RddE: Rdd {
        
         let data_ptr = Box::into_raw(Box::new(data));
         let now = Instant::now();
-
+        let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -605,6 +612,7 @@ pub trait RddE: Rdd {
                 Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
                 &mut result_ptr,
                 self.get_rdd_id(),  //shuffle rdd id
+                tid,
                 3,   //3 is for reduce
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,

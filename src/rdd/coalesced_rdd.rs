@@ -2,7 +2,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering as SyncOrd};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
 use rand::Rng;
@@ -223,8 +224,8 @@ where
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     default fn iterator_any(
@@ -273,9 +274,9 @@ where
         Ok(Box::new(iter.into_iter().flatten()) as Box<dyn Iterator<Item = Self::Item>>)
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         //TODO need revision
-        self.parent.secure_compute(split, id)
+        Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }
 
 }

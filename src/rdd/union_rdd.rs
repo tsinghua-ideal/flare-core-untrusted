@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+use std::thread::JoinHandle;
 
 use itertools::{Itertools, MinMaxResult};
 use serde_derive::{Deserialize, Serialize};
@@ -325,8 +326,8 @@ impl<T: Data> RddBase for UnionRdd<T> {
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     fn iterator_any(
@@ -382,9 +383,9 @@ impl<T: Data> Rdd for UnionRdd<T> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         //TODO
-        Ok(Vec::new())
+        Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }
 
 }

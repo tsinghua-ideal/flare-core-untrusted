@@ -4,7 +4,8 @@ use std::io::{BufReader, Read};
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+use std::thread::{JoinHandle, self};
 
 use crate::context::Context;
 use crate::dependency::Dependency;
@@ -26,6 +27,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         id: usize,
+        tid: u64,
         is_shuffle: u8,
         input: *mut u8,
         captured_vars: *const u8,
@@ -386,8 +388,8 @@ macro_rules! impl_common_lfs_rddb_funcs {
             true
         }
 
-        fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-            self.secure_compute(split, self.get_rdd_id())
+        fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+            self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
         }
 
         default fn iterator_any(
@@ -478,7 +480,7 @@ impl Rdd for LocalFsReader<BytesReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;
@@ -492,41 +494,42 @@ impl Rdd for LocalFsReader<BytesReader> {
             .collect::<Vec<_>>();  //Vec<Vec<u8>>
         let len = data.len();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-
-        //TODO need to sub-partition
-        let block_len = len; //temporary 
-        let mut cur = 0;
-        let mut result_ptr = Vec::new();
-        while cur < len {
-            let next = match cur + block_len > len {
-                true => len,
-                false => cur + block_len,
-            };
-            let block = Box::new((&data[cur..next]).to_vec());
-            let block_ptr = Box::into_raw(block);
-            let mut result_bl_ptr: usize = 0;
-            let sgx_status = unsafe {
-                secure_executing(
-                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut result_bl_ptr,
-                    id,
-                    0,   //false
-                    block_ptr as *mut u8,
-                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                )
-            };
-            let _block = unsafe{ Box::from_raw(block_ptr) };
-            let _r = match sgx_status {
-                sgx_status_t::SGX_SUCCESS => {},
-                _ => {
-                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                },
-            };
-            result_ptr.push(result_bl_ptr);
-            cur = next; 
-        }  
-
-        Ok(result_ptr)
+        let handle = std::thread::spawn(move || {
+            let tid: u64 = thread::current().id().as_u64().into();
+            //TODO need to sub-partition
+            let block_len = len; //temporary 
+            let mut cur = 0;
+            while cur < len {
+                let next = match cur + block_len > len {
+                    true => len,
+                    false => cur + block_len,
+                };
+                let block = Box::new((&data[cur..next]).to_vec());
+                let block_ptr = Box::into_raw(block);
+                let mut result_bl_ptr: usize = 0;
+                let sgx_status = unsafe {
+                    secure_executing(
+                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                        &mut result_bl_ptr,
+                        id,
+                        tid,
+                        is_shuffle,  
+                        block_ptr as *mut u8,
+                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                    )
+                };
+                let _block = unsafe{ Box::from_raw(block_ptr) };
+                let _r = match sgx_status {
+                    sgx_status_t::SGX_SUCCESS => {},
+                    _ => {
+                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                    },
+                };
+                tx.send(result_bl_ptr).unwrap();
+                cur = next; 
+            }  
+        });
+        Ok(handle)
     }
 }
 
@@ -547,7 +550,7 @@ impl Rdd for LocalFsReader<FileReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         panic!("Don't support secure computing for LocalFsReader<FileReader>")
     }
 }

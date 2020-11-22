@@ -10,9 +10,8 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::forget;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
-use sgx_types::*;
 
 // Revise if enum is good choice. Considering enum since down casting one trait object to another trait object is difficult.
 #[derive(Clone, Serialize, Deserialize)]
@@ -200,50 +199,28 @@ where
         log::debug!("split index: {}", split.get_index());
         log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
         if rdd_base.get_secure() {
+            let (tx, rx) = mpsc::channel();
+
             let rdd_id = rdd_base.get_rdd_id();
-            let data_ptr = rdd_base.iterator_raw(split).unwrap();
-            //let data = rdd_base.iterator_any(split).unwrap().collect::<Vec<_>>();
-            //println!("data = {:?}", data);
+            let handle = rdd_base.iterator_raw(split, tx, 1).unwrap();
             let now = Instant::now();
-            let captured_vars = std::mem::replace(&mut *env::Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let num_output_splits = self.partitioner.get_num_of_partitions();
-            let mut buckets: Vec<Vec<(KE, CE)>> = (0..num_output_splits)
-                .map(|_| Vec::new())
-                .collect::<Vec<_>>();
+            let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
 
-            for block_ptr in data_ptr { 
-                let now = Instant::now();
-                let mut buckets_bl_ptr: usize = 0;
-                log::debug!("enter enclave");
-                let sgx_status = unsafe {
-                    secure_executing(
-                        env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                        &mut buckets_bl_ptr,
-                        rdd_id,
-                        1,   //shuffle write
-                        block_ptr as *mut u8,
-                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                    )
-                };
-
-                match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => (),
-                    _ => {
-                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                    },
-                };
-
-                let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_id, 1, buckets_bl_ptr as *mut u8);
-                for (i, mut bucket) in buckets_bl.into_iter().enumerate() {
-                    buckets[i].append(&mut bucket); 
+            for block_ptr in rx { 
+                let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_id, 1, block_ptr as *mut u8);
+                for (i, bucket) in buckets_bl.into_iter().enumerate() {
+                    buckets[i].push(bucket); 
                 }
-                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                log::debug!("in dependency, shuffle write {:?}", dur);
             }
+                 
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
                 env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
             }
+            handle.join().unwrap();
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("in dependency, total {:?}", dur);
             env::Env::get().shuffle_manager.get_server_uri()    
@@ -311,15 +288,4 @@ where
             env::Env::get().shuffle_manager.get_server_uri()
         }
     }
-}
-
-extern "C" {
-    fn secure_executing(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        id: usize,
-        is_shuffle: u8,
-        input: *mut u8,
-        captured_vars: *const u8,
-    ) -> sgx_status_t;
 }

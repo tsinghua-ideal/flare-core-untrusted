@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+use std::thread::{JoinHandle, self};
 use std::time::{Duration, Instant};
 
 use crate::aggregator::Aggregator;
@@ -23,6 +23,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         id: usize,
+        tid: u64,
         is_shuffle: u8,
         input: *mut u8,
         captured_vars: *const u8,
@@ -191,8 +192,8 @@ where
         Some(self.part.clone())
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>) -> Result<Vec<usize>> {
-        self.secure_compute(split, self.get_rdd_id())
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
     fn iterator_any(
@@ -260,85 +261,89 @@ where
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize) -> Result<Vec<usize>> {
-        log::debug!("compute inside shuffled rdd");
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, split.get_index());
+        let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
+        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cur_id = self.get_rdd_id();
 
-        let now = Instant::now();
-        //let fut = ShuffleFetcher::secure_fetch(self.shuffle_id, split.get_index());
-        let fut = ShuffleFetcher::fetch::<KE, CE>(self.shuffle_id, split.get_index());
-        let buckets: Vec<(KE, CE)> = futures::executor::block_on(fut)?.into_iter().collect();
-        println!("buckets = {:?}", buckets);
-        let data_ptr = Box::into_raw(Box::new(buckets));
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in ShuffledRdd, fetch {:?}", dur);
-        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new()); 
-        let now = Instant::now();
-        let mut result_ptr: usize = 0;
-        let sgx_status = unsafe {
-            secure_executing(
-                Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                &mut result_ptr,
-                self.get_rdd_id(),  //shuffle rdd id
-                2,   //shuffle read
-                data_ptr as *mut u8, 
-                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-            )
-        };
-        let _buckets = unsafe{ Box::from_raw(data_ptr) };
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            },
-        };
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in ShuffledRdd, shuffle read {:?}", dur);
-        
-        log::debug!("finish shuffle read");
-
-        let data = unsafe{ Box::from_raw(result_ptr as *mut u8 as *mut Vec<(KE, CE)>) };
-        let data_size = std::mem::size_of::<(KE, CE)>();
-        let len = data.len();
-
-        //sub-partition
-        let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
-        let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size
-        let mut cur = 0;
-        let mut result_ptr = Vec::new();
-        while cur < len {
-            let next = match cur + block_len > len {
-                true => len,
-                false => cur + block_len,
-            };
-            let block = Box::new((&data[cur..next]).to_vec());
-            let block_ptr = Box::into_raw(block);
-            let mut result_bl_ptr: usize = 0;
+        let handle = thread::spawn(move || {
+            let tid: u64 = thread::current().id().as_u64().into();
             let now = Instant::now();
-            let sgx_status = unsafe {
-                secure_executing(
-                    Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                    &mut result_bl_ptr,
-                    id,
-                    0,   //false
-                    block_ptr as *mut u8,
-                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                )
-            };
-            let _block = unsafe{ Box::from_raw(block_ptr) };
-            match sgx_status {
-                sgx_status_t::SGX_SUCCESS => {},
-                _ => {
-                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                },
-            };
-
-            result_ptr.push(result_bl_ptr);
+            let mut blocks = Vec::new(); 
+            let num_subpar = bucket.len();
+            let chunk_size = 1000;   //num of entries = 1000*num_subpar
+            let mut iter_vec = Vec::new();
+            for idx_subpar in 0..num_subpar {
+                iter_vec.push(bucket[idx_subpar].chunks(chunk_size));        
+            }
+                        
+            while !iter_vec.is_empty() {
+                //get block (memory inefficient)
+                blocks.clear();
+                let mut empty_idxs = Vec::new();
+                for (idx, iter) in iter_vec.iter_mut().enumerate() {
+                    let nxt = iter.next();
+                    if nxt.is_none() {
+                        empty_idxs.push(idx);
+                        continue;
+                    }
+                    let slice = nxt.unwrap();
+                    blocks.push(slice.to_vec());
+                }
+                empty_idxs.reverse();
+                for idx in empty_idxs {
+                    iter_vec.remove(idx);
+                }
+                
+                let block_ptr = Box::into_raw(Box::new(blocks));
+                
+                let mut result_bl_ptr: usize = 0; 
+                let sgx_status = unsafe {
+                    secure_executing(
+                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                        &mut result_bl_ptr,
+                        cur_id,  //shuffle rdd id
+                        tid,
+                        2,   //shuffle read
+                        block_ptr as *mut u8, 
+                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                    )
+                };
+                blocks = *unsafe{ Box::from_raw(block_ptr) };
+                let _r = match sgx_status {
+                    sgx_status_t::SGX_SUCCESS => {},
+                    _ => {
+                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                    },
+                };
+                
+                // this block is in enclave, cannot access
+                let block_ptr = result_bl_ptr as *mut u8;
+                result_bl_ptr = 0;
+                let sgx_status = unsafe {
+                    secure_executing(
+                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                        &mut result_bl_ptr,
+                        id,
+                        tid,
+                        is_shuffle,  
+                        block_ptr,
+                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                    )
+                };
+                match sgx_status {
+                    sgx_status_t::SGX_SUCCESS => {},
+                    _ => {
+                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                    },
+                };
+                tx.send(result_bl_ptr).unwrap();
+            }  
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("in ParallelCollectionRdd, compute {:?}", dur);
-            cur = next;
-        }
-        Ok(result_ptr)       
-
+            println!("in ShuffledRdd, shuffle read + narrow {:?}", dur);  
+        });
+        Ok(handle)
     }
 }
 
