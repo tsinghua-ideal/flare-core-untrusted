@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering as SyncOrd};
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, mpsc::SyncSender};
 use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
@@ -121,8 +121,8 @@ pub struct CoalescedRdd<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: Func(Vec<T>) -> Vec<TE> + Clone,
-    FD: Func(Vec<TE>) -> Vec<T> + Clone, 
+    FE: Func(Vec<T>) -> TE + Clone,
+    FD: Func(TE) -> Vec<T> + Clone, 
 {
     vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
@@ -137,8 +137,8 @@ impl<T, TE, FE, FD> CoalescedRdd<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: Func(Vec<T>) -> Vec<TE> + Clone,
-    FD: Func(Vec<TE>) -> Vec<T> + Clone, 
+    FE: Func(Vec<T>) -> TE + Clone,
+    FD: Func(TE) -> Vec<T> + Clone, 
 {
     /// ## Arguments
     ///
@@ -161,8 +161,8 @@ impl<T, TE, FE, FD> RddBase for CoalescedRdd<T, TE, FE, FD>
 where 
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         let partition_coalescer = DefaultPartitionCoalescer::default();
@@ -224,7 +224,7 @@ where
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -243,8 +243,8 @@ impl<T, TE, FE, FD> Rdd for CoalescedRdd<T, TE, FE, FD>
 where 
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     type Item = T;
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>>
@@ -274,7 +274,7 @@ where
         Ok(Box::new(iter.into_iter().flatten()) as Box<dyn Iterator<Item = Self::Item>>)
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         //TODO need revision
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }
@@ -285,20 +285,20 @@ impl<T, TE, FE, FD> RddE for CoalescedRdd<T, TE, FE, FD>
 where 
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     type ItemE = TE;
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
 }
 

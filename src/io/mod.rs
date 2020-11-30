@@ -14,6 +14,6 @@ pub trait ReaderConfiguration<I: Data> {
         O: Data,
         OE: Data,
         F: SerFunc(I) -> O,
-        FE: SerFunc(Vec<O>) -> Vec<OE>,
-        FD: SerFunc(Vec<OE>) -> Vec<O>;
+        FE: SerFunc(Vec<O>) -> OE,
+        FD: SerFunc(OE) -> Vec<O>;
 }

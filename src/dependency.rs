@@ -199,7 +199,7 @@ where
         log::debug!("split index: {}", split.get_index());
         log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
         if rdd_base.get_secure() {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::sync_channel(0);
 
             let rdd_id = rdd_base.get_rdd_id();
             let handle = rdd_base.iterator_raw(split, tx, 1).unwrap();

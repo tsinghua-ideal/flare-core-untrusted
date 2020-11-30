@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::executor::{Executor, Signal};
 use crate::io::ReaderConfiguration;
 use crate::partial::{ApproximateEvaluator, PartialResult};
-use crate::rdd::{ParallelCollection, Rdd, RddE, RddBase, UnionRdd, encrypt, decrypt, divide_ct, recover_ct};
+use crate::rdd::{ParallelCollection, Rdd, RddE, RddBase, UnionRdd, ser_encrypt, ser_decrypt};
 use crate::scheduler::{DistributedScheduler, LocalScheduler, NativeScheduler, TaskContext};
 use crate::serializable_traits::{Data, SerFunc};
 use crate::serialized_data_capnp::serialized_data;
@@ -482,8 +482,8 @@ impl Context {
     where
         I: IntoIterator<Item = T>,
         IE: IntoIterator<Item = TE>,
-        FE: SerFunc(Vec<T>) -> Vec<TE>,
-        FD: SerFunc(Vec<TE>) -> Vec<T>,
+        FE: SerFunc(Vec<T>) -> TE,
+        FD: SerFunc(TE) -> Vec<T>,
     {
         let rdd = self.parallelize(seq, seqe, fe, fd, num_slices);
         rdd.register_op_name("make_rdd");
@@ -496,16 +496,14 @@ impl Context {
         end: u64,
         step: usize,
         num_slices: usize,
-    ) -> SerArc<dyn RddE<Item = u64, ItemE = Option<Vec<u8>>>> {
+    ) -> SerArc<dyn RddE<Item = u64, ItemE = Vec<u8>>> {
         // TODO: input validity check
         let seq = (start..=end).step_by(step);
         let fe = Fn!(|v: Vec<u64>| {
-            let ct = encrypt::<>(bincode::serialize(&v).unwrap().as_ref());
-            divide_ct::<>(ct, v.len())            
+            ser_encrypt::<u64>(v)
         });
-        let fd = Fn!(|v: Vec<Option<Vec<u8>>>| {
-            let ct = recover_ct::<>(v); 
-            bincode::deserialize::<Vec<u64>>(decrypt::<>(ct.as_ref()).as_ref()).unwrap()
+        let fd = Fn!(|v: Vec<u8>| {
+            ser_decrypt::<u64>(v)
         });
 
         //no need to ensure privacy
@@ -525,8 +523,8 @@ impl Context {
     where
         I: IntoIterator<Item = T>,
         IE: IntoIterator<Item = TE>,
-        FE: SerFunc(Vec<T>) -> Vec<TE>,
-        FD: SerFunc(Vec<TE>) -> Vec<T>,
+        FE: SerFunc(Vec<T>) -> TE,
+        FD: SerFunc(TE) -> Vec<T>,
     {
         SerArc::new(ParallelCollection::new(self.clone(), seq, seqe, fe, fd, num_slices))
     }
@@ -542,8 +540,8 @@ impl Context {
     where
         F: SerFunc(I) -> O,
         C: ReaderConfiguration<I>,
-        FE: SerFunc(Vec<O>) -> Vec<OE>,
-        FD: SerFunc(Vec<OE>) -> Vec<O>,
+        FE: SerFunc(Vec<O>) -> OE,
+        FD: SerFunc(OE) -> Vec<O>,
     {
         config.make_reader(self.clone(), func, fe, fd)
     }

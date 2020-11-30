@@ -1,5 +1,5 @@
 use std::net::Ipv4Addr;
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, mpsc::SyncSender};
 use std::thread::JoinHandle;
 
 use itertools::{Itertools, MinMaxResult};
@@ -326,7 +326,7 @@ impl<T: Data> RddBase for UnionRdd<T> {
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -383,7 +383,7 @@ impl<T: Data> Rdd for UnionRdd<T> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         //TODO
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }

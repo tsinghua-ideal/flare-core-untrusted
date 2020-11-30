@@ -2,7 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::slice::Chunks;
-use std::sync::{Arc, mpsc::{self, Sender}};
+use std::sync::{Arc, mpsc::{self, SyncSender}};
 use std::thread::{JoinHandle, self};
 
 use crate::aggregator::Aggregator;
@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::partitioner::Partitioner;
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data};
+use crate::serialization_free::Construct;
 use crate::shuffle::ShuffleFetcher;
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
@@ -77,16 +78,18 @@ impl Split for CoGroupSplit {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct CoGroupedRdd<K, V, W, KE, VE, WE, FE, FD> 
+pub struct CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD> 
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
     KE: Data + Eq + Hash,
     VE: Data,
+    CE: Data,
     WE: Data,
-    FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))> + Clone, 
-    FD: Func(Vec<(KE, (Vec<VE>, Vec<WE>))>) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone, 
+    DE: Data,
+    FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)) + Clone, 
+    FD: Func((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone, 
 {
     pub(crate) vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
@@ -100,16 +103,18 @@ where
     pub(crate) part: Box<dyn Partitioner>,
 }
 
-impl<K, V, W, KE, VE, WE, FE, FD> CoGroupedRdd<K, V, W, KE, VE, WE, FE, FD> 
+impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD> 
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
     KE: Data + Eq + Hash,
     VE: Data,
+    CE: Data,
     WE: Data,
-    FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))> + Clone, 
-    FD: Func(Vec<(KE, (Vec<VE>, Vec<WE>))>) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone,
+    DE: Data,
+    FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)) + Clone, 
+    FD: Func((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone, 
 {
     pub fn new(
         rdd0: Arc<dyn RddE<Item = (K, V), ItemE = (KE, VE)>>,
@@ -136,7 +141,8 @@ where
             let rdd_base = rdd0.get_rdd_base();
             log::debug!("creating aggregator inside cogrouprdd");
             deps.push(Dependency::ShuffleDependency(
-                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<VE>>::new(
+                //TODO need revision if fe & fd of group_by is passed 
+                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
                     context.new_shuffle_id(),
                     true,
                     rdd_base,
@@ -158,7 +164,8 @@ where
             let rdd_base = rdd1.get_rdd_base();
             log::debug!("creating aggregator inside cogrouprdd");
             deps.push(Dependency::ShuffleDependency(
-                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<WE>>::new(
+                //TODO need revision if fe & fd of group_by is passed 
+                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
                     context.new_shuffle_id(),
                     true,
                     rdd_base,
@@ -183,16 +190,18 @@ where
     }
 }
 
-impl<K, V, W, KE, VE, WE, FE, FD> RddBase for CoGroupedRdd<K, V, W, KE, VE, WE, FE, FD> 
+impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> RddBase for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD> 
 where 
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
     KE: Data + Eq + Hash,
     VE: Data,
+    CE: Data,
     WE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))>, 
-    FD: SerFunc(Vec<(KE, (Vec<VE>, Vec<WE>))>) -> Vec<(K, (Vec<V>, Vec<W>))>,
+    DE: Data,
+    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)), 
+    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -257,7 +266,7 @@ where
         Some(part)
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -271,16 +280,18 @@ where
     }
 }
 
-impl<K, V, W, KE, VE, WE, FE, FD> Rdd for CoGroupedRdd<K, V, W, KE, VE, WE, FE, FD> 
+impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> Rdd for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD> 
 where 
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
     KE: Data + Eq + Hash,
     VE: Data,
+    CE: Data,
     WE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))>, 
-    FD: SerFunc(Vec<(KE, (Vec<VE>, Vec<WE>))>) -> Vec<(K, (Vec<V>, Vec<W>))>,
+    DE: Data,
+    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)), 
+    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
 {
     type Item = (K, (Vec<V>, Vec<W>)); 
     //type Item = (K, Vec<Vec<Box<dyn AnyData>>>);
@@ -370,56 +381,81 @@ where
         }
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let cur_id = self.get_rdd_id();
             println!("secure_compute in co_group_rdd");
             let mut deps = split.clone().deps;
-
+            let mut chunk_size = 0; 
+            let mut num_sub_part = 0;
             let mut kv = (Vec::new(), Vec::new());
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
-                    let (tx, rx) = mpsc::channel();
+                    let (tx, rx) = mpsc::sync_channel(0);
                     let handle = rdd.iterator_raw(split,  tx,0)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_rdd_id(), 0, received as *mut u8);
-                        kv.0.push(*result_bl)
+                        if result_bl.len() != 0 {
+                            chunk_size += result_bl.get_aprox_size() / result_bl.len();
+                            num_sub_part += 1;
+                        }
+                        kv.0.push(*result_bl);
                     }
                     handle.join().unwrap();
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
-                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<VE>>(shuffle_id, split.get_index());
+                    //TODO need revision if fe & fd of group_by is passed 
+                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
                     kv.1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
+                    for sub_part in &kv.1 {
+                        if sub_part.len() != 0 {
+                            chunk_size += sub_part.get_aprox_size() / sub_part.len();
+                            num_sub_part += 1;
+                        }
+                    }
                 }
             };
             
             let mut kw = (Vec::new(), Vec::new());
             match deps.remove(0) {    //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
-                    let (tx, rx) = mpsc::channel();
+                    let (tx, rx) = mpsc::sync_channel(0);
                     let handle = rdd.iterator_raw(split,  tx,0)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_rdd_id(), 0, received as *mut u8);
-                        kw.0.push(*result_bl)
+                        if result_bl.len() != 0 {
+                            chunk_size += result_bl.get_aprox_size() / result_bl.len();
+                            num_sub_part += 1;
+                        }
+                        kw.0.push(*result_bl);
                     }
                     handle.join().unwrap();
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
-                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<WE>>(shuffle_id, split.get_index());
+                    //TODO need revision if fe & fd of group_by is passed 
+                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
                     kw.1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
+                    for sub_part in &kw.1 {
+                        if sub_part.len() != 0 {
+                            chunk_size += sub_part.get_aprox_size() / sub_part.len();
+                            num_sub_part += 1;
+                        }
+                    }
                 }
             }
-            
+            chunk_size /= num_sub_part;
+
             let handle = std::thread::spawn(move || {
                 let tid: u64 = thread::current().id().as_u64().into();
                 let now = Instant::now();
                 let mut kv_iter = (Vec::new(), Vec::new());
                 let mut kw_iter = (Vec::new(), Vec::new());
-                init_chunks(&kv.0, &mut kv_iter.0);
-                init_chunks(&kv.1, &mut kv_iter.1);
-                init_chunks(&kw.0, &mut kw_iter.0);
-                init_chunks(&kw.1, &mut kw_iter.1);
+                let chunk_len = (1 << (10+10)) / (chunk_size * num_sub_part);  //each block: 1MB
+                init_chunks(&kv.0, &mut kv_iter.0, chunk_len);
+                init_chunks(&kv.1, &mut kv_iter.1, chunk_len);
+                init_chunks(&kw.0, &mut kw_iter.0, chunk_len);
+                init_chunks(&kw.1, &mut kw_iter.1, chunk_len);
 
                 let mut block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     
@@ -431,7 +467,7 @@ where
                     step_forward(&mut block.1, &mut kv_iter.1);
                     step_forward(&mut block.2, &mut kw_iter.0);
                     step_forward(&mut block.3, &mut kw_iter.1);
-                    let block_ptr = Box::into_raw(Box::new((block.0, block.1, block.2, block.3)));
+                    let block_ptr = Box::into_raw(Box::new(block));
                     let mut result_bl_ptr: usize = 0;
                     let sgx_status = unsafe {
                         secure_executing(
@@ -495,36 +531,38 @@ where
 
 }
 
-impl<K, V, W, KE, VE, WE, FE, FD> RddE for CoGroupedRdd<K, V, W, KE, VE, WE, FE, FD> 
+impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> RddE for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD> 
 where 
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
     KE: Data + Eq + Hash,
     VE: Data,
+    CE: Data,
     WE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> Vec<(KE, (Vec<VE>, Vec<WE>))>, 
-    FD: SerFunc(Vec<(KE, (Vec<VE>, Vec<WE>))>) -> Vec<(K, (Vec<V>, Vec<W>))>,
+    DE: Data,
+    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)), 
+    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
 {
-    type ItemE = (KE, (Vec<VE>, Vec<WE>));
+    type ItemE = (KE, (CE, DE));
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
 }
 
-pub fn init_chunks<'a, T: Clone>(v: &'a Vec<Vec<T>>, iter_vec: &mut Vec<Chunks<'a, T>>) {
+pub fn init_chunks<'a, T: Clone>(v: &'a Vec<Vec<T>>, iter_vec: &mut Vec<Chunks<'a, T>>, chunk_len: usize) {
     let num_subpar = v.len();
-    let chunk_size = MAX_ENC_BL;   //max num of entries = MAX_ENC_BL * num_subpar
+    //let chunk_size = MAX_ENC_BL;   //max num of entries = MAX_ENC_BL * num_subpar
     for idx_subpar in 0..num_subpar {
-        iter_vec.push(v[idx_subpar].chunks(chunk_size));        
+        iter_vec.push(v[idx_subpar].chunks(chunk_len));        
     }
 }
 

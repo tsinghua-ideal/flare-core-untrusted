@@ -4,7 +4,7 @@ use std::io::{BufReader, Read};
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, mpsc::SyncSender};
 use std::thread::{JoinHandle, self};
 
 use crate::context::Context;
@@ -80,8 +80,8 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
         F: SerFunc(Vec<u8>) -> U,
         U: Data,
         UE: Data,
-        FE: SerFunc(Vec<U>) -> Vec<UE>,
-        FD: SerFunc(Vec<UE>) -> Vec<U>,
+        FE: SerFunc(Vec<U>) -> UE,
+        FD: SerFunc(UE) -> Vec<U>,
     {
         let reader = LocalFsReader::<BytesReader>::new(self, context);
         let read_files = Fn!(
@@ -120,8 +120,8 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
         F: SerFunc(PathBuf) -> U,
         U: Data,
         UE: Data,
-        FE: SerFunc(Vec<U>) -> Vec<UE>,
-        FD: SerFunc(Vec<UE>) -> Vec<U>,
+        FE: SerFunc(Vec<U>) -> UE,
+        FD: SerFunc(UE) -> Vec<U>,
     {
         let reader = LocalFsReader::<FileReader>::new(self, context);
         let read_files = Fn!(
@@ -388,7 +388,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             true
         }
 
-        fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+        fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
             self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
         }
 
@@ -480,7 +480,7 @@ impl Rdd for LocalFsReader<BytesReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;
@@ -550,7 +550,7 @@ impl Rdd for LocalFsReader<FileReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         panic!("Don't support secure computing for LocalFsReader<FileReader>")
     }
 }

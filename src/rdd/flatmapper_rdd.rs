@@ -1,4 +1,4 @@
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, mpsc::SyncSender};
 use std::thread::JoinHandle;
 
 use crate::context::Context;
@@ -18,8 +18,8 @@ where
     U: Data,
     UE: Data,
     F: Func(T) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<U>) -> Vec<UE> + Clone,
-    FD: Func(Vec<UE>) -> Vec<U> + Clone,
+    FE: Func(Vec<U>) -> UE + Clone,
+    FD: Func(UE) -> Vec<U> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = T>>,
@@ -36,8 +36,8 @@ where
     U: Data,
     UE: Data,
     F: Func(T) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<U>) -> Vec<UE> + Clone,
-    FD: Func(Vec<UE>) -> Vec<U> + Clone,
+    FE: Func(Vec<U>) -> UE + Clone,
+    FD: Func(UE) -> Vec<U> + Clone,
 {
     fn clone(&self) -> Self {
         FlatMapperRdd {
@@ -57,8 +57,8 @@ where
     U: Data,
     UE: Data,
     F: Func(T) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<U>) -> Vec<UE> + Clone,
-    FD: Func(Vec<UE>) -> Vec<U> + Clone,
+    FE: Func(Vec<U>) -> UE + Clone,
+    FD: Func(UE) -> Vec<U> + Clone,
 {
     pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
@@ -85,8 +85,8 @@ where
     U: Data,
     UE: Data,
     F: SerFunc(T) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<U>) -> Vec<UE>,
-    FD: SerFunc(Vec<UE>) -> Vec<U>,
+    FE: SerFunc(Vec<U>) -> UE,
+    FD: SerFunc(UE) -> Vec<U>,
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -121,7 +121,7 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -152,8 +152,8 @@ where
     VE: Data,
     UE: Data,
     F: SerFunc(T) -> Box<dyn Iterator<Item = (V, U)>>,
-    FE: SerFunc(Vec<(V, U)>) -> Vec<(VE, UE)>,
-    FD: SerFunc(Vec<(VE, UE)>) -> Vec<(V, U)>,
+    FE: SerFunc(Vec<(V, U)>) -> (VE, UE),
+    FD: SerFunc((VE, UE)) -> Vec<(V, U)>,
 {
     fn cogroup_iterator_any(
         &self,
@@ -172,8 +172,8 @@ where
     U: Data,
     UE: Data,
     F: SerFunc(T) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<U>) -> Vec<UE>,
-    FD: SerFunc(Vec<UE>) -> Vec<U>,
+    FE: SerFunc(Vec<U>) -> UE,
+    FD: SerFunc(UE) -> Vec<U>,
 {
     type Item = U;
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -189,7 +189,7 @@ where
         Ok(Box::new(self.prev.iterator(split)?.flat_map(f)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             Env::get().captured_vars
@@ -207,19 +207,19 @@ where
     U: Data,
     UE: Data,
     F: SerFunc(T) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<U>) -> Vec<UE>,
-    FD: SerFunc(Vec<UE>) -> Vec<U>,
+    FE: SerFunc(Vec<U>) -> UE,
+    FD: SerFunc(UE) -> Vec<U>,
 {
     type ItemE = UE;
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
 }

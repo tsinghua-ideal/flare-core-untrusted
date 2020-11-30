@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, mpsc::SyncSender};
 use std::thread::{JoinHandle, self};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::aggregator::Aggregator;
 use crate::context::Context;
@@ -10,7 +10,7 @@ use crate::env::Env;
 use crate::dependency::{Dependency, ShuffleDependency};
 use crate::error::Result;
 use crate::partitioner::Partitioner;
-use crate::rdd::{Rdd, RddBase, RddE, RddVals, MAX_ENC_BL};
+use crate::rdd::{Rdd, RddBase, RddE, RddVals};
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::shuffle::ShuffleFetcher;
 use crate::split::Split;
@@ -55,8 +55,8 @@ where
     C: Data,
     KE: Data,
     CE: Data,
-    FE: Func(Vec<(K, C)>) -> Vec<(KE, CE)> + Clone,
-    FD: Func(Vec<(KE, CE)>) -> Vec<(K, C)> + Clone,
+    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
+    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     parent: Arc<dyn Rdd<Item = (K, V)>>,
@@ -78,8 +78,8 @@ where
     C: Data,
     KE: Data,
     CE: Data,
-    FE: Func(Vec<(K, C)>) -> Vec<(KE, CE)> + Clone,
-    FD: Func(Vec<(KE, CE)>) -> Vec<(K, C)> + Clone, 
+    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
+    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone, 
 {
     fn clone(&self) -> Self {
         ShuffledRdd {
@@ -102,8 +102,8 @@ where
     C: Data,
     KE: Data,
     CE: Data,
-    FE: Func(Vec<(K, C)>) -> Vec<(KE, CE)> + Clone,
-    FD: Func(Vec<(KE, CE)>) -> Vec<(K, C)> + Clone, 
+    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
+    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone, 
 {
     pub(crate) fn new(
         parent: Arc<dyn Rdd<Item = (K, V)>>,
@@ -149,8 +149,8 @@ where
     C: Data,
     KE: Data,
     CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> Vec<(KE, CE)>,
-    FD: SerFunc(Vec<(KE, CE)>) -> Vec<(K, C)>, 
+    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
+    FD: SerFunc((KE, CE)) -> Vec<(K, C)>, 
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -192,7 +192,7 @@ where
         Some(self.part.clone())
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -225,8 +225,8 @@ where
     C: Data,
     KE: Data,
     CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> Vec<(KE, CE)>,
-    FD: SerFunc(Vec<(KE, CE)>) -> Vec<(K, C)>, 
+    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
+    FD: SerFunc((KE, CE)) -> Vec<(K, C)>, 
 {
     type Item = (K, C);
 
@@ -261,7 +261,7 @@ where
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, split.get_index());
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
@@ -354,8 +354,8 @@ where
     C: Data,
     KE: Data,
     CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> Vec<(KE, CE)>,
-    FD: SerFunc(Vec<(KE, CE)>) -> Vec<(K, C)>,
+    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
+    FD: SerFunc((KE, CE)) -> Vec<(K, C)>,
 {
     type ItemE = (KE, CE);
     
@@ -363,11 +363,11 @@ where
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
 }

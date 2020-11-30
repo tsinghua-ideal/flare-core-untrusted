@@ -1,14 +1,15 @@
 //! This module implements parallel collection RDD for dividing the input collection for parallel processing.
 use std::collections::HashMap;
-use std::sync::{Arc, mpsc::Sender, Weak};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, mpsc::SyncSender, Weak};
+use std::time::Instant;
 use std::thread::{JoinHandle, self};
 
 use crate::context::Context;
 use crate::dependency::Dependency;
 use crate::env::Env;
 use crate::error::{Error, Result};
-use crate::rdd::{Rdd, RddBase, RddE, RddVals, MAX_ENC_BL};
+use crate::rdd::{Rdd, RddBase, RddE, RddVals};
+use crate::serialization_free::Construct;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use parking_lot::Mutex;
@@ -77,18 +78,17 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, id: usize, tx: Sender<usize>, is_shuffle: u8) -> JoinHandle<()> {
+    fn secure_iterator(&self, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
-        let data_size = std::mem::size_of::<T>();  //may need revising when the type of element is not trivial
+        let data_size = data.get_aprox_size() / len;
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         
         //sub-partition
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
             let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
-            let block_len = (block_len / MAX_ENC_BL + 1) * MAX_ENC_BL;  //align with encryption block size
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -141,8 +141,8 @@ pub struct ParallelCollectionVals<T, TE> {
 #[derive(Serialize, Deserialize)]
 pub struct ParallelCollection<T, TE, FE, FD> 
 where
-    FE: Func(Vec<T>) -> Vec<TE> + Clone,
-    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+    FE: Func(Vec<T>) -> TE + Clone,
+    FD: Func(TE) -> Vec<T> + Clone,
 {
     #[serde(skip_serializing, skip_deserializing)]
     name: Mutex<String>,
@@ -155,8 +155,8 @@ impl<T, TE, FE, FD> Clone for ParallelCollection<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: Func(Vec<T>) -> Vec<TE> + Clone,
-    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+    FE: Func(Vec<T>) -> TE + Clone,
+    FD: Func(TE) -> Vec<T> + Clone,
 {
     fn clone(&self) -> Self {
         ParallelCollection {
@@ -172,8 +172,8 @@ impl<T, TE, FE, FD> ParallelCollection<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: Func(Vec<T>) -> Vec<TE> + Clone,
-    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+    FE: Func(Vec<T>) -> TE + Clone,
+    FD: Func(TE) -> Vec<T> + Clone,
 {
     pub fn new<I, IE>(context: Arc<Context>, data: I, data_enc: IE, fe: FE, fd: FD, num_slices: usize) -> Self
     where
@@ -284,8 +284,8 @@ where
     V: Data,
     KE: Data,
     VE: Data,
-    FE: SerFunc(Vec<(K, V)>) -> Vec<(KE, VE)>,
-    FD: SerFunc(Vec<(KE, VE)>) -> Vec<(K, V)>, 
+    FE: SerFunc(Vec<(K, V)>) -> (KE, VE),
+    FD: SerFunc((KE, VE)) -> Vec<(K, V)>, 
 {
     fn cogroup_iterator_any(
         &self,
@@ -302,8 +302,8 @@ impl<T, TE, FE, FD> RddBase for ParallelCollection<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     fn get_rdd_id(&self) -> usize {
         self.rdd_vals.vals.id
@@ -371,7 +371,7 @@ where
         self.rdd_vals.num_slices
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -398,8 +398,8 @@ impl<T, TE, FE, FD> Rdd for ParallelCollection<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     type Item = T;
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
@@ -423,7 +423,7 @@ where
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
             Ok(s.secure_iterator(id, tx, is_shuffle))
         } else {
@@ -437,19 +437,19 @@ impl<T, TE, FE, FD> RddE for ParallelCollection<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     type ItemE = TE;
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>    
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>    
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     } 
 }

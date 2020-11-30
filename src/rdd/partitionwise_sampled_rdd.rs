@@ -8,7 +8,7 @@ use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use crate::utils::random::RandomSampler;
 use serde_derive::{Deserialize, Serialize};
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, mpsc::SyncSender};
 use std::thread::JoinHandle;
 use parking_lot::Mutex;
 
@@ -17,8 +17,8 @@ pub struct PartitionwiseSampledRdd<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: Func(Vec<T>) -> Vec<TE> + Clone,
-    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+    FE: Func(Vec<T>) -> TE + Clone,
+    FD: Func(TE) -> Vec<T> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = T>>,
@@ -35,8 +35,8 @@ impl<T, TE, FE, FD> PartitionwiseSampledRdd<T, TE, FE, FD>
 where 
     T: Data,
     TE: Data,
-    FE: Func(Vec<T>) -> Vec<TE> + Clone,
-    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+    FE: Func(Vec<T>) -> TE + Clone,
+    FD: Func(TE) -> Vec<T> + Clone,
 {
     pub(crate) fn new(
         prev: Arc<dyn Rdd<Item = T>>,
@@ -69,8 +69,8 @@ impl<T, TE, FE, FD> Clone for PartitionwiseSampledRdd<T, TE, FE, FD>
 where 
     T: Data,
     TE: Data,
-    FE: Func(Vec<T>) -> Vec<TE> + Clone,
-    FD: Func(Vec<TE>) -> Vec<T> + Clone,
+    FE: Func(Vec<T>) -> TE + Clone,
+    FD: Func(TE) -> Vec<T> + Clone,
 {
     fn clone(&self) -> Self {
         PartitionwiseSampledRdd {
@@ -89,8 +89,8 @@ impl<T, TE, FE, FD> RddBase for PartitionwiseSampledRdd<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -134,7 +134,7 @@ where
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -163,8 +163,8 @@ where
     V: Data,
     TE: Data,
     VE: Data,
-    FE: SerFunc(Vec<(T, V)>) -> Vec<(TE, VE)>,
-    FD: SerFunc(Vec<(TE, VE)>) -> Vec<(T, V)>, 
+    FE: SerFunc(Vec<(T, V)>) -> (TE, VE),
+    FD: SerFunc((TE, VE)) -> Vec<(T, V)>, 
 {
     fn cogroup_iterator_any(
         &self,
@@ -181,8 +181,8 @@ impl<T, TE, FE, FD> Rdd for PartitionwiseSampledRdd<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     type Item = T;
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -198,7 +198,7 @@ where
         let iter = self.prev.iterator(split)?;
         Ok(Box::new(sampler_func(iter).into_iter()) as Box<dyn Iterator<Item = T>>)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.prev.secure_compute(split, id, tx, is_shuffle)
     }
 
@@ -208,19 +208,19 @@ impl<T, TE, FE, FD> RddE for PartitionwiseSampledRdd<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
-    FE: SerFunc(Vec<T>) -> Vec<TE>,
-    FD: SerFunc(Vec<TE>) -> Vec<T>, 
+    FE: SerFunc(Vec<T>) -> TE,
+    FD: SerFunc(TE) -> Vec<T>, 
 {
     type ItemE = TE;
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>    
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>    
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     } 
 }

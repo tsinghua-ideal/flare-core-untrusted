@@ -8,7 +8,7 @@ use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
 use std::marker::PhantomData;
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, mpsc::SyncSender};
 use std::thread::JoinHandle;
 use parking_lot::Mutex;
 
@@ -36,8 +36,8 @@ where
     U: Data,
     TE: Data,
     UE: Data,
-    FE: Func(Vec<(T, U)>) -> Vec<(TE, UE)> + Clone,
-    FD: Func(Vec<(TE, UE)>) -> Vec<(T, U)> + Clone,
+    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
+    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
 {
     vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
@@ -58,8 +58,8 @@ where
     U: Data,
     TE: Data,
     UE: Data,
-    FE: Func(Vec<(T, U)>) -> Vec<(TE, UE)> + Clone,
-    FD: Func(Vec<(TE, UE)>) -> Vec<(T, U)> + Clone,
+    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
+    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
 {
     pub(crate) fn new(
         rdd1: Arc<dyn Rdd<Item = T>>,
@@ -90,8 +90,8 @@ where
     U: Data,
     TE: Data,
     UE: Data,
-    FE: Func(Vec<(T, U)>) -> Vec<(TE, UE)> + Clone,
-    FD: Func(Vec<(TE, UE)>) -> Vec<(T, U)> + Clone,
+    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
+    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
 {
     fn clone(&self) -> Self {
         CartesianRdd {
@@ -114,8 +114,8 @@ where
     U: Data,
     TE: Data,
     UE: Data,
-    FE: SerFunc(Vec<(T, U)>) -> Vec<(TE, UE)>,
-    FD: SerFunc(Vec<(TE, UE)>) -> Vec<(T, U)>,
+    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
+    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -162,7 +162,7 @@ where
         array
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -183,8 +183,8 @@ where
     U: Data,
     TE: Data,
     UE: Data,
-    FE: SerFunc(Vec<(T, U)>) -> Vec<(TE, UE)>,
-    FD: SerFunc(Vec<(TE, UE)>) -> Vec<(T, U)>,
+    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
+    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
 {
     type Item = (T, U);
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>>
@@ -209,7 +209,7 @@ where
         Ok(Box::new(iter1.cartesian_product(iter2.into_iter())))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         //TODO
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }
@@ -222,19 +222,19 @@ where
     U: Data,
     TE: Data,
     UE: Data,
-    FE: SerFunc(Vec<(T, U)>) -> Vec<(TE, UE)>,
-    FD: SerFunc(Vec<(TE, UE)>) -> Vec<(T, U)>,
+    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
+    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
 {
     type ItemE = (TE, UE);
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
 }

@@ -8,7 +8,7 @@ use std::hash::Hash;
 use std::io::{BufWriter, Write};
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::{Arc, mpsc::{channel, Sender}, Weak};
+use std::sync::{Arc, mpsc::{sync_channel, SyncSender, Receiver}, Weak};
 use std::thread::{JoinHandle, self};
 use std::time::{Duration, Instant};
 
@@ -97,10 +97,11 @@ where
         + Serialize
         + serde::ser::Serialize
         + serde::de::DeserializeOwned
+        + 'static
 {
     let tid: u64 = thread::current().id().as_u64().into();
     let now = Instant::now();
-    let size_buf_len = 1 << (7+10+10); //128M * 8B
+    let size_buf_len = 1 << (7 + 10 + 10); //128M * 8B
     let size_buf = SizeBuf::new(size_buf_len);
     let size_buf_ptr = Box::into_raw(Box::new(size_buf));
     let sgx_status = unsafe {
@@ -172,26 +173,21 @@ pub fn encrypt(pt: &[u8]) -> Vec<u8> {
 }
 
 #[inline(always)]
-pub fn divide_ct(ct: Vec<u8>, len: usize) -> Vec<Option<Vec<u8>>> {
-    let mut ct_div = vec![None; len];
-    ct_div[0] = Some(ct);
-    /*
-    let mut ct = ct;
-    let ct_len = ct.len();
-    let step = ct_len / len;
-    let remainder = ct_len % len;
-    let mut ct_div = Vec::with_capacity(len);
-    for idx in 0..len {
-        let mut tmp_ct = ct;
-        if idx != len-1 {
-            ct = tmp_ct.split_off(step);
-        } else {
-            ct = tmp_ct.split_off(step + remainder);
-        }
-        ct_div.push(tmp_ct);
-    }
-    */
-    ct_div
+pub fn ser_encrypt<T>(pt: Vec<T>) -> Vec<u8> 
+where
+    T: serde::ser::Serialize + serde::de::DeserializeOwned + 'static
+{
+    match type_eq::<T, u8>() {
+        true => {
+            let (ptr, len, cap) = pt.into_raw_parts();
+            let rebuilt = unsafe {
+                let ptr = ptr as *mut u8;
+                Vec::from_raw_parts(ptr, len, cap)
+            };
+            encrypt(&rebuilt)
+        },
+        false => encrypt(bincode::serialize(&pt).unwrap().as_ref()),
+    } 
 }
 
 #[inline(always)]
@@ -203,17 +199,24 @@ pub fn decrypt(ct: &[u8]) -> Vec<u8> {
 }
 
 #[inline(always)]
-pub fn recover_ct(ct_div: Vec<Option<Vec<u8>>>) -> Vec<u8> {
-    /*
-    ct_div.into_iter().flatten().collect::<Vec<u8>>()
-    */
-    if ct_div.len() > 0 {
-        match ct_div[0].clone() {
-            Some(s) => return s,
-            None => panic!("invalid ciphertext vector"),
-        }
-    } else {
-        return vec![]
+pub fn ser_decrypt<T>(ct: Vec<u8>) -> Vec<T> 
+where
+    T: serde::ser::Serialize + serde::de::DeserializeOwned + 'static
+{
+    if ct.len() == 0 {
+        return Vec::new();
+    }
+    match type_eq::<T, u8>() {
+        true => {
+            let pt = decrypt(&ct);
+            let (ptr, len, cap) = pt.into_raw_parts();
+            let rebuilt = unsafe {
+                let ptr = ptr as *mut T;
+                Vec::from_raw_parts(ptr, len, cap)
+            };
+            rebuilt
+        },
+        false => bincode::deserialize(decrypt(&ct).as_ref()).unwrap(),
     }
 }
 
@@ -276,7 +279,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>>;
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -335,7 +338,7 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         (**self).get_rdd_base().iterator_raw(split, tx, is_shuffle)
     }    
     fn iterator_any(
@@ -358,7 +361,7 @@ impl<I: RddE + ?Sized> Rdd for SerArc<I> {
         (**self).compute(split)
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         (**self).secure_compute(split, id, tx, is_shuffle)
     }
 
@@ -369,16 +372,16 @@ impl<I: RddE + ?Sized> RddE for SerArc<I> {
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         (**self).get_rdde()
     }
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
         (**self).get_fe()
     }
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
         (**self).get_fd()
     }
-    fn batch_encrypt(&self, data: &Vec<Self::Item>) -> Vec<Self::ItemE> {
+    fn batch_encrypt(&self, data: Vec<Self::Item>) -> Vec<Self::ItemE> {
         (**self).batch_encrypt(data)
     }
-    fn batch_decrypt(&self, data_enc: &Vec<Self::ItemE>) -> Vec<Self::Item> {
+    fn batch_decrypt(&self, data_enc: Vec<Self::ItemE>) -> Vec<Self::Item> {
         (**self).batch_decrypt(data_enc)
     }
 }
@@ -396,7 +399,7 @@ pub trait Rdd: RddBase + 'static {
         self.compute(split)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>>;
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>>;
 }
 
 pub trait RddE: Rdd {
@@ -404,47 +407,38 @@ pub trait RddE: Rdd {
 
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>;
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>;
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE>;
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>;
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>>;
 
-    fn batch_encrypt(&self, data: &Vec<Self::Item>) -> Vec<Self::ItemE> {
-        let len = data.len();
+    fn batch_encrypt(&self, mut data: Vec<Self::Item>) -> Vec<Self::ItemE> {
+        let mut len = data.len();
         let mut data_enc = Vec::with_capacity(len);
-        let mut cur = 0;
-        while cur < len {
-            let next = match cur + MAX_ENC_BL > len {
-                true => len,
-                false => cur + MAX_ENC_BL ,
-            };
-            data_enc.append(&mut self.get_fe()((data[cur..next]).to_vec())); //need to check security
-            cur = next;
+        while len >= MAX_ENC_BL {
+            len -= MAX_ENC_BL;
+            let remain = data.split_off(MAX_ENC_BL);
+            let input = data;
+            data = remain;
+            data_enc.push(self.get_fe()(input));
         }
+        if len != 0 {
+            data_enc.push(self.get_fe()(data));
+        }
+        
         data_enc
     }
 
-    fn batch_decrypt(&self, data_enc: &Vec<Self::ItemE>) -> Vec<Self::Item> {
-        let len = data_enc.len();
-        let mut data = Vec::with_capacity(len);
-        let mut cur = 0;
-        while cur < len {
-            let next = match cur + MAX_ENC_BL > len {
-                true => len,
-                false => cur + MAX_ENC_BL ,
-            };
-            let mut pt = self.get_fd()((data_enc[cur..next]).to_vec());
-            //not enough for fixing bug when performing group_by, 
-            //the key part is encrypted and the value part is totally in plaintext, 
-            //therefore, the actually length of the block is hard to get
-            //result in decryption error 
-            cur += pt.len();
+    fn batch_decrypt(&self, data_enc: Vec<Self::ItemE>) -> Vec<Self::Item> {
+        let mut data = Vec::new();
+        for block in data_enc {
+            let mut pt = self.get_fd()(block);
             data.append(&mut pt); //need to check security
         }
         data
     }
 
     fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(0);
         let result_ = self.secure_compute(split, self.get_rdd_id(), tx, 0);
 
         match result_ {
@@ -479,8 +473,8 @@ pub trait RddE: Rdd {
     fn map<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Self::Item) -> U,
-        FE: SerFunc(Vec<U>) -> Vec<UE>,
-        FD: SerFunc(Vec<UE>) -> Vec<U>,
+        FE: SerFunc(Vec<U>) -> UE,
+        FD: SerFunc(UE) -> Vec<U>,
         Self: Sized,
     {
         SerArc::new(MapperRdd::new(self.get_rdd(), f, fe, fd))
@@ -489,8 +483,8 @@ pub trait RddE: Rdd {
     fn flat_map<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Self::Item) -> Box<dyn Iterator<Item = U>>,
-        FE: SerFunc(Vec<U>) -> Vec<UE>,
-        FD: SerFunc(Vec<UE>) -> Vec<U>,
+        FE: SerFunc(Vec<U>) -> UE,
+        FD: SerFunc(UE) -> Vec<U>,
         Self: Sized,
     {
         SerArc::new(FlatMapperRdd::new(self.get_rdd(), f, fe, fd))
@@ -500,8 +494,8 @@ pub trait RddE: Rdd {
     fn map_partitions<U: Data, UE: Data, F, FE, FD>(&self, func: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Box<dyn Iterator<Item = Self::Item>>) -> Box<dyn Iterator<Item = U>>,
-        FE: SerFunc(Vec<U>) -> Vec<UE>,
-        FD: SerFunc(Vec<UE>) -> Vec<U>,
+        FE: SerFunc(Vec<U>) -> UE,
+        FD: SerFunc(UE) -> Vec<U>,
         Self: Sized,
     {
         let ignore_idx = Fn!(move |_index: usize,
@@ -515,8 +509,8 @@ pub trait RddE: Rdd {
     fn map_partitions_with_index<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(usize, Box<dyn Iterator<Item = Self::Item>>) -> Box<dyn Iterator<Item = U>>,
-        FE: SerFunc(Vec<U>) -> Vec<UE>,
-        FD: SerFunc(Vec<UE>) -> Vec<U>,
+        FE: SerFunc(Vec<U>) -> UE,
+        FD: SerFunc(UE) -> Vec<U>,
         Self: Sized,
     {
         SerArc::new(MapPartitionsRdd::new(self.get_rdd(), f, fe, fd))
@@ -537,9 +531,9 @@ pub trait RddE: Rdd {
         let fe = self.get_fe();
         let fd = self.get_fd();
         let fe_wrapper = Fn!(move |v: Vec<Vec<Self::Item>>| {
-            v.into_iter().map(|x| (fe)(x)).collect::<Vec<Vec<Self::ItemE>>>()
+            v.into_iter().map(|x| (fe)(x)).collect::<Vec<Self::ItemE>>()
         });
-        let fd_wrapper = Fn!(move |v: Vec<Vec<Self::ItemE>>| {
+        let fd_wrapper = Fn!(move |v: Vec<Self::ItemE>| {
             v.into_iter().map(|x| (fd)(x)).collect::<Vec<Vec<Self::Item>>>()
         });
         let rdd = MapPartitionsRdd::new(self.get_rdd(), Box::new(func), fe_wrapper, fd_wrapper);
@@ -697,12 +691,14 @@ pub trait RddE: Rdd {
 
     /// Return the Cartesian product of this RDD and another one, that is, the RDD of all pairs of
     /// elements (a, b) where a is in `this` and b is in `other`.
-    fn cartesian<U: Data, UE: Data>(
+    fn cartesian<U, UE>(
         &self,
         other: SerArc<dyn RddE<Item = U, ItemE = UE>>,
     ) -> SerArc<dyn RddE<Item = (Self::Item, U), ItemE = (Self::ItemE, UE)>>
     where
         Self: Sized,
+        U: Data,
+        UE: Data,
     {
         let fe0 = self.get_fe();
         let fd0 = self.get_fd();
@@ -710,10 +706,10 @@ pub trait RddE: Rdd {
         let fd1 = other.get_fd();
         let fe = Fn!(move |v: Vec<(Self::Item, U)>| {
             let (vx, vy): (Vec<Self::Item>, Vec<U>) = v.into_iter().unzip();
-            (fe0)(vx).into_iter().zip((fe1)(vy).into_iter()).collect::<Vec<(Self::ItemE, UE)>>()
+            ((fe0)(vx), (fe1)(vy))
         });
-        let fd = Fn!(move |v: Vec<(Self::ItemE, UE)>| {
-            let (vx, vy): (Vec<Self::ItemE>, Vec<UE>) = v.into_iter().unzip();
+        let fd = Fn!(move |v: (Self::ItemE, UE)| {
+            let (vx, vy) = v;
             (fd0)(vx).into_iter().zip((fd1)(vy).into_iter()).collect::<Vec<(Self::Item, U)>>()
         });
         SerArc::new(CartesianRdd::new(self.get_rdd(), other.get_rdd(), fe, fd))
@@ -767,14 +763,14 @@ pub trait RddE: Rdd {
             let fe_wrapper_mpp = Fn!(move |v: Vec<(usize, Self::Item)>| {
                 let (vx, vy): (Vec<usize>, Vec<Self::Item>) = v.into_iter().unzip();
                 let ct_y = (fe)(vy);
-                vx.into_iter().zip(ct_y.into_iter()).collect::<Vec<_>>()
+                (vx, ct_y)
             });
-            let fd_wrapper_mpp = Fn!(move |v: Vec<(usize, Self::ItemE)>| {
-                let (vx, vy): (Vec<usize>, Vec<Self::ItemE>) = v.into_iter().unzip();
+            let fd_wrapper_mpp = Fn!(move |v: (Vec<usize>, Self::ItemE)| {
+                let (vx, vy) = v;
                 let pt_y = (fd)(vy); 
                 vx.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
             });
-            let map_steep: SerArc<dyn RddE<Item = (usize, Self::Item), ItemE = (usize, Self::ItemE)>> =
+            let map_steep: SerArc<dyn RddE<Item = (usize, Self::Item), ItemE = (Vec<usize>, Self::ItemE)>> =
                 SerArc::new(MapPartitionsRdd::new(self.get_rdd(), distributed_partition, fe_wrapper_mpp, fd_wrapper_mpp));
             let partitioner = Box::new(HashPartitioner::<usize>::new(num_partitions));
             SerArc::new(CoalescedRdd::new(
@@ -835,7 +831,7 @@ pub trait RddE: Rdd {
 
     /// Return the count of each unique value in this RDD as a dictionary of (value, count) pairs.
     /// TODO fe and fd should be drived from RddE automatically, not act as input
-    fn count_by_value(&self) -> SerArc<dyn RddE<Item = (Self::Item, u64), ItemE = (Self::ItemE, Option<Vec<u8>>)>>
+    fn count_by_value(&self) -> SerArc<dyn RddE<Item = (Self::Item, u64), ItemE = (Self::ItemE, Vec<u8>)>>
     where
         Self: Sized,
         Self::Item: Data + Eq + Hash,
@@ -845,30 +841,27 @@ pub trait RddE: Rdd {
         let fe_wrapper_mp = Fn!(move |v: Vec<(Self::Item, u64)>| {
             let (vx, vy): (Vec<Self::Item>, Vec<u64>) = v.into_iter().unzip();
             let ct_x = (fe_c)(vx);
-            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+            (ct_x, vy)
         });
         let fd_c = self.get_fd();
-        let fd_wrapper_mp = Fn!(move |v: Vec<(Self::ItemE, u64)>| {
-            let (vx, vy): (Vec<Self::ItemE>, Vec<u64>) = v.into_iter().unzip();
+        let fd_wrapper_mp = Fn!(move |v: (Self::ItemE, Vec<u64>)| {
+            let (vx, vy) = v;
             let pt_x = (fd_c)(vx); 
             pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
         });
 
         let fe = self.get_fe();
         let fe_wrapper_rd = Fn!(move |v: Vec<(Self::Item, u64)>| {
-            let len = v.len();
             let (vx, vy): (Vec<Self::Item>, Vec<u64>) = v.into_iter().unzip();
             let ct_x = (fe)(vx);
-            let ct_y = encrypt::<>(bincode::serialize(&vy).unwrap().as_ref());
-            let ct_y_div = divide_ct::<>(ct_y, len); 
-            ct_x.into_iter().zip(ct_y_div.into_iter()).collect::<Vec<(Self::ItemE, Option<Vec<u8>>)>>()
+            let ct_y = ser_encrypt(vy);
+            (ct_x, ct_y)
         });
         let fd = self.get_fd();
-        let fd_wrapper_rd = Fn!(move |v: Vec<(Self::ItemE, Option<Vec<u8>>)>| {
-            let (vx, vy): (Vec<Self::ItemE>, Vec<Option<Vec<u8>>>) = v.into_iter().unzip();
+        let fd_wrapper_rd = Fn!(move |v: (Self::ItemE, Vec<u8>)| {
+            let (vx, vy) = v;
             let pt_x = (fd)(vx);
-            let ct_y = recover_ct::<>(vy); 
-            let pt_y: Vec<u64> = bincode::deserialize(decrypt::<>(ct_y.as_ref()).as_ref()).unwrap();
+            let pt_y: Vec<u64> = ser_decrypt(vy);
             assert_eq!(pt_x.len(), pt_y.len());
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
@@ -939,13 +932,13 @@ pub trait RddE: Rdd {
         let fe_wrapper_mp0 = Fn!(move |v: Vec<(Option<Self::Item>, Option<Self::Item>)>| {
             let (vx, vy): (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
             let ct_x = (fe_c)(vx.into_iter().map(|x| x.unwrap()).collect::<Vec<_>>());
-            ct_x.into_iter().map(|x| Some(x)).zip(vy.into_iter()).collect::<Vec<_>>()
+            (ct_x, vy)
         }); 
         let fd_c = self.get_fd();
-        let fd_wrapper_mp0 = Fn!(move |v: Vec<(Option<Self::ItemE>, Option<Self::Item>)>| {
-            let (vx, vy): (Vec<Option<Self::ItemE>>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
-            let pt_x = (fd_c)(vx.into_iter().map(|x| x.unwrap()).collect::<Vec<_>>());
-            pt_x.into_iter().map(|x| Some(x)).zip(vy.into_iter()).collect::<Vec<_>>()
+        let fd_wrapper_mp0 = Fn!(move |v: (Self::ItemE, Vec<Option<Self::Item>>)| {
+            let (vx, vy) = v;
+            let pt_x = (fd_c)(vx).into_iter().map(|x| Some(x));
+            pt_x.zip(vy.into_iter()).collect::<Vec<_>>()
         });
         let fe_wrapper_rd = fe_wrapper_mp0.clone();
         let fd_wrapper_rd = fd_wrapper_mp0.clone();
@@ -955,7 +948,7 @@ pub trait RddE: Rdd {
             ct
         });
         let fd = self.get_fd();
-        let fd_wrapper_mp1 = Fn!(move |v: Vec<Self::ItemE>| {
+        let fd_wrapper_mp1 = Fn!(move |v: Self::ItemE| {
             let pt = (fd)(v);
             pt
         });
@@ -1324,27 +1317,30 @@ pub trait RddE: Rdd {
         let fe_wrapper_mp0 = Fn!(move |v: Vec<(Self::Item, Option<Self::Item>)>| {
             let (vx, vy): (Vec<Self::Item>, Vec<Option<Self::Item>>)= v.into_iter().unzip();
             let ct_x = (fe_c)(vx);
-            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+            (ct_x, vy)
         });
         let fd_c = self.get_fd();
-        let fd_wrapper_mp0 = Fn!(move |v: Vec<(Self::ItemE, Option<Self::Item>)>| {
-            let (vx, vy): (Vec<Self::ItemE>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
+        let fd_wrapper_mp0 = Fn!(move |v: (Self::ItemE, Vec<Option<Self::Item>>)| {
+            let (vx, vy) = v;
             let pt_x = (fd_c)(vx); 
             pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
         });
 
-        //should cogroup provide interface of fe and fd?
         let fe_c = self.get_fe();
-        let fe_wrapper_jn = Fn!(move |v: Vec<(Self::Item, (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>))>| {
+        let fe_wrapper_jn = Fn!(move |v: Vec<(Self::Item, (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>))>| {
             let (vx, vy): (Vec<Self::Item>, Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>) = v.into_iter().unzip();
+            let (vy, vz): (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>) = vy.into_iter().unzip();
             let ct_x = (fe_c)(vx);
-            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+            (ct_x, (vy, vz))
         });
         let fd_c = self.get_fd();
-        let fd_wrapper_jn = Fn!(move |v: Vec<(Self::ItemE, (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>))>| {
-            let (vx, vy): (Vec<Self::ItemE>, Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>) = v.into_iter().unzip();
+        let fd_wrapper_jn = Fn!(move |v: (Self::ItemE, (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>))| {
+            let (vx, (vy, vz)) = v;
             let pt_x = (fd_c)(vx); 
-            pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+            pt_x.into_iter()
+                .zip(vy.into_iter()
+                    .zip(vz.into_iter())
+                ).collect::<Vec<_>>()
         }); 
 
         //TODO may need to be revised
@@ -1366,6 +1362,8 @@ pub trait RddE: Rdd {
             )), fe_wrapper_mp0, fd_wrapper_mp0)
             .cogroup(
                 other,
+                fe_wrapper_jn,
+                fd_wrapper_jn,
                 Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
             ).map(Box::new(Fn!(|(x, (v1, v2)): (
                 Self::Item,
@@ -1408,28 +1406,31 @@ pub trait RddE: Rdd {
         let fe_wrapper_mp0 = Fn!(move |v: Vec<(Self::Item, Option<Self::Item>)>| {
             let (vx, vy): (Vec<Self::Item>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
             let ct_x = (fe_c)(vx);
-            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+            (ct_x, vy)
         });
         let fd_c = self.get_fd();
-        let fd_wrapper_mp0 = Fn!(move |v: Vec<(Self::ItemE, Option<Self::Item>)>| {
-            let (vx, vy): (Vec<Self::ItemE>, Vec<Option<Self::Item>>)= v.into_iter().unzip();
+        let fd_wrapper_mp0 = Fn!(move |v: (Self::ItemE, Vec<Option<Self::Item>>)| {
+            let (vx, vy) = v;
             let pt_x = (fd_c)(vx); 
             pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
         });
 
-        //should cogroup provide interface of fe and fd?
         let fe_c = self.get_fe();
-        let fe_wrapper_jn = Fn!(move |v: Vec<(Self::Item, (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>))>| {
-            let (vx, vy): (Vec<Self::Item>, Vec<(Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>)>)= v.into_iter().unzip();
+        let fe_wrapper_jn = Fn!(move |v: Vec<(Self::Item, (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>))>| {
+            let (vx, vy): (Vec<Self::Item>, Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>) = v.into_iter().unzip();
+            let (vy, vz): (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>) = vy.into_iter().unzip();
             let ct_x = (fe_c)(vx);
-            ct_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
+            (ct_x, (vy, vz))
         });
         let fd_c = self.get_fd();
-        let fd_wrapper_jn = Fn!(move |v: Vec<(Self::ItemE, (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>))>| {
-            let (vx, vy): (Vec<Self::ItemE>, Vec<(Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>)>) = v.into_iter().unzip();
+        let fd_wrapper_jn = Fn!(move |v: (Self::ItemE, (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>))| {
+            let (vx, (vy, vz)) = v;
             let pt_x = (fd_c)(vx); 
-            pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
-        });
+            pt_x.into_iter()
+                .zip(vy.into_iter()
+                    .zip(vz.into_iter())
+                ).collect::<Vec<_>>()
+        }); 
 
         //TODO may need to be revised
         let fe_wrapper_mp1 = Fn!(move |v: Vec<Option<Self::Item>>| {
@@ -1450,6 +1451,8 @@ pub trait RddE: Rdd {
             )), fe_wrapper_mp0, fd_wrapper_mp0)
             .cogroup(
                 other,
+                fe_wrapper_jn,
+                fd_wrapper_jn,
                 Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
             )
             .map(Box::new(Fn!(|(x, (v1, v2)): (
@@ -1485,7 +1488,7 @@ pub trait RddE: Rdd {
     /// This operation may be very expensive. If you are grouping in order to perform an
     /// aggregation (such as a sum or average) over each key, using `aggregate_by_key`
     /// or `reduce_by_key` will provide much better performance.
-    fn group_by<K, F>(&self, func: F) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Option<Vec<u8>>, Vec<Self::ItemE>)>>
+    fn group_by<K, F>(&self, func: F) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Vec<u8>, Vec<Self::ItemE>)>>
     where
         Self: Sized,
         K: Data + Hash + Eq,
@@ -1507,7 +1510,7 @@ pub trait RddE: Rdd {
         &self,
         func: F,
         num_splits: usize,
-    ) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Option<Vec<u8>>, Vec<Self::ItemE>)>>
+    ) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Vec<u8>, Vec<Self::ItemE>)>>
     where
         Self: Sized,
         K: Data + Hash + Eq,
@@ -1516,28 +1519,37 @@ pub trait RddE: Rdd {
         let fe = self.get_fe();
         let fe_wrapper_mp = Fn!(move |v: Vec<(K, Self::Item)>| {
             let len = v.len();
-            let (mut vx, vy): (Vec<K>, Vec<Self::Item>) = v.into_iter().unzip();
-            {
-                let mut vx_tmp = vx.clone();
-                vx_tmp.dedup();
-                if vx_tmp.len() == 1 {
-                    vx = vx_tmp;
-                }
-            }
-            let ct_x = encrypt::<>(bincode::serialize(&vx).unwrap().as_ref());
-            let ct_x_div = divide_ct::<>(ct_x, len);
+            let (vx, vy): (Vec<K>, Vec<Self::Item>) = v.into_iter().unzip();
+            let ct_x = ser_encrypt(vx);
             let ct_y = (fe)(vy);
-            ct_x_div.into_iter().zip(ct_y.into_iter()).collect::<Vec<_>>()
+            (ct_x, ct_y)
         });
         let fd = self.get_fd();
-        let fd_wrapper_mp = Fn!(move |v: Vec<(Option<Vec<u8>>, Self::ItemE)>| {
-            let (vx, vy): (Vec<Option<Vec<u8>>>, Vec<Self::ItemE>) = v.into_iter().unzip();
-            let ct_x = recover_ct::<>(vx); 
-            let mut pt_x: Vec<K> = bincode::deserialize(decrypt::<>(ct_x.as_ref()).as_ref()).unwrap();
+        let fd_wrapper_mp = Fn!(move |v: (Vec<u8>, Self::ItemE)| {
+            let (vx, vy) = v;
+            let pt_x: Vec<K> = ser_decrypt(vx);
             let pt_y = (fd)(vy);
-            if pt_x.len() == 1 {
-                pt_x.resize(pt_y.len(), pt_x[0].clone());
+            pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
+        });
+
+        let fe = self.get_fe();
+        let fe_wrapper_gb = Fn!(move |v: Vec<(K, Vec<Self::Item>)>| {
+            let (vx, vy): (Vec<K>, Vec<Vec<Self::Item>>) = v.into_iter().unzip();
+            let mut ct_y = Vec::with_capacity(vy.len());
+            for y in vy {
+                ct_y.push((fe)(y));
             }
+            let ct_x = ser_encrypt(vx);
+            (ct_x, ct_y)
+        });
+        let fd = self.get_fd();
+        let fd_wrapper_gb = Fn!(move |v: (Vec<u8>, Vec<Self::ItemE>)| {
+            let (vx, vy) = v;
+            let mut pt_y = Vec::with_capacity(vy.len());
+            for y in vy {
+                pt_y.push((fd)(y));
+            }
+            let pt_x = ser_decrypt(vx);
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
 
@@ -1545,7 +1557,7 @@ pub trait RddE: Rdd {
             let key = (func)(&val);
             (key, val)
         })), fe_wrapper_mp, fd_wrapper_mp)
-        .group_by_key(num_splits)
+        .group_by_key(fe_wrapper_gb, fd_wrapper_gb, num_splits)
     }
 
     /// Return an RDD of grouped items. Each group consists of a key and a sequence of elements
@@ -1561,7 +1573,7 @@ pub trait RddE: Rdd {
         &self,
         func: F,
         partitioner: Box<dyn Partitioner>,
-    ) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Option<Vec<u8>>, Vec<Self::ItemE>)>>
+    ) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Vec<u8>, Vec<Self::ItemE>)>>
     where
         Self: Sized,
         K: Data + Hash + Eq,
@@ -1571,25 +1583,44 @@ pub trait RddE: Rdd {
         let fe_wrapper_mp = Fn!(move |v: Vec<(K, Self::Item)>| {
             let len = v.len();
             let (vx, vy): (Vec<K>, Vec<Self::Item>) = v.into_iter().unzip();
-            let ct_x = encrypt::<>(bincode::serialize(&vx).unwrap().as_ref());
-            let ct_x_div = divide_ct::<>(ct_x, len);
+            let ct_x = ser_encrypt(vx);
             let ct_y = (fe)(vy);
-            ct_x_div.into_iter().zip(ct_y.into_iter()).collect::<Vec<_>>()
+            (ct_x, ct_y)
         });
         let fd = self.get_fd();
-        let fd_wrapper_mp = Fn!(move |v: Vec<(Option<Vec<u8>>, Self::ItemE)>| {
-            let (vx, vy): (Vec<Option<Vec<u8>>>, Vec<Self::ItemE>) = v.into_iter().unzip();
-            let ct_x = recover_ct::<>(vx); 
-            let pt_x: Vec<K> = bincode::deserialize(decrypt::<>(ct_x.as_ref()).as_ref()).unwrap();
+        let fd_wrapper_mp = Fn!(move |v: (Vec<u8>, Self::ItemE)| {
+            let (vx, vy) = v;
+            let pt_x: Vec<K> = ser_decrypt(vx);
             let pt_y = (fd)(vy);
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
-        
+
+        let fe = self.get_fe();
+        let fe_wrapper_gb = Fn!(move |v: Vec<(K, Vec<Self::Item>)>| {
+            let (vx, vy): (Vec<K>, Vec<Vec<Self::Item>>) = v.into_iter().unzip();
+            let mut ct_y = Vec::with_capacity(vy.len());
+            for y in vy {
+                ct_y.push((fe)(y));
+            }
+            let ct_x = ser_encrypt(vx);
+            (ct_x, ct_y)
+        });
+        let fd = self.get_fd();
+        let fd_wrapper_gb = Fn!(move |v: (Vec<u8>, Vec<Self::ItemE>)| {
+            let (vx, vy) = v;
+            let mut pt_y = Vec::with_capacity(vy.len());
+            for y in vy {
+                pt_y.push((fd)(y));
+            }
+            let pt_x = ser_decrypt(vx);
+            pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
+        });
+
         self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
             let key = (func)(&val);
             (key, val)
         })), fe_wrapper_mp, fd_wrapper_mp)
-        .group_by_key_using_partitioner(partitioner)
+        .group_by_key_using_partitioner(fe_wrapper_gb, fd_wrapper_gb, partitioner)
     }
 
     /// Approximate version of count() that returns a potentially incomplete result
@@ -1636,7 +1667,7 @@ pub trait RddE: Rdd {
     }
 
     /// Creates tuples of the elements in this RDD by applying `f`.
-    fn key_by<T, F>(&self, func: F) -> SerArc<dyn RddE<Item = (Self::Item, T), ItemE = (Self::ItemE, Option<Vec<u8>>)>>
+    fn key_by<T, F>(&self, func: F) -> SerArc<dyn RddE<Item = (Self::Item, T), ItemE = (Self::ItemE, Vec<u8>)>>
     where
         Self: Sized,
         T: Data,
@@ -1647,16 +1678,15 @@ pub trait RddE: Rdd {
             let len = v.len();
             let (vx, vy): (Vec<Self::Item>, Vec<T>) = v.into_iter().unzip();
             let ct_x = (fe)(vx);
-            let ct_y = encrypt::<>(bincode::serialize(&vy).unwrap().as_ref());
-            let ct_y_div = divide_ct::<>(ct_y, len); 
-            ct_x.into_iter().zip(ct_y_div.into_iter()).collect::<Vec<_>>()
+            let ct_y = ser_encrypt(vy);
+            (ct_x, ct_y)
         });
+
         let fd = self.get_fd();
-        let fd_wrapper_mp = Fn!(move |v: Vec<(Self::ItemE, Option<Vec<u8>>)>| {
-            let (vx, vy): (Vec<Self::ItemE>, Vec<Option<Vec<u8>>>) = v.into_iter().unzip();
+        let fd_wrapper_mp = Fn!(move |v: (Self::ItemE, Vec<u8>)| {
+            let (vx, vy) = v;
             let pt_x = (fd)(vx);
-            let ct_y = recover_ct::<>(vy); 
-            let pt_y: Vec<T> = bincode::deserialize(decrypt::<>(ct_y.as_ref()).as_ref()).unwrap();
+            let pt_y: Vec<T> = ser_decrypt(vy);
             assert_eq!(pt_x.len(), pt_y.len());
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
@@ -1712,7 +1742,7 @@ pub trait RddE: Rdd {
             (fe)(v.into_iter().map(|x| x.0).collect::<Vec<_>>())
         });
         let fd = self.get_fd();
-        let fd_wrapper_mp = Fn!(move |v: Vec<Self::ItemE>| {
+        let fd_wrapper_mp = Fn!(move |v: Self::ItemE| {
             (fd)(v).into_iter().map(|x| Reverse(x)).collect::<Vec<_>>()
         });
 

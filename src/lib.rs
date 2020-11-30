@@ -10,6 +10,7 @@
     thread_id_value,
     unboxed_closures,
     unsize,
+    vec_into_raw_parts,
     vec_resize_default
 )]
 #![allow(dead_code, where_clauses_object_safety, deprecated)]
@@ -55,4 +56,4 @@ pub use context::Context;
 pub use error::*;
 pub use io::LocalFsReaderConfig;
 pub use partial::BoundedDouble;
-pub use rdd::{PairRdd, Rdd, RddE, encrypt, divide_ct, decrypt, recover_ct, MAX_ENC_BL};
+pub use rdd::{PairRdd, Rdd, RddE, encrypt, decrypt, ser_encrypt, ser_decrypt, MAX_ENC_BL};

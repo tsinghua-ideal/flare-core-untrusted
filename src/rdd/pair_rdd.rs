@@ -1,5 +1,5 @@
 use std::hash::Hash;
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, mpsc::SyncSender};
 use std::thread::JoinHandle;
 
 use crate::aggregator::Aggregator;
@@ -33,8 +33,8 @@ where
     ) -> SerArc<dyn RddE<Item = (K, C), ItemE = (KE2, CE)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, C)>) -> Vec<(KE2, CE)>, 
-        FD: SerFunc(Vec<(KE2, CE)>) -> Vec<(K, C)>,
+        FE: SerFunc(Vec<(K, C)>) -> (KE2, CE), 
+        FD: SerFunc((KE2, CE)) -> Vec<(K, C)>,
     {
         SerArc::new(ShuffledRdd::new(
             self.get_rdd(),
@@ -45,52 +45,33 @@ where
         ))
     }
 
-    fn group_by_key(&self, num_splits: usize) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, Vec<VE>)>>
+    fn group_by_key<CE, FE, FD>(&self, fe: FE, fd: FD, num_splits: usize) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, CE)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
+        CE: Data,
+        FE: SerFunc(Vec<(K, Vec<V>)>) -> (KE, CE),
+        FD: SerFunc((KE, CE)) -> Vec<(K, Vec<V>)>,
     {
         self.group_by_key_using_partitioner(
+            fe,
+            fd,
             Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>
         )
     }
 
-    fn group_by_key_using_partitioner(
+    fn group_by_key_using_partitioner<CE, FE, FD>(
         &self,
+        fe: FE,
+        fd: FD,
         partitioner: Box<dyn Partitioner>,
-    ) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, Vec<VE>)>>
+    ) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, CE)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
+        CE: Data,
+        FE: SerFunc(Vec<(K, Vec<V>)>) -> (KE, CE),
+        FD: SerFunc((KE, CE)) -> Vec<(K, Vec<V>)>,
     {
-        let fe = self.get_fe();
-        let fd = self.get_fd();
-        let fe_wrapper = Fn!(move |v: Vec<(K, Vec<V>)>| {
-            let mut ct = Vec::with_capacity(v.len());
-            for (x, vy) in v {
-                let (ct_x, ct_y): (Vec<KE>, Vec<VE>) = (fe)(vy
-                    .into_iter()
-                    .map(|y| (x.clone(), y))
-                    .collect::<Vec<_>>())
-                    .into_iter()
-                    .unzip();
-                ct.push((ct_x[0].clone(), ct_y));
-            } 
-            ct
-        });
-        let fd_wrapper = Fn!(move |v: Vec<(KE, Vec<VE>)>| {
-            let mut pt = Vec::with_capacity(v.len());
-            for (x, vy) in v {
-                let (pt_x, pt_y): (Vec<K>, Vec<V>) = (fd)(vy
-                    .into_iter()
-                    .map(|y| (x.clone(), y))
-                    .collect::<Vec<_>>())
-                    .into_iter()
-                    .unzip();
-                pt.push((pt_x[0].clone(), pt_y));
-            }
-            pt
-        });
-
-        self.combine_by_key(Aggregator::<K, V, _>::default(), partitioner, fe_wrapper, fd_wrapper)
+        self.combine_by_key(Aggregator::<K, V, _>::default(), partitioner, fe, fd)
     }
 
     fn reduce_by_key<KE2, VE2, F, FE, FD>(&self, func: F, num_splits: usize, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = (K, V), ItemE = (KE2, VE2)>>
@@ -99,8 +80,8 @@ where
         VE2: Data,
         F: SerFunc((V, V)) -> V,
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, V)>) -> Vec<(KE2, VE2)>, 
-        FD: SerFunc(Vec<(KE2, VE2)>) -> Vec<(K, V)>,        
+        FE: SerFunc(Vec<(K, V)>) -> (KE2, VE2), 
+        FD: SerFunc((KE2, VE2)) -> Vec<(K, V)>,        
     {
         self.reduce_by_key_using_partitioner(
             func,
@@ -122,8 +103,8 @@ where
         VE2: Data,
         F: SerFunc((V, V)) -> V,
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, V)>) -> Vec<(KE2, VE2)>, 
-        FD: SerFunc(Vec<(KE2, VE2)>) -> Vec<(K, V)>,  
+        FE: SerFunc(Vec<(K, V)>) -> (KE2, VE2), 
+        FD: SerFunc((KE2, VE2)) -> Vec<(K, V)>,  
     {
         let create_combiner = Box::new(Fn!(|v: V| v));
         let f_clone = func.clone();
@@ -144,8 +125,8 @@ where
         F: SerFunc(V) -> U + Clone,
         U: Data,
         UE: Data,
-        FE: SerFunc(Vec<(K, U)>) -> Vec<(KE, UE)>, 
-        FD: SerFunc(Vec<(KE, UE)>) -> Vec<(K, U)>,
+        FE: SerFunc(Vec<(K, U)>) -> (KE, UE), 
+        FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
     {
         SerArc::new(MappedValuesRdd::new(self.get_rdd(), f, fe, fd))
     }
@@ -161,17 +142,24 @@ where
         F: SerFunc(V) -> Box<dyn Iterator<Item = U>> + Clone,
         U: Data,
         UE: Data,
-        FE: SerFunc(Vec<(K, U)>) -> Vec<(KE, UE)>, 
-        FD: SerFunc(Vec<(KE, UE)>) -> Vec<(K, U)>, 
+        FE: SerFunc(Vec<(K, U)>) -> (KE, UE), 
+        FD: SerFunc((KE, UE)) -> Vec<(K, U)>, 
     {
         SerArc::new(FlatMappedValuesRdd::new(self.get_rdd(), f, fe, fd))
     }
 
-    fn join<W: Data, WE: Data>(
+    fn join<W, WE, FE, FD>(
         &self,
         other: SerArc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
+        fe: FE,
+        fd: FD,
         num_splits: usize,
     ) -> SerArc<dyn RddE<Item = (K, (V, W)), ItemE = (KE, (VE, WE))>> 
+    where
+        W: Data + Default,
+        WE: Data + Default,
+        FE: SerFunc(Vec<(K, (V, W))>) -> (KE, (VE, WE)), 
+        FD: SerFunc((KE, (VE, WE))) -> Vec<(K, (V, W))>, 
     {
         let f = Fn!(|v: (Vec<V>, Vec<W>)| {
             let (vs, ws) = v;
@@ -180,143 +168,85 @@ where
                 .flat_map(move |v| ws.clone().into_iter().map(move |w| (v.clone(), w)));
             Box::new(combine) as Box<dyn Iterator<Item = (V, W)>>
         });
+
         let fe0 = self.get_fe();
         let fd0 = self.get_fd();
         let fe1 = other.get_fe();
         let fd1 = other.get_fd();
-        let fe = Fn!(move |v: Vec<(K, (V, W))>| {
-            let (vx, vy): (Vec<K>, Vec<(V, W)>) = v.into_iter().unzip();
-            let (vy, vz): (Vec<V>, Vec<W>) = vy.into_iter().unzip();
-            let ct_xy: Vec<(KE, VE)> = (fe0)(vx
-                .clone()
-                .into_iter()
-                .zip(vy.into_iter())
-                .collect::<Vec<_>>());
-            let ct_xz: Vec<(KE, WE)> = (fe1)(vx
-                .into_iter()
-                .zip(vz.into_iter())
-                .collect::<Vec<_>>());
-            ct_xy.into_iter()
-                .zip(ct_xz.into_iter())
-                .map(|((ct_k, ct_v), (_, ct_w))| (ct_k, (ct_v, ct_w)))
+        //temporarily built
+        let fe_cg = Fn!(move |v: Vec<(K, (Vec<V>, Vec<W>))>| {
+            let (k, vw): (Vec<K>, Vec<(Vec<V>, Vec<W>)>) = v.into_iter().unzip();
+            let (v, w): (Vec<Vec<V>>, Vec<Vec<W>>) = vw.into_iter().unzip();
+            let mut w_padding: Vec<W> = Vec::new();
+            w_padding.resize_with(k.len(), Default::default);
+            let (ct_x, _) = (fe1)(k.into_iter()
+                .zip(w_padding.into_iter())
                 .collect::<Vec<_>>()
+            );
+            (ct_x, (ser_encrypt(v), ser_encrypt(w)))
         });
-        let fd = Fn!(move |v: Vec<(KE, (VE, WE))>| {
-            let (vx, vy): (Vec<KE>, Vec<(VE, WE)>) = v.into_iter().unzip();
-            let (vy, vz): (Vec<VE>, Vec<WE>) = vy.into_iter().unzip();
-            let pt_xy: Vec<(K, V)> = (fd0)(vx
-                .clone()
-                .into_iter()
-                .zip(vy.into_iter())
-                .collect::<Vec<_>>());
-            let pt_xz: Vec<(K, W)> = (fd1)(vx
-                .into_iter()
-                .zip(vz.into_iter())
-                .collect::<Vec<_>>());
-            pt_xy.into_iter()
-                .zip(pt_xz.into_iter())
-                .map(|((pt_k, pt_v), (_, pt_w))| (pt_k, (pt_v, pt_w)))
-                .collect::<Vec<_>>()
+        let fd_cg = Fn!(move |v: (KE, (Vec<u8>, Vec<u8>))| {
+            let (ct_x, (ct_y, ct_z)) = v;
+            let w_padding: WE = Default::default();
+            let (x, _): (Vec<K>, Vec<W>)= (fd1)((ct_x, w_padding)).into_iter().unzip();
+            let y = ser_decrypt(ct_y);
+            let z = ser_decrypt(ct_z);
+            x.into_iter()
+                .zip(y.into_iter()
+                    .zip(z.into_iter())
+                ).collect::<Vec<_>>()
         });
+
         self.cogroup(
             other,
+            fe_cg,
+            fd_cg,
             Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
         )
         .flat_map_values(Box::new(f), fe, fd)
     }
 
-    fn cogroup<W: Data, WE: Data>(
+    fn cogroup<W, WE, CE, DE, FE, FD>(
         &self,
         other: SerArc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
+        fe: FE,
+        fd: FD,
         partitioner: Box<dyn Partitioner>,
-    ) -> SerArc<dyn RddE<Item = (K, (Vec<V>, Vec<W>)), ItemE = (KE, (Vec<VE>, Vec<WE>))>> 
+    ) -> SerArc<dyn RddE<Item = (K, (Vec<V>, Vec<W>)), ItemE = (KE, (CE, DE))>> 
+    where
+        W: Data,
+        WE: Data,
+        CE: Data,
+        DE: Data,
+        FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)), 
+        FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>, 
     {
-        let fe0 = self.get_fe();
-        let fd0 = self.get_fd();
-        let fe1 = other.get_fe();
-        let fd1 = other.get_fd();
-        let fe = Fn!(move |v: Vec<(K, (Vec<V>, Vec<W>))>| {
-            let mut ct = Vec::with_capacity(v.len());
-            for (x, (vy, vz)) in v {
-                let (ct_x, ct_y): (Vec<KE>, Vec<VE>) = (fe0)(vy
-                    .into_iter()
-                    .map(|y| (x.clone(), y))
-                    .collect::<Vec<_>>())
-                    .into_iter()
-                    .unzip();
-                let (_, ct_z): (Vec<KE>, Vec<WE>) = (fe1)(vz
-                    .into_iter()
-                    .map(|z| (x.clone(), z))
-                    .collect::<Vec<_>>())
-                    .into_iter()
-                    .unzip();
-                ct.push((ct_x[0].clone(), (ct_y, ct_z)));
-            } 
-            ct
-        });
-        let fd = Fn!(move |v: Vec<(KE, (Vec<VE>, Vec<WE>))>| {
-            let mut pt = Vec::with_capacity(v.len());
-            for (x, (vy, vz)) in v {
-                let (pt_x, pt_y): (Vec<K>, Vec<V>) = (fd0)(vy
-                    .into_iter()
-                    .map(|y| (x.clone(), y))
-                    .collect::<Vec<_>>())
-                    .into_iter()
-                    .unzip();
-                let (_, pt_z): (Vec<K>, Vec<W>) = (fd1)(vz
-                    .into_iter()
-                    .map(|z| (x.clone(), z))
-                    .collect::<Vec<_>>())
-                    .into_iter()
-                    .unzip();
-                pt.push((pt_x[0].clone(), (pt_y, pt_z)));
-            }
-            pt
-        });
-
         SerArc::new(CoGroupedRdd::new(self.get_rdde(), other.get_rdde(), fe, fd, partitioner))
     }
 
     fn partition_by_key<FE, FD>(&self, partitioner: Box<dyn Partitioner>, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = V, ItemE = VE>>
     where 
-        FE: SerFunc(Vec<V>) -> Vec<VE>, 
-        FD: SerFunc(Vec<VE>) -> Vec<V>, 
+        FE: SerFunc(Vec<V>) -> VE, 
+        FD: SerFunc(VE) -> Vec<V>, 
     {
         // Guarantee the number of partitions by introducing a shuffle phase
-        let fe1 = self.get_fe();
-        let fd1 = self.get_fd();
-
+        let fe_c = fe.clone();
+        let fd_c = fd.clone();
         let fe_wrapper_sf = Fn!(move |v: Vec<(K, Vec<V>)>| {
-            let mut ct = Vec::with_capacity(v.len());
-            for (x, vy) in v {
-                let len = vy.len();
-                let mut vx = Vec::new();
-                vx.resize(len, x);
-                let (ct_x, ct_y): (Vec<KE>, Vec<VE>) = (fe1)(vx
-                    .into_iter()
-                    .zip(vy.into_iter())
-                    .collect::<Vec<_>>())
-                    .into_iter()
-                    .unzip();
-                ct.push((ct_x[0].clone(), ct_y));
-            } 
-            ct
-        });
-        let fd_wrapper_sf = Fn!(move |v: Vec<(KE, Vec<VE>)>| {
-            let mut pt = Vec::with_capacity(v.len());
-            for (x, vy) in v {
-                let len = vy.len();
-                let mut vx = Vec::new();
-                vx.resize(len, x);  //TODO may need revision
-                let (pt_x, pt_y): (Vec<K>, Vec<V>) = (fd1)(vx
-                    .into_iter()
-                    .zip(vy.into_iter())
-                    .collect::<Vec<_>>())
-                    .into_iter()
-                    .unzip();
-                pt.push((pt_x[0].clone(), pt_y));
+            let (x, vy): (Vec<K>, Vec<Vec<V>>) = v.into_iter().unzip();
+            let mut ct_y = Vec::with_capacity(vy.len());
+            for y in vy {
+                ct_y.push((fe_c)(y));
             }
-            pt
+            (x, ct_y)
+        });
+        let fd_wrapper_sf = Fn!(move |v: (Vec<K>, Vec<VE>)| {
+            let (x, vy) = v;
+            let mut pt_y = Vec::with_capacity(vy.len());
+            for y in vy {
+                pt_y.push((fd_c)(y));
+            } 
+            x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
 
         let shuffle_steep = ShuffledRdd::new(
@@ -365,8 +295,8 @@ where
     KE: Data,
     UE: Data,
     F: Func(V) -> U + Clone,
-    FE: Func(Vec<(K, U)>) -> Vec<(KE, UE)> + Clone,
-    FD: Func(Vec<(KE, UE)>) -> Vec<(K, U)> + Clone,
+    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
+    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = (K, V)>>,
@@ -385,8 +315,8 @@ where
     KE: Data,
     UE: Data,
     F: Func(V) -> U + Clone,
-    FE: Func(Vec<(K, U)>) -> Vec<(KE, UE)> + Clone,
-    FD: Func(Vec<(KE, UE)>) -> Vec<(K, U)> + Clone,
+    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
+    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     fn clone(&self) -> Self {
         MappedValuesRdd {
@@ -408,8 +338,8 @@ where
     KE: Data,
     UE: Data,
     F: Func(V) -> U + Clone,
-    FE: Func(Vec<(K, U)>) -> Vec<(KE, UE)> + Clone,
-    FD: Func(Vec<(KE, UE)>) -> Vec<(K, U)> + Clone,
+    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
+    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
@@ -438,8 +368,8 @@ where
     KE: Data,
     UE: Data,
     F: SerFunc(V) -> U,
-    FE: SerFunc(Vec<(K, U)>) -> Vec<(KE, UE)>,
-    FD: SerFunc(Vec<(KE, UE)>) -> Vec<(K, U)>,
+    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
+    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -472,7 +402,7 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -506,8 +436,8 @@ where
     KE: Data,
     UE: Data,
     F: SerFunc(V) -> U,
-    FE: SerFunc(Vec<(K, U)>) -> Vec<(KE, UE)>,
-    FD: SerFunc(Vec<(KE, UE)>) -> Vec<(K, U)>,
+    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
+    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     type Item = (K, U);
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -522,7 +452,7 @@ where
             self.prev.iterator(split)?.map(move |(k, v)| (k, f(v))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.prev.secure_compute(split, id, tx, is_shuffle)
     }
 }
@@ -535,20 +465,20 @@ where
     KE: Data,
     UE: Data,
     F: SerFunc(V) -> U,
-    FE: SerFunc(Vec<(K, U)>) -> Vec<(KE, UE)>,
-    FD: SerFunc(Vec<(KE, UE)>) -> Vec<(K, U)>,
+    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
+    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     type ItemE = (KE, UE);
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
 }
 
@@ -561,8 +491,8 @@ where
     KE: Data,
     UE: Data,
     F: Func(V) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<(K, U)>) -> Vec<(KE, UE)> + Clone,
-    FD: Func(Vec<(KE, UE)>) -> Vec<(K, U)> + Clone,
+    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
+    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = (K, V)>>,
@@ -581,8 +511,8 @@ where
     KE: Data,
     UE: Data,
     F: Func(V) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<(K, U)>) -> Vec<(KE, UE)> + Clone,
-    FD: Func(Vec<(KE, UE)>) -> Vec<(K, U)> + Clone,
+    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
+    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     fn clone(&self) -> Self {
         FlatMappedValuesRdd {
@@ -604,8 +534,8 @@ where
     KE: Data,
     UE: Data,
     F: Func(V) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<(K, U)>) -> Vec<(KE, UE)> + Clone,
-    FD: Func(Vec<(KE, UE)>) -> Vec<(K, U)> + Clone,
+    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
+    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
@@ -634,8 +564,8 @@ where
     KE: Data,
     UE: Data,
     F: SerFunc(V) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<(K, U)>) -> Vec<(KE, UE)>,
-    FD: SerFunc(Vec<(KE, UE)>) -> Vec<(K, U)>,
+    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
+    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     fn get_rdd_id(&self) -> usize {
         self.vals.id
@@ -667,7 +597,7 @@ where
         self.prev.number_of_splits()
     }
     
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
     }
 
@@ -701,8 +631,8 @@ where
     KE: Data,
     UE: Data,
     F: SerFunc(V) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<(K, U)>) -> Vec<(KE, UE)>,
-    FD: SerFunc(Vec<(KE, UE)>) -> Vec<(K, U)>,
+    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
+    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     type Item = (K, U);
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -719,7 +649,7 @@ where
                 .flat_map(move |(k, v)| f(v).map(move |x| (k.clone(), x))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: Sender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
         self.prev.secure_compute(split, id, tx, is_shuffle)
     }
 }
@@ -732,19 +662,19 @@ where
     KE: Data,
     UE: Data,
     F: SerFunc(V) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<(K, U)>) -> Vec<(KE, UE)>,
-    FD: SerFunc(Vec<(KE, UE)>) -> Vec<(K, U)>,
+    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
+    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     type ItemE = (KE, UE);
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Vec<Self::ItemE>>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Vec<Self::ItemE>)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
 }
