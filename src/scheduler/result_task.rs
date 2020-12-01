@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::env;
 use crate::rdd::RddE;
@@ -157,7 +158,10 @@ where
         log::debug!("resulttask runs");
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
-        SerBox::new((self.func)((
+
+        let now = Instant::now();
+
+        let res = SerBox::new((self.func)((
             context, 
             (
                 match self.rdd.iterator(split.clone()) {
@@ -169,7 +173,11 @@ where
                     Err(_) => Box::new(Vec::new().into_iter()),
                 }
             )
-        )))
-            as SerBox<dyn AnyData>
+        ))) as SerBox<dyn AnyData>;
+
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("result_task {:?}s", dur);
+
+        res
     }
 }

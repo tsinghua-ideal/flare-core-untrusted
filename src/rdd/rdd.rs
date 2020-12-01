@@ -30,6 +30,7 @@ use crate::{utils, Fn, SerArc, SerBox};
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
 use fasthash::MetroHasher;
+use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
 use serde_derive::{Deserialize, Serialize};
@@ -62,6 +63,9 @@ mod union_rdd;
 pub use union_rdd::*;
 
 pub const MAX_ENC_BL: usize = 1000;
+lazy_static! {
+    pub static ref EENTER_LOCK: Arc<std::sync::Mutex<bool>> = Arc::new(std::sync::Mutex::new(false));
+}
 
 extern "C" {
     fn secure_executing(
@@ -146,6 +150,7 @@ where
     }
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("copy out {:?}s", dur);
+    /*
     let now = Instant::now();
     let _v = bincode::serialize(&*v).unwrap();
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
@@ -154,6 +159,7 @@ where
     let _v = v.clone();
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("clone {:?}", dur);
+    */
     v
 }
 
@@ -447,7 +453,8 @@ pub trait RddE: Rdd {
                 for received in rx {
                     println!("in secure_iterator");
                     let mut result_bl = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 0, received as *mut u8);
-                    result.append(result_bl.borrow_mut())
+                    *EENTER_LOCK.lock().unwrap() = false;
+                    result.append(result_bl.borrow_mut());
                 }
                 result_ptr.join().unwrap();
                 Ok(Box::new(result.into_iter()))

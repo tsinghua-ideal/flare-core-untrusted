@@ -166,15 +166,7 @@ where
     FE: SerFunc(Vec<(T, V)>) -> (TE, VE),
     FD: SerFunc((TE, VE)) -> Vec<(T, V)>, 
 {
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        log::debug!("inside PartitionwiseSampledRdd cogroup_iterator_any",);
-        Ok(Box::new(self.iterator(split)?.map(|(k, v)| {
-            Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
-        })))
-    }
+
 }
 
 impl<T, TE, FE, FD> Rdd for PartitionwiseSampledRdd<T, TE, FE, FD> 

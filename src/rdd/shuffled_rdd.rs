@@ -206,16 +206,6 @@ where
                 .map(|(k, v)| Box::new((k, v)) as Box<dyn AnyData>),
         ))
     }
-
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        log::debug!("inside cogroup iterator_any shuffledrdd",);
-        Ok(Box::new(self.iterator(split)?.map(|(k, v)| {
-            Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
-        })))
-    }
 }
 
 impl<K, V, C, KE, CE, FE, FD> Rdd for ShuffledRdd<K, V, C, KE, CE, FE, FD> 

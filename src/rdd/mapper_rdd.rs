@@ -179,15 +179,7 @@ where
     FE: SerFunc(Vec<(V, U)>) -> (VE, UE),  //need check
     FD: SerFunc((VE, UE)) -> Vec<(V, U)>,  //need check
 {
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        log::debug!("inside iterator_any maprdd",);
-        Ok(Box::new(self.iterator(split)?.map(|(k, v)| {
-            Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
-        })))
-    }
+
 }
 
 impl<T: Data, U: Data, UE: Data, F, FE, FD> Rdd for MapperRdd<T, U, UE, F, FE, FD>

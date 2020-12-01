@@ -1,7 +1,7 @@
 use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
-use crate::rdd::{get_encrypted_data, RddBase};
+use crate::rdd::{get_encrypted_data, RddBase, EENTER_LOCK};
 use crate::serializable_traits::Data;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
@@ -195,12 +195,11 @@ where
             self.shuffle_id,
             partition
         );
-        let split = rdd_base.splits()[partition].clone();
-        log::debug!("split index: {}", split.get_index());
         log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
         if rdd_base.get_secure() {
+            let split = rdd_base.splits()[partition].clone();
+            log::debug!("split index: {}", split.get_index());
             let (tx, rx) = mpsc::sync_channel(0);
-
             let rdd_id = rdd_base.get_rdd_id();
             let handle = rdd_base.iterator_raw(split, tx, 1).unwrap();
             let now = Instant::now();
@@ -211,6 +210,7 @@ where
 
             for block_ptr in rx { 
                 let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_id, 1, block_ptr as *mut u8);
+                *EENTER_LOCK.lock().unwrap() = false;
                 for (i, bucket) in buckets_bl.into_iter().enumerate() {
                     buckets[i].push(bucket); 
                 }
@@ -225,6 +225,8 @@ where
             println!("in dependency, total {:?}", dur);
             env::Env::get().shuffle_manager.get_server_uri()    
         } else {
+            let split = rdd_base.splits()[partition].clone();
+            log::debug!("split index: {}", split.get_index());
             let iter = if self.is_cogroup {
                 rdd_base.cogroup_iterator_any(split)
             } else {

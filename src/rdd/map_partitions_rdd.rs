@@ -187,15 +187,7 @@ where
     FE: SerFunc(Vec<(V, U)>) -> (VE, UE),
     FD: SerFunc((VE, UE)) -> Vec<(V, U)>, 
 {
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        log::debug!("inside iterator_any map_partitions_rdd",);
-        Ok(Box::new(self.iterator(split)?.map(|(k, v)| {
-            Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
-        })))
-    }
+
 }
 
 impl<T, U, UE, F, FE, FD> Rdd for MapPartitionsRdd<T, U, UE, F, FE, FD>

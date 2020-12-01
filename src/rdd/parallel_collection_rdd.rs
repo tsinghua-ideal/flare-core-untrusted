@@ -8,7 +8,7 @@ use crate::context::Context;
 use crate::dependency::Dependency;
 use crate::env::Env;
 use crate::error::{Error, Result};
-use crate::rdd::{Rdd, RddBase, RddE, RddVals};
+use crate::rdd::{Rdd, RddBase, RddE, RddVals, EENTER_LOCK};
 use crate::serialization_free::Construct;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
@@ -86,9 +86,10 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         
         //sub-partition
+        let mut num_sub_part = 0;
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
-            let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
+            let block_len = (1 << (8+10)) / data_size;  //each block: 256KB
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -99,6 +100,9 @@ impl<T: Data> ParallelCollectionSplit<T> {
                 let block_ptr = Box::into_raw(block);
                 let mut result_bl_ptr: usize = 0;
                 let now = Instant::now();
+                while *EENTER_LOCK.lock().unwrap() {
+                    //wait
+                }
                 let sgx_status = unsafe {
                     secure_executing(
                         Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
@@ -110,6 +114,8 @@ impl<T: Data> ParallelCollectionSplit<T> {
                         &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                     )
                 };
+                *EENTER_LOCK.lock().unwrap() =  true;
+
                 let _block = unsafe{ Box::from_raw(block_ptr) };
                 let _r = match sgx_status {
                     sgx_status_t::SGX_SUCCESS => {},
@@ -118,9 +124,9 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     },
                 };
                 tx.send(result_bl_ptr).unwrap();
-               
+                num_sub_part += 1;
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                println!("in ParallelCollectionRdd, compute {:?}", dur);
+                println!("in ParallelCollectionRdd, num of sub_partition {:?}, compute {:?}", num_sub_part, dur);
                 cur = next;  
             }
         });
@@ -287,15 +293,7 @@ where
     FE: SerFunc(Vec<(K, V)>) -> (KE, VE),
     FD: SerFunc((KE, VE)) -> Vec<(K, V)>, 
 {
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        log::debug!("inside iterator_any parallel collection",);
-        Ok(Box::new(self.iterator(split)?.map(|(k, v)| {
-            Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
-        })))
-    }
+
 }
 
 impl<T, TE, FE, FD> RddBase for ParallelCollection<T, TE, FE, FD>

@@ -417,15 +417,6 @@ where
                 .map(|(k, v)| Box::new((k, v)) as Box<dyn AnyData>),
         ))
     }
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        log::debug!("inside cogroup_iterator_any mapvaluesrdd");
-        Ok(Box::new(self.iterator(split)?.map(|(k, v)| {
-            Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
-        })))
-    }
 }
 
 impl<K, V, U, KE, UE, F, FE, FD> Rdd for MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
@@ -611,15 +602,6 @@ where
             self.iterator(split)?
                 .map(|(k, v)| Box::new((k, v)) as Box<dyn AnyData>),
         ))
-    }
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        log::debug!("inside iterator_any flatmapvaluesrdd",);
-        Ok(Box::new(self.iterator(split)?.map(|(k, v)| {
-            Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
-        })))
     }
 }
 

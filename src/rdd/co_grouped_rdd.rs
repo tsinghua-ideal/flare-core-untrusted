@@ -274,7 +274,8 @@ where
         &self,
         split: Box<dyn Split>,
     ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        Ok(Box::new(self.iterator(split)?.map(|(k, v)| {
+        let res = self.iterator(split)?;
+        Ok(Box::new(res.map(|(k, v)| {
             Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
         })))
     }
