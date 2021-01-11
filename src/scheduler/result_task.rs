@@ -163,16 +163,22 @@ where
 
         let res = SerBox::new((self.func)((
             context, 
-            (
-                match self.rdd.iterator(split.clone()) {
-                    Ok(r) => r,
-                    Err(_) => Box::new(Vec::new().into_iter()),
-                }, 
-                match self.rdd.secure_iterator(split) {
-                    Ok(r) => r,
-                    Err(_) => Box::new(Vec::new().into_iter()),
-                }
-            )
+            match self.rdd.get_secure() {
+                true => (
+                    Box::new(Vec::new().into_iter()),                 
+                    match self.rdd.secure_iterator(split) {
+                        Ok(r) => r,
+                        Err(_) => Box::new(Vec::new().into_iter()),
+                    }
+                ),
+                false => (
+                    match self.rdd.iterator(split.clone()) {
+                        Ok(r) => r,
+                        Err(_) => Box::new(Vec::new().into_iter()),
+                    }, 
+                    Box::new(Vec::new().into_iter()), 
+                ),
+            }
         ))) as SerBox<dyn AnyData>;
 
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;

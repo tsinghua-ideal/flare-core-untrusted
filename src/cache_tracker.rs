@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::LinkedList;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::thread;
-use std::time;
+use std::time::Duration;
 
 use crate::cache::{BoundedMemoryCache, CachePutResponse, KeySpace};
 use crate::env;
@@ -65,11 +65,12 @@ pub(crate) enum CacheTrackerMessageReply {
 #[derive(Debug)]
 pub(crate) struct CacheTracker {
     is_master: bool,
-    locs: DashMap<usize, Vec<LinkedList<Ipv4Addr>>>,
+    locs: DashMap<usize, Vec<LinkedList<Ipv4Addr>>>,  //(rdd, partition) -> LinkedList
     slave_capacity: DashMap<Ipv4Addr, usize>,
     slave_usage: DashMap<Ipv4Addr, usize>,
     registered_rdd_ids: DashSet<usize>,
-    loading: DashSet<(usize, usize)>,
+    loading: DashSet<(usize, usize)>,   // (rdd, partition)
+    sloading: DashSet<(usize, usize, usize)>,  // (cached_rdd_id, part_id, sub_part_id)
     cache: KeySpace<'static>,
     master_addr: SocketAddr,
 }
@@ -88,6 +89,7 @@ impl CacheTracker {
             slave_usage: DashMap::new(),
             registered_rdd_ids: DashSet::new(),
             loading: DashSet::new(),
+            sloading: DashSet::new(),
             cache: the_cache.new_key_space(),
             master_addr: SocketAddr::new(master_addr.ip(), master_addr.port() + 1),
         });
@@ -324,7 +326,59 @@ impl CacheTracker {
         }
     }
 
-    fn get_or_compute<T: Data>(
+    pub fn get_sdata(&self, key: (usize, usize, usize)) -> Option<usize> {
+        let (rdd_id, part_id, sub_part_id) = key;
+        self.cache.sget(rdd_id, part_id, sub_part_id)
+    }
+
+    pub fn get_subpids(&self, rdd_id: usize, part_id: usize) -> HashSet<usize> {
+        self.cache.get_subpid(rdd_id, part_id).into_iter().collect()
+    }
+
+    pub fn get_cached_subpids(&self, rdd_id: usize, part_id: usize) -> HashSet<usize> {
+        let cached_sub_parts = self.cache.get_subpid(rdd_id, part_id);
+        cached_sub_parts.into_iter().filter(|id| {
+            while self.sloading.contains(&(rdd_id, part_id, *id)) {
+                let dur = Duration::from_millis(1);
+                thread::sleep(dur);
+            }
+            let cached = self.cache.scontain(rdd_id, part_id, *id);
+            cached
+        }).collect()
+    }
+
+    pub fn get_uncached_subpids(&self, rdd_id: usize, part_id: usize) -> HashSet<usize> {
+        let uncached_sub_parts = self.cache.get_subpid(rdd_id, part_id);
+        uncached_sub_parts.into_iter().filter(|id| {
+            while self.sloading.contains(&(rdd_id, part_id, *id)) {
+                let dur = Duration::from_millis(1);
+                thread::sleep(dur);
+            }
+            let not_cached = !self.cache.scontain(rdd_id, part_id, *id);
+            not_cached
+        }).collect()
+    }
+
+    pub fn put_sdata(
+        &self,
+        key: (usize, usize, usize),
+        value: *mut u8,
+    ) {
+        let (rdd_id, part_id, sub_part_id) = key;
+        let put_response = self.cache.sput(rdd_id, part_id, sub_part_id, value);
+        if let CachePutResponse::CachePutSuccess(size) = put_response {
+            futures::executor::block_on(self.client(CacheTrackerMessage::AddedToCache {
+                rdd_id: rdd_id,
+                partition: part_id,
+                host: env::Configuration::get().local_ip,
+                size,
+            }))
+            .unwrap();
+        }
+    }
+
+    //support local mode only
+    pub fn get_or_compute<T: Data>(
         &self,
         rdd: Arc<dyn Rdd<Item = T>>,
         split: Box<dyn Split>,
@@ -335,7 +389,7 @@ impl CacheTracker {
         } else {
             let key = (rdd.get_rdd_id(), split.get_index());
             while self.loading.contains(&key) {
-                let dur = time::Duration::from_millis(1);
+                let dur = Duration::from_millis(1);
                 thread::sleep(dur);
             }
             if let Some(cached_val) = self.cache.get(rdd.get_rdd_id(), split.get_index()) {

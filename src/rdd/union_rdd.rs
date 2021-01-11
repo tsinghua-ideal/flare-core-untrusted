@@ -1,5 +1,5 @@
 use std::net::Ipv4Addr;
-use std::sync::{Arc, mpsc::SyncSender};
+use std::sync::{Arc, mpsc::{sync_channel, SyncSender}};
 use std::thread::JoinHandle;
 
 use itertools::{Itertools, MinMaxResult};
@@ -7,6 +7,7 @@ use serde_derive::{Deserialize, Serialize};
 
 use crate::context::Context;
 use crate::dependency::{Dependency, NarrowDependencyTrait, OneToOneDependency, RangeDependency};
+use crate::env::{BOUNDED_MEM_CACHE, RDDB_MAP, Env};
 use crate::error::{Error, Result};
 use crate::partitioner::Partitioner;
 use crate::rdd::union_rdd::UnionVariants::{NonUniquePartitioner, PartitionerAware};
@@ -16,24 +17,32 @@ use crate::split::Split;
 use parking_lot::Mutex;
 
 #[derive(Clone, Serialize, Deserialize)]
-struct UnionSplit<T: 'static> {
+struct UnionSplit<T: 'static, TE: 'static> {
     /// index of the partition
     idx: usize,
     /// the parent RDD this partition refers to
-    rdd: SerArc<dyn Rdd<Item = T>>,
+    rdd: SerArc<dyn RddE<Item = T, ItemE = TE>>,
     /// index of the parent RDD this partition refers to
     parent_rdd_index: usize,
     /// index of the partition within the parent RDD this partition refers to
     parent_rdd_split_index: usize,
 }
 
-impl<T: Data> UnionSplit<T> {
+impl<T, TE> UnionSplit<T, TE> 
+where
+    T: Data,
+    TE: Data,
+{
     fn parent_partition(&self) -> Box<dyn Split> {
         self.rdd.splits()[self.parent_rdd_split_index].clone()
     }
 }
 
-impl<T: Data> Split for UnionSplit<T> {
+impl<T, TE> Split for UnionSplit<T, TE> 
+where 
+    T: Data,
+    TE: Data,
+{
     fn get_index(&self) -> usize {
         self.idx
     }
@@ -45,9 +54,9 @@ struct PartitionerAwareUnionSplit {
 }
 
 impl PartitionerAwareUnionSplit {
-    fn parents<'a, T: Data>(
+    fn parents<'a, T: Data, TE: Data>(
         &'a self,
-        rdds: &'a [SerArc<dyn Rdd<Item = T>>],
+        rdds: &'a [SerArc<dyn RddE<Item = T, ItemE = TE>>],
     ) -> impl Iterator<Item = Box<dyn Split>> + 'a {
         rdds.iter().map(move |rdd| rdd.splits()[self.idx].clone())
     }
@@ -60,21 +69,28 @@ impl Split for PartitionerAwareUnionSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct UnionRdd<T: 'static>(UnionVariants<T>);
+pub struct UnionRdd<T: 'static, TE: 'static>(UnionVariants<T, TE>);
 
-impl<T> UnionRdd<T>
+impl<T, TE> UnionRdd<T, TE>
 where
     T: Data,
+    TE: Data,
 {
-    pub(crate) fn new(rdds: &[Arc<dyn Rdd<Item = T>>]) -> Result<Self> {
+    pub(crate) fn new(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Result<Self> {
         Ok(UnionRdd(UnionVariants::new(rdds)?))
     }
 }
 
+impl<T: Data, TE: Data> Clone for UnionRdd<T, TE> {
+    fn clone(&self) -> Self {
+        UnionRdd(self.0.clone())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
-enum UnionVariants<T: 'static> {
+enum UnionVariants<T: 'static, TE: 'static> {
     NonUniquePartitioner {
-        rdds: Vec<SerArc<dyn Rdd<Item = T>>>,
+        rdds: Vec<SerArc<dyn RddE<Item = T, ItemE = TE>>>,
         vals: Arc<RddVals>,
         ecall_ids: Arc<Mutex<Vec<usize>>>,
     },
@@ -82,7 +98,7 @@ enum UnionVariants<T: 'static> {
     /// unify them into a single RDD while preserving the partitioner. So m RDDs with p partitions each
     /// will be unified to a single RDD with p partitions and the same partitioner.
     PartitionerAware {
-        rdds: Vec<SerArc<dyn Rdd<Item = T>>>,
+        rdds: Vec<SerArc<dyn RddE<Item = T, ItemE = TE>>>,
         vals: Arc<RddVals>,
         ecall_ids: Arc<Mutex<Vec<usize>>>,
         #[serde(with = "serde_traitobject")]
@@ -90,7 +106,7 @@ enum UnionVariants<T: 'static> {
     },
 }
 
-impl<T: Data> Clone for UnionVariants<T> {
+impl<T: Data, TE: Data> Clone for UnionVariants<T, TE> {
     fn clone(&self) -> Self {
         match self {
             NonUniquePartitioner { rdds, vals, ecall_ids, .. } => NonUniquePartitioner {
@@ -110,8 +126,8 @@ impl<T: Data> Clone for UnionVariants<T> {
     }
 }
 
-impl<T: Data> UnionVariants<T> {
-    fn new(rdds: &[Arc<dyn Rdd<Item = T>>]) -> Result<Self> {
+impl<T: Data, TE: Data> UnionVariants<T, TE> {
+    fn new(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Result<Self> {
         let context = rdds[0].get_context();
         let secure = rdds[0].get_secure();  //temp
         let mut vals = RddVals::new(context, secure);
@@ -163,7 +179,7 @@ impl<T: Data> UnionVariants<T> {
         }
     }
 
-    fn has_unique_partitioner(rdds: &[Arc<dyn Rdd<Item = T>>]) -> bool {
+    fn has_unique_partitioner(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> bool {
         rdds.iter()
             .map(|p| p.partitioner())
             .try_fold(None, |prev: Option<Box<dyn Partitioner>>, p| {
@@ -196,9 +212,48 @@ impl<T: Data> UnionVariants<T> {
             .get_preferred_locs(rdd, split.get_index())
             .into_iter()
     }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<T>)->TE> {
+        match self {
+            NonUniquePartitioner { rdds, .. } => rdds[0].get_fe(),
+            PartitionerAware { rdds, .. } => rdds[0].get_fe(),
+        }
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(TE)->Vec<T>> {
+        match self {
+            NonUniquePartitioner { rdds, .. } => rdds[0].get_fd(),
+            PartitionerAware { rdds, .. } => rdds[0].get_fd(),
+        }
+    }
+
 }
 
-impl<T: Data> RddBase for UnionRdd<T> {
+impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
+    fn cache(&self) {
+        match &self.0 {
+            NonUniquePartitioner { vals, .. } => vals.cache(),
+            PartitionerAware { vals, .. } => vals.cache(),
+        }
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+
+    fn should_cache(&self) -> bool {
+        match &self.0 {
+            NonUniquePartitioner { vals, .. } => vals.should_cache(),
+            PartitionerAware { vals, .. } => vals.should_cache(),
+        }
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<TE>)
+        };
+    }
+
     fn get_rdd_id(&self) -> usize {
         match &self.0 {
             NonUniquePartitioner { vals, .. } => vals.id,
@@ -249,6 +304,13 @@ impl<T: Data> RddBase for UnionRdd<T> {
                     ecall_ids.lock().push(vals.id);
                 }
         }
+    }
+
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<TE>(self.get_rdd_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn preferred_locations(&self, split: Box<dyn Split>) -> Vec<Ipv4Addr> {
@@ -326,8 +388,8 @@ impl<T: Data> RddBase for UnionRdd<T> {
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
     }
 
     fn iterator_any(
@@ -349,7 +411,7 @@ impl<T: Data> RddBase for UnionRdd<T> {
     }
 }
 
-impl<T: Data> Rdd for UnionRdd<T> {
+impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
     type Item = T;
 
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -364,7 +426,7 @@ impl<T: Data> Rdd for UnionRdd<T> {
         match &self.0 {
             NonUniquePartitioner { rdds, .. } => {
                 let part = &*split
-                    .downcast::<UnionSplit<T>>()
+                    .downcast::<UnionSplit<T, TE>>()
                     .or(Err(Error::DowncastFailure("UnionSplit")))?;
                 let parent = &rdds[part.parent_rdd_index];
                 parent.iterator(part.parent_partition())
@@ -383,9 +445,137 @@ impl<T: Data> Rdd for UnionRdd<T> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        //TODO
-        Err(Error::UnsupportedOperation("Unsupported secure_compute"))
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        let part_id = split.get_index();
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        match &self.0 {
+            NonUniquePartitioner { rdds, .. } => {
+                let (tx_un, rx_un) = sync_channel(0);
+                let tx = tx.clone();
+                let part = &*split
+                    .downcast::<UnionSplit<T, TE>>()
+                    .or(Err(Error::DowncastFailure("UnionSplit")))?;
+                let parent = &rdds[part.parent_rdd_index];
+                let rdd_id = parent.get_rdd_id();
+                let mut acc_arg_un = AccArg::new(rdd_id, 0, 0, 0);
+                let handle_uns = parent.secure_compute(part.parent_partition(), &mut acc_arg_un, tx_un.clone())?; 
+                
+                let acc_arg = acc_arg.clone();
+                let handle = std::thread::spawn(move || {
+                    let tid: u64 = thread::current().id().as_u64().into();
+                    let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+                    
+                    let mut sub_part_id = 0;
+                    let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
+                        0,   //indicate it cannot find the cached data
+                        part_id, 
+                        acc_arg.steps_to_caching,
+                        acc_arg.steps_to_cached,
+                    );
+                    for received in rx_un {
+                        if !acc_arg.cached(&sub_part_id) {
+                            cache_meta.set_sub_part_id(sub_part_id);
+                            BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
+                            let mut result_bl_ptr: usize = 0; 
+                            let _sgx_status = unsafe {
+                                secure_executing(
+                                    eid,
+                                    &mut result_bl_ptr,
+                                    tid,
+                                    acc_arg.rdd_id, 
+                                    cache_meta,
+                                    acc_arg.is_shuffle, 
+                                    received as *mut u8, 
+                                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                                )
+                            };
+                            tx.send(result_bl_ptr).unwrap();
+                        }
+                        sub_part_id += 1;
+                    }
+                    for handle_un in handle_uns {
+                        handle_un.join().unwrap();
+                    }
+                });
+                Ok(vec![handle])
+            },
+            PartitionerAware { rdds, .. } => {
+                let (tx_un, rx_un) = sync_channel(0);
+                let split = split
+                    .downcast::<PartitionerAwareUnionSplit>()
+                    .or(Err(Error::DowncastFailure("PartitionerAwareUnionSplit")))?;
+                let iter = rdds
+                    .iter()
+                    .zip(split.parents(&rdds))
+                    .collect::<Vec<_>>();
+
+                let mut handle_uns = Vec::new(); 
+                for (rdd, p) in iter {
+                    let rdd_id = rdd.get_rdd_id();
+                    let mut acc_arg_un = AccArg::new(rdd_id, 0, 0, 0);
+                    handle_uns.append(&mut rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un.clone())?);
+                }
+
+                let acc_arg = acc_arg.clone();
+                let handle = std::thread::spawn(move || { 
+                    let tid: u64 = thread::current().id().as_u64().into();
+                    let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+                    let mut sub_part_id = 0;
+                    let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
+                        0,   //indicate it cannot find the cached data
+                        part_id, 
+                        acc_arg.steps_to_caching,
+                        acc_arg.steps_to_cached,
+                    );
+                    for received in rx_un {
+                        if !acc_arg.cached(&sub_part_id) {
+                            cache_meta.set_sub_part_id(sub_part_id);
+                            BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
+                            let mut result_bl_ptr: usize = 0; 
+                            let _sgx_status = unsafe {
+                                secure_executing(
+                                    eid,
+                                    &mut result_bl_ptr,
+                                    tid,
+                                    acc_arg.rdd_id, 
+                                    cache_meta,
+                                    acc_arg.is_shuffle, 
+                                    received as *mut u8, 
+                                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                                )
+                            };
+                            tx.send(result_bl_ptr).unwrap();
+                        }
+                        sub_part_id += 1;
+                    }
+
+                    for handle_un in handle_uns {
+                        handle_un.join().unwrap();
+                    }
+                });
+                Ok(vec![handle])
+            }
+        }
     }
 
+}
+
+impl<T, TE> RddE for UnionRdd<T, TE>
+where
+    T: Data,
+    TE: Data,
+{
+    type ItemE = TE;
+    
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(UnionRdd(self.0.clone())) as Arc<dyn RddE<Item = T, ItemE = TE>>
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        self.0.get_fe()
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        self.0.get_fd()
+    }
 }

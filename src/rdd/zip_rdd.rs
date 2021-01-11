@@ -5,8 +5,9 @@ use std::thread::JoinHandle;
 
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
+use crate::env::{RDDB_MAP, Env};
 use crate::error::{Error, Result};
-use crate::rdd::{Rdd, RddBase, RddVals};
+use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data};
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
@@ -54,6 +55,22 @@ impl<F: Data, S: Data> Clone for ZippedPartitionsRdd<F, S> {
 }
 
 impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
+    fn cache(&self) {
+        self.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+    
+    fn should_cache(&self) -> bool {
+        self.vals.should_cache()
+    }
+    
+    fn free_data_enc(&self, ptr: *mut u8) {
+        todo!()
+    }
+
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
@@ -78,6 +95,10 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
         if self.vals.secure {
             self.ecall_ids.lock().push(self.vals.id);
         }
+    }
+
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        todo!()
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -105,8 +126,8 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
         self.splits().len()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
     }
 
     fn iterator_any(
@@ -137,7 +158,7 @@ impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
         Arc::new(self.clone()) as Arc<dyn RddBase>
     }
-
+    
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         let current_split = split
             .downcast::<ZippedPartitionsSplit>()
@@ -148,7 +169,7 @@ impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
         Ok(Box::new(fst_iter.zip(sec_iter)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         //TODO
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }

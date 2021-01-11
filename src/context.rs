@@ -395,7 +395,8 @@ impl Context {
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
         if let Some(enclave) = std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None) {
             enclave.destroy();
-        } 
+        }
+        env::BOUNDED_MEM_CACHE.free_data_enc();
         utils::clean_up_work_dir(&work_dir);
         match run_result {
             Err(err) => {
@@ -417,6 +418,7 @@ impl Context {
         if let Some(enclave) = std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None) {
             enclave.destroy();
         }
+        env::BOUNDED_MEM_CACHE.free_data_enc();
         utils::clean_up_work_dir(work_dir);
     }
 
@@ -627,7 +629,7 @@ impl Context {
         }
     }
 
-    pub fn union<T: Data>(rdds: &[Arc<dyn Rdd<Item = T>>]) -> Result<impl Rdd<Item = T>> {
+    pub fn union<T: Data, TE: Data>(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Result<impl RddE<Item = T, ItemE = TE>> {
         UnionRdd::new(rdds)
     }
 }

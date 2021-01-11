@@ -1,21 +1,27 @@
+use std::any::TypeId;
 use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fs;
 use std::hash::Hash;
 use std::io::{BufWriter, Write};
+use std::mem::forget;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::{Arc, mpsc::{sync_channel, SyncSender, Receiver}, Weak};
+use std::slice;
+use std::sync::{Arc, Weak,
+    atomic::{self, AtomicBool},
+    mpsc::{sync_channel, SyncSender, Receiver} 
+    };
 use std::thread::{JoinHandle, self};
 use std::time::{Duration, Instant};
 
 
 use crate::context::Context;
 use crate::dependency::Dependency;
-use crate::env::Env;
+use crate::env::{RDDB_MAP, Env};
 use crate::error::{Error, Result};
 use crate::partial::{BoundedDouble, CountEvaluator, GroupedCountEvaluator, PartialResult};
 use crate::partitioner::{HashPartitioner, Partitioner};
@@ -63,38 +69,90 @@ mod union_rdd;
 pub use union_rdd::*;
 
 pub const MAX_ENC_BL: usize = 1000;
+static immediate_cout: bool = true;
 lazy_static! {
     pub static ref EENTER_LOCK: Arc<std::sync::Mutex<bool>> = Arc::new(std::sync::Mutex::new(false));
 }
 
 extern "C" {
-    fn secure_executing(
+    pub fn secure_executing(
         eid: sgx_enclave_id_t,
         retval: *mut usize,
-        id: usize,
         tid: u64,
+        rdd_id: usize,
+        cache_meta: CacheMeta,
         is_shuffle: u8,
         input: *mut u8,
         captured_vars: *const u8,
     ) -> sgx_status_t;
-    fn get_sketch(
+    pub fn free_res_enc(
         eid: sgx_enclave_id_t,
-        id: usize,
+        op_id: usize,
+        is_shuffle: u8,
+        input: *mut u8,  
+    ) -> sgx_status_t;
+    pub fn priv_free_res_enc(
+        eid: sgx_enclave_id_t,
+        op_id: usize,
+        is_shuffle: u8,
+        input: *mut u8,  
+    ) -> sgx_status_t;
+    pub fn get_sketch(
+        eid: sgx_enclave_id_t,
+        rdd_id: usize,
         is_shuffle: u8,
         p_buf: *mut u8,
         p_data_enc: *mut u8,
     ) -> sgx_status_t;
-    fn clone_out(
+    pub fn clone_out(
         eid: sgx_enclave_id_t,
-        id: usize,
+        rdd_id: usize,
         is_shuffle: u8,
         p_out: usize,
         p_data_enc: *mut u8,
     ) -> sgx_status_t;
+    pub fn probe_caching(
+        eid: sgx_enclave_id_t,
+        ret_val: *mut usize,
+        rdd_id: usize,
+        part: usize,
+    ) -> sgx_status_t;
+    pub fn finish_probe_caching(
+        eid: sgx_enclave_id_t,
+        cached_sub_parts: *mut u8,
+    ) -> sgx_status_t;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sbrk_o(increment: usize) -> *mut c_void {
+    libc::sbrk(increment as intptr_t)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ocall_cache_to_outside(rdd_id: usize,
+    part_id: usize,
+    sub_part_id: usize,
+    data_ptr: usize,
+) -> u8 {
+    //need to clone from memory alloced by ucmalloc to memory alloced by default allocator
+    Env::get().cache_tracker.put_sdata((rdd_id, part_id, sub_part_id), data_ptr as *mut u8);
+    0  //need to revise
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ocall_cache_from_outside(rdd_id: usize,
+    part_id: usize,
+    sub_part_id: usize,
+) -> usize {
+    let res = Env::get().cache_tracker.get_sdata((rdd_id, part_id, sub_part_id));
+    match res {
+        Some(val) => val,
+        None => 0,
+    }
 }
 
 
-pub fn get_encrypted_data<T>(id: usize, is_shuffle: u8, p_data_enc: *mut u8) -> Box<Vec<T>> 
+pub fn get_encrypted_data<T>(rdd_id: usize, is_shuffle: u8, p_data_enc: *mut u8) -> Box<Vec<T>> 
 where
     T:  std::fmt::Debug 
         + Clone 
@@ -104,63 +162,108 @@ where
         + 'static
 {
     let tid: u64 = thread::current().id().as_u64().into();
-    let now = Instant::now();
-    let size_buf_len = 1 << (7 + 10 + 10); //128M * 8B
-    let size_buf = SizeBuf::new(size_buf_len);
-    let size_buf_ptr = Box::into_raw(Box::new(size_buf));
-    let sgx_status = unsafe {
-        get_sketch(
-            Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-            id,
-            is_shuffle,
-            size_buf_ptr as *mut u8,
-            p_data_enc,   //shuffle write
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    if immediate_cout {
+        let op_id = RDDB_MAP.map_id(rdd_id);
+        let res_ = unsafe{ Box::from_raw(p_data_enc as *mut Vec<T>) };
+        let res = res_.clone();
+        forget(res_);
+        let sgx_status = unsafe { 
+            free_res_enc(
+                eid,
+                op_id,
+                is_shuffle,
+                p_data_enc,
+            )
+        };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            }
+        }
+        res
+    } else { 
+        let now = Instant::now();
+        let size_buf_len = 1 << (7 + 10 + 10); //128M * 8B
+        let size_buf = SizeBuf::new(size_buf_len);
+        let size_buf_ptr = Box::into_raw(Box::new(size_buf));
+        let sgx_status = unsafe {
+            get_sketch(
+                eid,
+                rdd_id,
+                is_shuffle,
+                size_buf_ptr as *mut u8,
+                p_data_enc,   //shuffle write
+            )
+        };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => (),
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            },
+        };
+
+        let size_buf = unsafe{ Box::from_raw(size_buf_ptr) };
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("get sketch {:?}s", dur);
+        let now = Instant::now();
+        let mut v: Vec<T> = Vec::new();
+        let mut idx = Idx::new();
+        v.recv(&size_buf, &mut idx);
+        let ptr_out = Box::into_raw(Box::new(v)) as *mut u8 as usize; 
+        let sgx_status = unsafe {
+            clone_out(
+                eid,
+                rdd_id,
+                is_shuffle,
+                ptr_out,
+                p_data_enc,
+            )
+        };
+        let v = unsafe { Box::from_raw(ptr_out as *mut u8 as *mut Vec<T>) };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            }
+        }
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("copy out {:?}s", dur);
+        /*
+        let now = Instant::now();
+        let _v = bincode::serialize(&*v).unwrap();
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("serialize {:?}", dur);
+        let now = Instant::now();
+        let _v = v.clone();
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("clone {:?}", dur);
+        */
+        v
+    }
+}
+
+pub fn move_data<T: Clone>(op_id: usize, data: *mut u8) -> Box<Vec<T>> {
+    let res_ = unsafe{ Box::from_raw(data as *mut Vec<T>) };
+    let res = res_.clone();
+    forget(res_);
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let sgx_status = unsafe { 
+        priv_free_res_enc(
+            eid,
+            op_id,
+            0, //default to 0, for cache should not appear at the end of stage
+            data
         )
     };
     match sgx_status {
-        sgx_status_t::SGX_SUCCESS => (),
-        _ => {
-            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
-    };
-
-    let size_buf = unsafe{ Box::from_raw(size_buf_ptr) };
-    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-    println!("get sketch {:?}s", dur);
-    let now = Instant::now();
-    let mut v: Vec<T> = Vec::new();
-    let mut idx = Idx::new();
-    v.recv(&size_buf, &mut idx);
-    let ptr_out = Box::into_raw(Box::new(v)) as *mut u8 as usize; 
-    let result = unsafe {
-        clone_out(
-            Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-            id,
-            is_shuffle,
-            ptr_out,
-            p_data_enc,
-        )
-    };
-    let v = unsafe { Box::from_raw(ptr_out as *mut u8 as *mut Vec<T>) };
-    match result {
         sgx_status_t::SGX_SUCCESS => {},
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         }
     }
-    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-    println!("copy out {:?}s", dur);
-    /*
-    let now = Instant::now();
-    let _v = bincode::serialize(&*v).unwrap();
-    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-    println!("serialize {:?}", dur);
-    let now = Instant::now();
-    let _v = v.clone();
-    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-    println!("clone {:?}", dur);
-    */
-    v
+    res
 }
 
 #[inline(always)]
@@ -183,7 +286,7 @@ pub fn ser_encrypt<T>(pt: Vec<T>) -> Vec<u8>
 where
     T: serde::ser::Serialize + serde::de::DeserializeOwned + 'static
 {
-    match type_eq::<T, u8>() {
+    match TypeId::of::<u8>() == TypeId::of::<T>() {
         true => {
             let (ptr, len, cap) = pt.into_raw_parts();
             let rebuilt = unsafe {
@@ -212,7 +315,7 @@ where
     if ct.len() == 0 {
         return Vec::new();
     }
-    match type_eq::<T, u8>() {
+    match TypeId::of::<u8>() == TypeId::of::<T>() {
         true => {
             let pt = decrypt(&ct);
             let (ptr, len, cap) = pt.into_raw_parts();
@@ -226,8 +329,219 @@ where
     }
 }
 
-pub fn type_eq<T1: 'static, T2: 'static>() -> bool{
-    std::any::TypeId::of::<T1>() == std::any::TypeId::of::<T2>()
+//Return the cached or caching sub-partition number
+pub fn cached_or_caching_in_enclave(rdd_id: usize, part: usize) -> HashSet<usize> {
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let mut ret_val = 0;
+    let sgx_status = unsafe {
+        probe_caching(
+            eid,
+            &mut ret_val,
+            rdd_id,
+            part,
+        )
+    };
+    match sgx_status {
+        sgx_status_t::SGX_SUCCESS => (),
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+    let cached_sub_parts_ = unsafe {
+        Box::from_raw(ret_val as *mut u8 as *mut Vec<usize>)
+    };
+    let cached_sub_parts = cached_sub_parts_.clone();
+    forget(cached_sub_parts_);
+    let sgx_status = unsafe {
+        finish_probe_caching(
+            eid,
+            ret_val as *mut u8,
+        )
+    };
+    match sgx_status {
+        sgx_status_t::SGX_SUCCESS => (),
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+    cached_sub_parts.into_iter().collect::<HashSet<_>>()
+}
+
+pub fn secure_compute_cached(
+    acc_arg: &mut AccArg,
+    cur_rdd_id: usize, 
+    part_id: usize, 
+    tx: SyncSender<usize>,
+    captured_vars: HashMap<usize, Vec<u8>>,
+) -> Vec<JoinHandle<()>> {
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    //check whether it is cached inside enclave
+    let mut cached_sub_parts = cached_or_caching_in_enclave(cur_rdd_id, part_id);
+    //check whether it is cached outside enclave
+    let mut uncached_sub_parts = Env::get().cache_tracker.get_uncached_subpids(cur_rdd_id, part_id);
+    uncached_sub_parts = uncached_sub_parts.difference(&cached_sub_parts)
+        .map(|x| *x)
+        .collect::<HashSet<_>>();
+    cached_sub_parts = cached_sub_parts.union(&Env::get().cache_tracker.get_cached_subpids(cur_rdd_id, part_id))
+        .map(|x| *x)
+        .collect::<HashSet<_>>();
+    println!("get_subpids {:?}, {:?}", cur_rdd_id, part_id);
+    let subpids = Env::get().cache_tracker.get_subpids(cur_rdd_id, part_id);
+    println!("subpids = {:?}, cached = {:?}, uncached = {:?}", subpids, cached_sub_parts, uncached_sub_parts);
+    assert_eq!(uncached_sub_parts.len() + cached_sub_parts.len(), subpids.len());
+
+    acc_arg.cached_sub_parts = cached_sub_parts.clone();
+    acc_arg.sub_parts_len = subpids.len();
+    let mut handles = Vec::new();
+    if cached_sub_parts.len() > 0 {
+        acc_arg.step_cached(true);
+        // Compute based on cached values
+        let rdd_id = acc_arg.rdd_id;
+        let caching_rdd_id = acc_arg.caching_rdd_id;
+        let steps_to_caching = acc_arg.steps_to_caching;
+        let steps_to_cached = acc_arg.steps_to_cached;
+        let mut cache_meta = CacheMeta::new(caching_rdd_id, cur_rdd_id, part_id, steps_to_caching, steps_to_cached);
+        let is_shuffle = acc_arg.is_shuffle;
+
+        let handle = std::thread::spawn(move || {
+            let tid: u64 = thread::current().id().as_u64().into();
+            for sub_part in cached_sub_parts {
+                cache_meta.set_sub_part_id(sub_part);
+                let data_ptr: usize = 0;  //invalid pointer
+                let mut result_ptr: usize = 0;
+                while *EENTER_LOCK.lock().unwrap() {
+                    //wait
+                }
+                let sgx_status = unsafe {
+                    secure_executing(
+                        eid,
+                        &mut result_ptr,
+                        tid,
+                        rdd_id, 
+                        cache_meta,
+                        is_shuffle,   
+                        data_ptr as *mut u8 ,
+                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                    )
+                };
+                *EENTER_LOCK.lock().unwrap() =  true;
+                match sgx_status {
+                    sgx_status_t::SGX_SUCCESS => {},
+                    _ => {
+                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                    },
+                };
+                tx.send(result_ptr).unwrap();
+            }
+        });
+        handles.push(handle);
+    } else {
+        acc_arg.step_cached(false);
+        acc_arg.set_caching_rdd_id(cur_rdd_id);
+    }
+    handles
+}
+
+
+#[derive(Clone)]
+pub struct AccArg {
+    pub rdd_id: usize,
+    pub is_shuffle: u8,
+    pub caching_rdd_id: usize,
+    pub steps_to_caching: usize,
+    pub steps_to_cached: usize,
+    pub step_caching_end: bool,
+    pub step_cached_end: bool,
+    pub cached_sub_parts: HashSet<usize>,
+    pub sub_parts_len: usize,
+}
+
+impl AccArg {
+    pub fn new(rdd_id: usize, is_shuffle: u8, steps_to_caching: usize, steps_to_cached: usize) -> Self {
+        AccArg {
+            rdd_id,
+            is_shuffle,
+            caching_rdd_id: 0,
+            steps_to_caching,
+            steps_to_cached,
+            step_caching_end: false,
+            step_cached_end: false,
+            cached_sub_parts: HashSet::new(),
+            sub_parts_len: 0,
+        }
+    }
+
+    //set the to_be_cached rdd and return whether the set is successfully
+    pub fn set_caching_rdd_id(&mut self, caching_rdd_id: usize) -> bool {
+        match self.caching_rdd_id == 0 {
+            true => {
+                self.caching_rdd_id = caching_rdd_id;
+                return true;
+            },
+            false => return false,
+        }
+    }
+
+    fn step_caching(&mut self, should_cache: bool) {
+        let b = should_cache || self.step_caching_end;
+        match b {
+            true => self.step_caching_end = true,
+            false => self.steps_to_caching += 1,
+        }
+        println!("step_caching step = {:?}, end = {:?}", self.steps_to_caching, self.step_caching_end);
+    }
+
+    fn step_cached(&mut self, have_cache: bool) {
+        let b = have_cache || self.step_cached_end;
+        match b {
+            true => self.step_cached_end = true,
+            false => self.steps_to_cached += 1,
+        }
+        println!("step_cachd step = {:?}, end = {:?}", self.steps_to_cached, self.step_cached_end);
+    }
+
+    pub fn totally_cached(&self) -> bool {
+        let not_totally_cached = self.cached_sub_parts.len() < self.sub_parts_len ||
+            self.sub_parts_len == 0;
+        !not_totally_cached
+    }
+
+    pub fn cached(&self, subpid: &usize) -> bool {
+        self.cached_sub_parts.contains(subpid)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CacheMeta {
+    caching_rdd_id: usize,
+    cached_rdd_id: usize,
+    part_id: usize,
+    sub_part_id: usize, 
+    steps_to_caching: usize, 
+    steps_to_cached: usize,
+}
+
+impl CacheMeta {
+    pub fn new(caching_rdd_id: usize,
+        cached_rdd_id: usize,
+        part_id: usize,
+        steps_to_caching: usize,
+        steps_to_cached: usize,
+    ) -> Self {
+        CacheMeta {
+            caching_rdd_id,
+            cached_rdd_id,
+            part_id,
+            sub_part_id: 0, 
+            steps_to_caching,
+            steps_to_cached,
+        }
+    }
+
+    pub fn set_sub_part_id(&mut self, sub_part_id: usize) {
+        self.sub_part_id = sub_part_id;
+    }
 }
 
 // Values which are needed for all RDDs
@@ -235,7 +549,7 @@ pub fn type_eq<T1: 'static, T2: 'static>() -> bool{
 pub(crate) struct RddVals {
     pub id: usize,
     pub dependencies: Vec<Dependency>,
-    should_cache: bool,
+    should_cache_: AtomicBool,
     secure: bool,
     #[serde(skip_serializing, skip_deserializing)]
     pub context: Weak<Context>,
@@ -246,15 +560,18 @@ impl RddVals {
         RddVals {
             id: sc.new_rdd_id(),
             dependencies: Vec::new(),
-            should_cache: false,
+            should_cache_: AtomicBool::new(false),
             secure,
             context: Arc::downgrade(&sc),
         }
     }
 
-    fn cache(mut self) -> Self {
-        self.should_cache = true;
-        self
+    fn cache(&self) {
+        self.should_cache_.store(true, atomic::Ordering::Relaxed);
+    }
+
+    fn should_cache(&self) -> bool {
+        self.should_cache_.load(atomic::Ordering::Relaxed)
     }
 }
 
@@ -263,6 +580,9 @@ impl RddVals {
 // Refactored RDD trait into two traits one having RddBase trait which contains only non generic methods which provide information for dependency lists
 // Another separate Rdd containing generic methods like map, etc.,
 pub trait RddBase: Send + Sync + Serialize + Deserialize {
+    fn cache(&self); //cache once temporarily
+    fn should_cache(&self) -> bool;
+    fn free_data_enc(&self, ptr: *mut u8);
     fn get_rdd_id(&self) -> usize;
     fn get_context(&self) -> Arc<Context>;
     fn get_op_name(&self) -> String {
@@ -275,6 +595,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn get_secure(&self) -> bool;
     fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>>;
     fn insert_ecall_id(&self);
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize);
     fn preferred_locations(&self, _split: Box<dyn Split>) -> Vec<Ipv4Addr> {
         Vec::new()
     }
@@ -285,7 +606,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>>;
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -323,6 +644,15 @@ impl Ord for dyn RddBase {
 }
 
 impl<I: RddE + ?Sized> RddBase for SerArc<I> {
+    fn cache(&self) {
+        (**self).get_rdd_base().cache();
+    }
+    fn should_cache(&self) -> bool {
+        (**self).get_rdd_base().should_cache()
+    }
+    fn free_data_enc(&self, ptr: *mut u8) {
+        (**self).free_data_enc(ptr);
+    }
     fn get_rdd_id(&self) -> usize {
         (**self).get_rdd_base().get_rdd_id()
     }
@@ -338,14 +668,17 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
         (**self).get_rdd_base().get_ecall_ids()
     }
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        (**self).move_allocation(value_ptr)
+    }
     fn insert_ecall_id(&self) {
         (**self).get_rdd_base().insert_ecall_id();
     }
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        (**self).get_rdd_base().iterator_raw(split, tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        (**self).get_rdd_base().iterator_raw(split, acc_arg, tx)
     }    
     fn iterator_any(
         &self,
@@ -363,12 +696,14 @@ impl<I: RddE + ?Sized> Rdd for SerArc<I> {
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
         (**self).get_rdd_base()
     }
+    fn get_or_compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+        (**self).get_or_compute(split)
+    }
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        (**self).secure_compute(split, id, tx, is_shuffle)
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        (**self).secure_compute(split, acc_arg, tx)
     }
 
 }
@@ -399,13 +734,22 @@ pub trait Rdd: RddBase + 'static {
 
     fn get_rdd_base(&self) -> Arc<dyn RddBase>;
 
+    fn get_or_compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+        let cache_tracker = Env::get().cache_tracker.clone();
+        Ok(cache_tracker.get_or_compute(self.get_rdd(), split))
+    }
+
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>>;
 
     fn iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
-        self.compute(split)
+        if self.should_cache() {
+            self.get_or_compute(split)
+        } else {
+            self.compute(split)
+        }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>>;
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>>;
 }
 
 pub trait RddE: Rdd {
@@ -445,22 +789,20 @@ pub trait RddE: Rdd {
 
     fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let (tx, rx) = sync_channel(0);
-        let result_ = self.secure_compute(split, self.get_rdd_id(), tx, 0);
+        let mut acc_arg = AccArg::new(self.get_rdd_id(), 0, 0, 0);
+        let handles = self.secure_compute(split, &mut acc_arg, tx)?;
 
-        match result_ {
-            Ok(result_ptr) => {
-                let mut result = Vec::new();
-                for received in rx {
-                    println!("in secure_iterator");
-                    let mut result_bl = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 0, received as *mut u8);
-                    *EENTER_LOCK.lock().unwrap() = false;
-                    result.append(result_bl.borrow_mut());
-                }
-                result_ptr.join().unwrap();
-                Ok(Box::new(result.into_iter()))
-            },
-            Err(e) => return Err(e),
+        let mut result = Vec::new();
+        for received in rx {
+            println!("in secure_iterator");
+            let mut result_bl = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 0, received as *mut u8);
+            *EENTER_LOCK.lock().unwrap() = false;
+            result.append(result_bl.borrow_mut());
         }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        Ok(Box::new(result.into_iter()))
     }
 
     /// Return a new RDD containing only the elements that satisfy a predicate.
@@ -607,14 +949,16 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_executing(
-                Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
+                eid,
                 &mut result_ptr,
-                self.get_rdd_id(),  //shuffle rdd id
                 tid,
-                3,   //3 is for reduce
+                self.get_rdd_id(),  //shuffle rdd id
+                CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
+                3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )
@@ -668,6 +1012,48 @@ pub trait RddE: Rdd {
         Ok(results?.into_iter().fold(init, f))
     }
 
+    fn secure_fold<F>(&self, init: Self::Item, f: F) -> Result<Self::ItemE> 
+    where
+        Self: Sized,
+        F: SerFunc(Self::Item, Self::Item) -> Self::Item,
+    {
+        let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
+        let data = self.get_context().run_job(self.get_rdde(), cl)?
+            .into_iter().flatten().collect::<Vec<Self::ItemE>>();
+       
+        let data_ptr = Box::into_raw(Box::new(data));
+        let now = Instant::now();
+        let tid: u64 = thread::current().id().as_u64().into();
+        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let mut result_ptr: usize = 0;
+        let sgx_status = unsafe {
+            secure_executing(
+                eid,
+                &mut result_ptr,
+                tid,
+                self.get_rdd_id(),  //shuffle rdd id
+                CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
+                3,   //3 is for reduce & fold
+                data_ptr as *mut u8 ,
+                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+            )
+        };
+        let _data = unsafe{ Box::from_raw(data_ptr) };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            },
+        };
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in fold, ecall {:?}s", dur);
+        let mut temp = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 3, result_ptr as *mut u8);
+        //temp only contains one element
+        Ok(temp.pop().unwrap())
+    }
+
+
     /// Aggregate the elements of each partition, and then the results for all the partitions, using
     /// given combine functions and a neutral "initial value". This function can return a different result
     /// type, U, than the type of this RDD, T. Thus, we need one operation for merging a T into an U
@@ -694,6 +1080,53 @@ pub trait RddE: Rdd {
             Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.fold(zero.clone(), &seq_fn));
         let results = self.get_context().run_job(self.get_rdde(), reduce_partition);
         Ok(results?.into_iter().fold(init, comb_fn))
+    }
+
+    //
+    fn secure_aggregate<U, UE, SF, CF, FE, FD>(&self, init: U, seq_fn: SF, comb_fn: CF, fe: FE, fd: FD) -> Result<UE>
+    where
+        Self: Sized,
+        U: Data,
+        UE: Data,
+        SF: SerFunc(U, Self::Item) -> U,
+        CF: SerFunc(U, U) -> U,
+        FE: SerFunc(Vec<U>) -> UE,
+        FD: SerFunc(UE) -> Vec<U>,
+    {
+        let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
+        let data = self.get_context().run_job(self.get_rdde(), cl)?
+            .into_iter().flatten().collect::<Vec<_>>();
+       
+        let data_ptr = Box::into_raw(Box::new(data));
+        let now = Instant::now();
+        let tid: u64 = thread::current().id().as_u64().into();
+        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let mut result_ptr: usize = 0;
+        let sgx_status = unsafe {
+            secure_executing(
+                eid,
+                &mut result_ptr,
+                tid,
+                self.get_rdd_id(),  //shuffle rdd id
+                CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
+                3,   //3 is for reduce & fold
+                data_ptr as *mut u8 ,
+                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+            )
+        };
+        let _data = unsafe{ Box::from_raw(data_ptr) };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            },
+        };
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in aggregate, ecall {:?}s", dur);
+        let mut temp = get_encrypted_data::<UE>(self.get_rdd_id(), 3, result_ptr as *mut u8);
+        //temp only contains one element
+        Ok(temp.pop().unwrap())
     }
 
     /// Return the Cartesian product of this RDD and another one, that is, the RDD of all pairs of
@@ -835,6 +1268,50 @@ pub trait RddE: Rdd {
             .into_iter()
             .sum())
     }
+
+    fn secure_count(&self) -> Result<u64>
+    where
+        Self: Sized,
+    {
+        let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
+        let data = self.get_context().run_job(self.get_rdde(), cl)?
+            .into_iter().flatten().collect::<Vec<_>>();
+       
+        let data_ptr = Box::into_raw(Box::new(data));
+        let now = Instant::now();
+        let tid: u64 = thread::current().id().as_u64().into();
+        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let mut result_ptr: usize = 0;
+        let sgx_status = unsafe {
+            secure_executing(
+                eid,
+                &mut result_ptr,
+                tid,
+                self.get_rdd_id(),  //shuffle rdd id
+                CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
+                3,   //3 is for reduce & fold
+                data_ptr as *mut u8 ,
+                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+            )
+        };
+        let _data = unsafe{ Box::from_raw(data_ptr) };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            },
+        };
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in aggregate, ecall {:?}s", dur);
+        /*
+        let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 3, result_ptr as *mut u8);
+        //temp only contains one element
+        Ok(temp.pop().unwrap())
+        */
+        Ok(result_ptr as u64)
+    }   
+
 
     /// Return the count of each unique value in this RDD as a dictionary of (value, count) pairs.
     /// TODO fe and fd should be drived from RddE automatically, not act as input
@@ -1261,13 +1738,13 @@ pub trait RddE: Rdd {
 
     fn union(
         &self,
-        other: Arc<dyn Rdd<Item = Self::Item>>,
-    ) -> Result<SerArc<dyn Rdd<Item = Self::Item>>>
+        other: Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>,
+    ) -> Result<SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>>
     where
         Self: Clone,
     {
         Ok(SerArc::new(Context::union(&[
-            Arc::new(self.clone()) as Arc<dyn Rdd<Item = Self::Item>>,
+            Arc::new(self.clone()) as Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>,
             other,
         ])?))
     }

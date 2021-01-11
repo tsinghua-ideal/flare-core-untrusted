@@ -12,6 +12,7 @@ use serde_traitobject::{Deserialize, Serialize};
 
 use crate::context::Context;
 use crate::dependency::{Dependency, NarrowDependencyTrait};
+use crate::env::{RDDB_MAP, Env};
 use crate::error::{Error, Result};
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
@@ -164,6 +165,24 @@ where
     FE: SerFunc(Vec<T>) -> TE,
     FD: SerFunc(TE) -> Vec<T>, 
 {
+    fn cache(&self) {
+        self.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+    
+    fn should_cache(&self) -> bool {
+        self.vals.should_cache()
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<TE>)
+        };
+    }
+
     fn splits(&self) -> Vec<Box<dyn Split>> {
         let partition_coalescer = DefaultPartitionCoalescer::default();
         partition_coalescer
@@ -213,6 +232,13 @@ where
         }
     }
 
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<TE>(self.get_rdd_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
+    }
+
     /// Returns the preferred machine for the partition. If split is of type CoalescedRddSplit,
     /// then the preferred machine will be one which most parent splits prefer too.
     fn preferred_locations(&self, split: Box<dyn Split>) -> Vec<Ipv4Addr> {
@@ -224,8 +250,8 @@ where
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
     }
 
     default fn iterator_any(
@@ -274,7 +300,7 @@ where
         Ok(Box::new(iter.into_iter().flatten()) as Box<dyn Iterator<Item = Self::Item>>)
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         //TODO need revision
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }

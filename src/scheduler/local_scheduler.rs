@@ -181,7 +181,8 @@ impl LocalScheduler {
         L: JobListener,
     {
         // TODO: update cache
-
+        self.update_cache_locs().await?;
+        
         if allow_local {
             if let Some(result) = LocalScheduler::local_execution(jt.clone())? {
                 return Ok(result);

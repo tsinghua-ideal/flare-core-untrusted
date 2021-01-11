@@ -11,7 +11,8 @@
     unboxed_closures,
     unsize,
     vec_into_raw_parts,
-    vec_resize_default
+    vec_resize_default,
+    map_first_last
 )]
 #![allow(dead_code, where_clauses_object_safety, deprecated)]
 #![allow(clippy::single_component_path_imports)]

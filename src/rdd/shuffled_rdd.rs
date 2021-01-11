@@ -6,29 +6,17 @@ use std::time::Instant;
 
 use crate::aggregator::Aggregator;
 use crate::context::Context;
-use crate::env::Env;
+use crate::env::{BOUNDED_MEM_CACHE, RDDB_MAP, Env};
 use crate::dependency::{Dependency, ShuffleDependency};
 use crate::error::Result;
 use crate::partitioner::Partitioner;
-use crate::rdd::{Rdd, RddBase, RddE, RddVals};
+use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::shuffle::ShuffleFetcher;
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
 use parking_lot::Mutex;
 use sgx_types::*;
-
-extern "C" {
-    fn secure_executing(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        id: usize,
-        tid: u64,
-        is_shuffle: u8,
-        input: *mut u8,
-        captured_vars: *const u8,
-    ) -> sgx_status_t;
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ShuffledRddSplit {
@@ -152,6 +140,24 @@ where
     FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
     FD: SerFunc((KE, CE)) -> Vec<(K, C)>, 
 {
+    fn cache(&self) {
+        self.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+
+    fn should_cache(&self) -> bool {
+        self.vals.should_cache()
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<(KE, CE)>)
+        };
+    }
+    
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
@@ -178,6 +184,13 @@ where
         }
     }
 
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<(KE, CE)>(self.get_rdd_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
+    }
+
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (0..self.part.get_num_of_partitions())
             .map(|x| Box::new(ShuffledRddSplit::new(x)) as Box<dyn Split>)
@@ -192,8 +205,8 @@ where
         Some(self.part.clone())
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
     }
 
     fn iterator_any(
@@ -251,23 +264,32 @@ where
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, split.get_index());
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        let part_id = split.get_index();
+        let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let cur_id = self.get_rdd_id();
 
+        let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
             let now = Instant::now();
             let mut blocks = Vec::new(); 
-            let num_subpar = bucket.len();
-            let chunk_size = 1000;   //num of entries = 1000*num_subpar
+            let chunk_size = 1000;   //num of entries = 1000*num of sub_part
             let mut iter_vec = Vec::new();
-            for idx_subpar in 0..num_subpar {
+            for idx_subpar in 0..bucket.len() {
                 iter_vec.push(bucket[idx_subpar].chunks(chunk_size));        
             }
-                        
+            
+            let mut sub_part_id = 0;
+            let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
+                0,   //indicate it cannot find the cached data
+                part_id,
+                acc_arg.steps_to_caching,
+                acc_arg.steps_to_cached,
+            );
             while !iter_vec.is_empty() {
                 //get block (memory inefficient)
                 blocks.clear();
@@ -286,54 +308,60 @@ where
                     iter_vec.remove(idx);
                 }
                 
-                let block_ptr = Box::into_raw(Box::new(blocks));
-                
-                let mut result_bl_ptr: usize = 0; 
-                let sgx_status = unsafe {
-                    secure_executing(
-                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                        &mut result_bl_ptr,
-                        cur_id,  //shuffle rdd id
-                        tid,
-                        2,   //shuffle read
-                        block_ptr as *mut u8, 
-                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                    )
-                };
-                blocks = *unsafe{ Box::from_raw(block_ptr) };
-                let _r = match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {},
-                    _ => {
-                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                    },
-                };
-                
-                // this block is in enclave, cannot access
-                let block_ptr = result_bl_ptr as *mut u8;
-                result_bl_ptr = 0;
-                let sgx_status = unsafe {
-                    secure_executing(
-                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                        &mut result_bl_ptr,
-                        id,
-                        tid,
-                        is_shuffle,  
-                        block_ptr,
-                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                    )
-                };
-                match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {},
-                    _ => {
-                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                    },
-                };
-                tx.send(result_bl_ptr).unwrap();
+                if !acc_arg.cached(&sub_part_id) {
+                    cache_meta.set_sub_part_id(sub_part_id);
+                    BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
+                    let block_ptr = Box::into_raw(Box::new(blocks));
+                    let mut result_bl_ptr: usize = 0; 
+                    let sgx_status = unsafe {
+                        secure_executing(
+                            eid,
+                            &mut result_bl_ptr,
+                            tid,
+                            cur_id,  //shuffle rdd id
+                            cache_meta,    //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
+                            2,   //shuffle read
+                            block_ptr as *mut u8, 
+                            &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                        )
+                    };
+                    blocks = *unsafe{ Box::from_raw(block_ptr) };
+                    let _r = match sgx_status {
+                        sgx_status_t::SGX_SUCCESS => {},
+                        _ => {
+                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                        },
+                    };
+                    
+                    // this block is in enclave, cannot access
+                    let block_ptr = result_bl_ptr as *mut u8;
+                    result_bl_ptr = 0;
+                    let sgx_status = unsafe {
+                        secure_executing(
+                            eid,
+                            &mut result_bl_ptr,
+                            tid,
+                            acc_arg.rdd_id,
+                            cache_meta,
+                            acc_arg.is_shuffle,  
+                            block_ptr,
+                            &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                        )
+                    };
+                    match sgx_status {
+                        sgx_status_t::SGX_SUCCESS => {},
+                        _ => {
+                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                        },
+                    };
+                    tx.send(result_bl_ptr).unwrap();
+                }
+                sub_part_id += 1;
             }  
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("in ShuffledRdd, shuffle read + narrow {:?}", dur);  
         });
-        Ok(handle)
+        Ok(vec![handle])
     }
 }
 

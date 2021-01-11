@@ -1,7 +1,7 @@
 use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
-use crate::rdd::{get_encrypted_data, RddBase, EENTER_LOCK};
+use crate::rdd::{AccArg, get_encrypted_data, RddBase, EENTER_LOCK};
 use crate::serializable_traits::Data;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
@@ -54,10 +54,10 @@ impl NarrowDependencyTrait for OneToOneDependency {
 pub(crate) struct RangeDependency {
     #[serde(with = "serde_traitobject")]
     rdd_base: Arc<dyn RddBase>,
-    /// the start of the range in the child RDD
-    out_start: usize,
     /// the start of the range in the parent RDD
     in_start: usize,
+    /// the start of the range in the child RDD
+    out_start: usize,
     /// the length of the range
     length: usize,
 }
@@ -201,7 +201,8 @@ where
             log::debug!("split index: {}", split.get_index());
             let (tx, rx) = mpsc::sync_channel(0);
             let rdd_id = rdd_base.get_rdd_id();
-            let handle = rdd_base.iterator_raw(split, tx, 1).unwrap();
+            let mut acc_arg = AccArg::new(rdd_id, 1, 0, 0);
+            let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
             let now = Instant::now();
             let num_output_splits = self.partitioner.get_num_of_partitions();
             let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
@@ -215,12 +216,17 @@ where
                     buckets[i].push(bucket); 
                 }
             }
-                 
+            println!("finish getting encrypted data");
+            
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
                 env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
             }
-            handle.join().unwrap();
+            
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("in dependency, total {:?}", dur);
             env::Env::get().shuffle_manager.get_server_uri()    

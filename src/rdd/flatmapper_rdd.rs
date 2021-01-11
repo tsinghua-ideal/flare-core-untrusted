@@ -4,8 +4,8 @@ use std::thread::JoinHandle;
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
 use crate::error::Result;
-use crate::env::Env;
-use crate::rdd::{Rdd, RddE, RddBase, RddVals};
+use crate::env::{RDDB_MAP, Env};
+use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
@@ -88,6 +88,24 @@ where
     FE: SerFunc(Vec<U>) -> UE,
     FD: SerFunc(UE) -> Vec<U>,
 {
+    fn cache(&self) {
+        self.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+
+    fn should_cache(&self) -> bool {
+        self.vals.should_cache()
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<UE>)
+        };
+    }
+    
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
@@ -114,6 +132,13 @@ where
         }
     }
 
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<UE>(self.get_rdd_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
+    }
+
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()
     }
@@ -121,8 +146,8 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
     }
 
     default fn cogroup_iterator_any(
@@ -181,15 +206,36 @@ where
         Ok(Box::new(self.prev.iterator(split)?.flat_map(f)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        let cur_rdd_id = self.get_rdd_id();
+        let part_id = split.get_index();
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             Env::get().captured_vars
                 .lock()
                 .unwrap()
-                .insert(self.get_rdd_id(), captured_vars);
+                .insert(cur_rdd_id, captured_vars);
         }
-        self.prev.secure_compute(split, id, tx, is_shuffle)
+        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
+        let should_cache = self.should_cache();
+        acc_arg.step_caching(should_cache);
+        if should_cache {
+            let mut handles = secure_compute_cached(
+                acc_arg, 
+                cur_rdd_id, 
+                part_id,
+                tx.clone(),
+                captured_vars,
+            );
+
+            if !acc_arg.totally_cached() {
+                handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
+            }
+            Ok(handles)     
+        } else {
+            acc_arg.step_cached(false);
+            self.prev.secure_compute(split, acc_arg, tx)
+        }
     }
 }
 

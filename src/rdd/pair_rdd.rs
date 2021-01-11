@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 use crate::aggregator::Aggregator;
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
+use crate::env::{RDDB_MAP, Env};
 use crate::error::Result;
 use crate::partitioner::{HashPartitioner, Partitioner};
 use crate::rdd::co_grouped_rdd::CoGroupedRdd;
@@ -371,6 +372,24 @@ where
     FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
     FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
+    fn cache(&self) {
+        self.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+
+    fn should_cache(&self) -> bool {
+        self.vals.should_cache()
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<(KE, UE)>)
+        };
+    }
+
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
@@ -395,6 +414,13 @@ where
         }
     }
 
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<(KE, UE)>(self.get_rdd_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
+    }
+
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()
     }
@@ -402,8 +428,8 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
     }
 
     // TODO: Analyze the possible error in invariance here
@@ -443,8 +469,36 @@ where
             self.prev.iterator(split)?.map(move |(k, v)| (k, f(v))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.prev.secure_compute(split, id, tx, is_shuffle)
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        let cur_rdd_id = self.get_rdd_id();
+        let part_id = split.get_index();
+        let captured_vars = self.f.get_ser_captured_var(); 
+        if !captured_vars.is_empty() {
+            Env::get().captured_vars
+                .lock()
+                .unwrap()
+                .insert(cur_rdd_id, captured_vars);
+        }
+        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
+        let should_cache = self.should_cache();
+        acc_arg.step_caching(should_cache);
+        if should_cache {
+            let mut handles = secure_compute_cached(
+                acc_arg, 
+                cur_rdd_id, 
+                part_id,
+                tx.clone(),
+                captured_vars,
+            );
+
+            if !acc_arg.totally_cached() {
+                handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
+            }
+            Ok(handles)     
+        } else {
+            acc_arg.step_cached(false);
+            self.prev.secure_compute(split, acc_arg, tx)
+        }
     }
 }
 
@@ -558,6 +612,24 @@ where
     FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
     FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
+    fn cache(&self) {
+        self.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+    
+    fn should_cache(&self) -> bool {
+        self.vals.should_cache()
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<(KE, UE)>)
+        };
+    }
+
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
@@ -581,6 +653,13 @@ where
         }
     }
 
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<(KE, UE)>(self.get_rdd_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
+    }
+
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()
     }
@@ -588,8 +667,8 @@ where
         self.prev.number_of_splits()
     }
     
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
     }
 
     // TODO: Analyze the possible error in invariance here
@@ -631,8 +710,36 @@ where
                 .flat_map(move |(k, v)| f(v).map(move |x| (k.clone(), x))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.prev.secure_compute(split, id, tx, is_shuffle)
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        let cur_rdd_id = self.get_rdd_id();
+        let part_id = split.get_index();
+        let captured_vars = self.f.get_ser_captured_var(); 
+        if !captured_vars.is_empty() {
+            Env::get().captured_vars
+                .lock()
+                .unwrap()
+                .insert(cur_rdd_id, captured_vars);
+        }
+        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
+        let should_cache = self.should_cache();
+        acc_arg.step_caching(should_cache);
+        if should_cache {
+            let mut handles = secure_compute_cached(
+                acc_arg, 
+                cur_rdd_id, 
+                part_id,
+                tx.clone(),
+                captured_vars,
+            );
+
+            if !acc_arg.totally_cached() {
+                handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
+            }
+            Ok(handles)     
+        } else {
+            acc_arg.step_cached(false);
+            self.prev.secure_compute(split, acc_arg, tx)
+        }
     }
 }
 

@@ -9,10 +9,10 @@ use std::thread::{JoinHandle, self};
 
 use crate::context::Context;
 use crate::dependency::Dependency;
-use crate::env::Env;
+use crate::env::{BOUNDED_MEM_CACHE, Env};
 use crate::error::{Error, Result};
 use crate::io::*;
-use crate::rdd::{MapPartitionsRdd, MapperRdd, Rdd, RddE, RddBase, encrypt, decrypt};
+use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data, SerFunc};
 use crate::split::Split;
 use crate::Fn;
@@ -21,18 +21,6 @@ use rand::prelude::*;
 use serde_derive::{Deserialize, Serialize};
 use parking_lot::Mutex;
 use sgx_types::*;
-
-extern "C" {
-    fn secure_executing(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        id: usize,
-        tid: u64,
-        is_shuffle: u8,
-        input: *mut u8,
-        captured_vars: *const u8,
-    ) -> sgx_status_t;
-}
 
 pub struct LocalFsReaderConfig {
     filter_ext: Option<std::ffi::OsString>,
@@ -358,6 +346,18 @@ impl<T: Data> LocalFsReader<T> {
 
 macro_rules! impl_common_lfs_rddb_funcs {
     () => {
+        fn cache(&self) {
+            panic!("no cache for LocalFsReader");
+        }
+        
+        fn should_cache(&self) -> bool {
+            false
+        }
+
+        fn free_data_enc(&self, ptr: *mut u8) {
+            todo!()
+        }
+
         fn get_rdd_id(&self) -> usize {
             self.id
         }
@@ -384,12 +384,16 @@ macro_rules! impl_common_lfs_rddb_funcs {
             }
         }
 
+        fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+            todo!()
+        }
+
         fn is_pinned(&self) -> bool {
             true
         }
 
-        fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-            self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+            self.secure_compute(split, acc_arg, tx)
         }
 
         default fn iterator_any(
@@ -460,6 +464,12 @@ macro_rules! impl_common_lfs_rdd_funcs {
         fn get_rdd_base(&self) -> Arc<dyn RddBase> {
             Arc::new(self.clone()) as Arc<dyn RddBase>
         }
+
+        fn get_or_compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+            let cache_tracker = Env::get().cache_tracker.clone();
+            Ok(cache_tracker.get_or_compute(Arc::new(self.clone()), split))
+        }
+        
     };
 }
 
@@ -480,7 +490,7 @@ impl Rdd for LocalFsReader<BytesReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;
@@ -494,8 +504,17 @@ impl Rdd for LocalFsReader<BytesReader> {
             .collect::<Vec<_>>();  //Vec<Vec<u8>>
         let len = data.len();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
+            let mut sub_part_id = 0;
+            let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
+                0,   //indicate it cannot find the cached data
+                idx,
+                acc_arg.steps_to_caching,
+                acc_arg.steps_to_cached,
+            );
             //TODO need to sub-partition
             let block_len = len; //temporary 
             let mut cur = 0;
@@ -504,32 +523,38 @@ impl Rdd for LocalFsReader<BytesReader> {
                     true => len,
                     false => cur + block_len,
                 };
-                let block = Box::new((&data[cur..next]).to_vec());
-                let block_ptr = Box::into_raw(block);
-                let mut result_bl_ptr: usize = 0;
-                let sgx_status = unsafe {
-                    secure_executing(
-                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                        &mut result_bl_ptr,
-                        id,
-                        tid,
-                        is_shuffle,  
-                        block_ptr as *mut u8,
-                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                    )
-                };
-                let _block = unsafe{ Box::from_raw(block_ptr) };
-                let _r = match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {},
-                    _ => {
-                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                    },
-                };
-                tx.send(result_bl_ptr).unwrap();
+                if !acc_arg.cached(&sub_part_id) {
+                    cache_meta.set_sub_part_id(sub_part_id);
+                    BOUNDED_MEM_CACHE.insert_subpid(acc_arg.caching_rdd_id, idx, sub_part_id);
+                    let block = Box::new((&data[cur..next]).to_vec());
+                    let block_ptr = Box::into_raw(block);
+                    let mut result_bl_ptr: usize = 0;
+                    let sgx_status = unsafe {
+                        secure_executing(
+                            eid,
+                            &mut result_bl_ptr,
+                            tid,
+                            acc_arg.rdd_id,
+                            cache_meta,
+                            acc_arg.is_shuffle,  
+                            block_ptr as *mut u8,
+                            &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                        )
+                    };
+                    let _block = unsafe{ Box::from_raw(block_ptr) };
+                    let _r = match sgx_status {
+                        sgx_status_t::SGX_SUCCESS => {},
+                        _ => {
+                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                        },
+                    };
+                    tx.send(result_bl_ptr).unwrap();
+                }
+                sub_part_id += 1;
                 cur = next; 
             }  
         });
-        Ok(handle)
+        Ok(vec![handle])
     }
 }
 
@@ -550,7 +575,7 @@ impl Rdd for LocalFsReader<FileReader> {
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         panic!("Don't support secure computing for LocalFsReader<FileReader>")
     }
 }

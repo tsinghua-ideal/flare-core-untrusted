@@ -35,16 +35,22 @@ pub(crate) trait NativeScheduler: Send + Sync {
             let now = Instant::now();
             let res = Ok(Some(vec![(&jt.func)((
                 task_context,
-                (
-                    match jt.final_rdd.iterator(split.clone()) {
-                        Ok(r) => r,
-                        Err(_) => Box::new(Vec::new().into_iter()),
-                    }, 
-                    match jt.final_rdd.secure_iterator(split) {
-                        Ok(r) => r,
-                        Err(_) => Box::new(Vec::new().into_iter()),
-                    }
-                )
+                match jt.final_rdd.get_secure() {
+                    true => (
+                        Box::new(Vec::new().into_iter()),                 
+                        match jt.final_rdd.secure_iterator(split) {
+                            Ok(r) => r,
+                            Err(_) => Box::new(Vec::new().into_iter()),
+                        }
+                    ),
+                    false => (
+                        match jt.final_rdd.iterator(split.clone()) {
+                            Ok(r) => r,
+                            Err(_) => Box::new(Vec::new().into_iter()),
+                        }, 
+                        Box::new(Vec::new().into_iter()), 
+                    ),
+                }
             ))]));
 
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
@@ -101,33 +107,35 @@ pub(crate) trait NativeScheduler: Send + Sync {
         if !visited.contains(&rdd) {
             visited.insert(rdd.clone());
             // TODO: CacheTracker register
-            for _ in 0..rdd.number_of_splits() {
-                let locs = self.get_cache_locs(rdd.clone());
-                log::debug!("cache locs: {:?}", locs);
-                if locs == None {
-                    for dep in rdd.get_dependencies() {
-                        log::debug!("for dep in missing stages ");
-                        match dep {
-                            Dependency::ShuffleDependency(shuf_dep) => {
-                                let stage = self.get_shuffle_map_stage(shuf_dep.clone()).await?;
-                                log::debug!("shuffle stage #{} in missing stages", stage.id);
-                                if !stage.is_available() {
-                                    log::debug!(
-                                        "inserting shuffle stage #{} in missing stages",
-                                        stage.id
-                                    );
-                                    missing.insert(stage);
-                                }
+            let locs = self.get_cache_locs(rdd.clone());
+            log::debug!("cache locs: {:?}", locs);
+            // For entirely not cached rdd, locs == None
+            // For partially not cached rdd, locs == Some(Vec<_>), some elements of the vec is empty
+            let rdd_has_uncached_partitions = locs.is_none() || 
+                locs.unwrap().into_iter().filter(|x| x.is_empty()).collect::<Vec<_>>().len() > 0;
+            if rdd_has_uncached_partitions {
+                for dep in rdd.get_dependencies() {
+                    log::debug!("for dep in missing stages ");
+                    match dep {
+                        Dependency::ShuffleDependency(shuf_dep) => {
+                            let stage = self.get_shuffle_map_stage(shuf_dep.clone()).await?;
+                            log::debug!("shuffle stage #{} in missing stages", stage.id);
+                            if !stage.is_available() {
+                                log::debug!(
+                                    "inserting shuffle stage #{} in missing stages",
+                                    stage.id
+                                );
+                                missing.insert(stage);
                             }
-                            Dependency::NarrowDependency(nar_dep) => {
-                                log::debug!("narrow stage in missing stages");
-                                self.visit_for_missing_parent_stages(
-                                    missing,
-                                    visited,
-                                    nar_dep.get_rdd_base(),
-                                )
-                                .await?;
-                            }
+                        }
+                        Dependency::NarrowDependency(nar_dep) => {
+                            log::debug!("narrow stage in missing stages");
+                            self.visit_for_missing_parent_stages(
+                                missing,
+                                visited,
+                                nar_dep.get_rdd_base(),
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -333,16 +341,11 @@ pub(crate) trait NativeScheduler: Send + Sync {
                 // TODO: Cache
                 self.update_cache_locs().await?;
                 let mut newly_runnable = Vec::new();
-                let waiting_stages: Vec<_> = jt.waiting.lock().await.iter().cloned().collect();
-                for stage in waiting_stages {
-                    let missing_stages = self.get_missing_parent_stages(stage.clone()).await?;
-                    log::debug!(
-                        "waiting stage parent stages for stage #{} are: {:?}",
-                        stage.id,
-                        missing_stages.iter().map(|x| x.id).collect::<Vec<_>>()
-                    );
-                    if missing_stages.iter().next().is_none() {
-                        newly_runnable.push(stage.clone())
+                let waiting_stages: BTreeSet<_> = jt.waiting.lock().await.iter().cloned().collect();
+                for stage in &waiting_stages {
+                    let parents = stage.parents.iter().cloned().collect::<BTreeSet<_>>();
+                    if parents.is_disjoint(&waiting_stages) {
+                        newly_runnable.push(stage.clone());
                     }
                 }
                 for stage in &newly_runnable {

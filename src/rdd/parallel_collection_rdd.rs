@@ -6,9 +6,9 @@ use std::thread::{JoinHandle, self};
 
 use crate::context::Context;
 use crate::dependency::Dependency;
-use crate::env::Env;
+use crate::env::{BOUNDED_MEM_CACHE, RDDB_MAP, Env};
 use crate::error::{Error, Result};
-use crate::rdd::{Rdd, RddBase, RddE, RddVals, EENTER_LOCK};
+use crate::rdd::*;
 use crate::serialization_free::Construct;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
@@ -30,18 +30,6 @@ where
         let as_many_parts_as_cpus = num_cpus::get();
         self.slice_with_set_parts(as_many_parts_as_cpus)
     }
-}
-
-extern "C" {
-    fn secure_executing(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        id: usize,
-        tid: u64,
-        is_shuffle: u8,
-        input: *mut u8,
-        captured_vars: *const u8,
-    ) -> sgx_status_t;
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -78,17 +66,25 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> JoinHandle<()> {
+    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
         let data_size = data.get_aprox_size() / len;
+        let part_id = self.get_index();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         //sub-partition
-        let mut num_sub_part = 0;
+        let mut acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
+            let mut sub_part_id = 0;
+            let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
+                0,   //indicate it cannot find the cached data
+                part_id, 
+                acc_arg.steps_to_caching,
+                acc_arg.steps_to_cached,
+            );
             let block_len = (1 << (8+10)) / data_size;  //each block: 256KB
             let mut cur = 0;
             while cur < len {
@@ -96,37 +92,44 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     true => len,
                     false => cur + block_len,
                 };
-                let block = Box::new((&data[cur..next]).to_vec());
-                let block_ptr = Box::into_raw(block);
-                let mut result_bl_ptr: usize = 0;
-                let now = Instant::now();
-                while *EENTER_LOCK.lock().unwrap() {
-                    //wait
-                }
-                let sgx_status = unsafe {
-                    secure_executing(
-                        Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid(),
-                        &mut result_bl_ptr,
-                        id,
-                        tid,
-                        is_shuffle,  
-                        block_ptr as *mut u8,
-                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
-                    )
-                };
-                *EENTER_LOCK.lock().unwrap() =  true;
+                
+                if !acc_arg.cached(&sub_part_id) {
+                    cache_meta.set_sub_part_id(sub_part_id);
+                    println!("insert_subpid {:?}, {:?}, {:?}", cache_meta.caching_rdd_id, part_id, sub_part_id);
+                    BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
+                    let now = Instant::now();
+                    let block = Box::new((&data[cur..next]).to_vec());
+                    let block_ptr = Box::into_raw(block);
+                    let mut result_bl_ptr: usize = 0;
+                    while *EENTER_LOCK.lock().unwrap() {
+                        //wait
+                    }
+                    let sgx_status = unsafe {
+                        secure_executing(
+                            eid,
+                            &mut result_bl_ptr,
+                            tid,
+                            acc_arg.rdd_id,
+                            cache_meta,
+                            acc_arg.is_shuffle,  
+                            block_ptr as *mut u8,
+                            &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                        )
+                    };
+                    *EENTER_LOCK.lock().unwrap() =  true;
 
-                let _block = unsafe{ Box::from_raw(block_ptr) };
-                let _r = match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {},
-                    _ => {
-                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                    },
-                };
-                tx.send(result_bl_ptr).unwrap();
-                num_sub_part += 1;
-                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                println!("in ParallelCollectionRdd, num of sub_partition {:?}, compute {:?}", num_sub_part, dur);
+                    let _block = unsafe{ Box::from_raw(block_ptr) };
+                    let _r = match sgx_status {
+                        sgx_status_t::SGX_SUCCESS => {},
+                        _ => {
+                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                        },
+                    };
+                    tx.send(result_bl_ptr).unwrap();
+                    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                    println!("in ParallelCollectionRdd, num of sub_partition {:?}, compute {:?}", sub_part_id, dur);
+                }
+                sub_part_id += 1;
                 cur = next;  
             }
         });
@@ -303,6 +306,24 @@ where
     FE: SerFunc(Vec<T>) -> TE,
     FD: SerFunc(TE) -> Vec<T>, 
 {
+    fn cache(&self) {
+        self.rdd_vals.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+
+    fn should_cache(&self) -> bool {
+        self.rdd_vals.vals.should_cache()
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<TE>)
+        };
+    }
+
     fn get_rdd_id(&self) -> usize {
         self.rdd_vals.vals.id
     }
@@ -337,6 +358,13 @@ where
         }
     }
 
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<TE>(self.get_rdd_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
+    }
+
     fn splits(&self) -> Vec<Box<dyn Split>> {
         match self.rdd_vals.splits_.clone() {
             DataForm::Plaintext(splits) => {
@@ -369,8 +397,8 @@ where
         self.rdd_vals.num_slices
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
-        self.secure_compute(split, self.get_rdd_id(), tx, is_shuffle)
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
     }
 
     default fn cogroup_iterator_any(
@@ -421,9 +449,9 @@ where
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, id: usize, tx: SyncSender<usize>, is_shuffle: u8) -> Result<JoinHandle<()>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
-            Ok(s.secure_iterator(id, tx, is_shuffle))
+            Ok(vec![s.secure_iterator(acc_arg, tx)])
         } else {
             Err(Error::DowncastFailure("ParallelCollectionSplit<TE>"))
         }

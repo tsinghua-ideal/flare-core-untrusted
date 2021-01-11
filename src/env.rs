@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::mem::forget;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -9,6 +10,7 @@ use crate::cache_tracker::CacheTracker;
 use crate::error::Error;
 use crate::hosts::Hosts;
 use crate::map_output_tracker::MapOutputTracker;
+use crate::rdd::RddBase;
 use crate::shuffle::{ShuffleFetcher, ShuffleManager};
 use dashmap::DashMap;
 use log::LevelFilter;
@@ -19,8 +21,20 @@ use tokio::runtime::{Handle, Runtime};
 use sgx_types::*;
 use sgx_urts::SgxEnclave;
 
+extern "C" {
+    pub fn get_lp_boundary(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+    ) -> sgx_status_t;
+    pub fn free_lp_boundary(
+        eid: sgx_enclave_id_t,
+        lp_bd_ptr: *mut u8,
+    ) -> sgx_status_t;
+}
+
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
 type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
+
 
 const ENV_VAR_PREFIX: &str = "VEGA_";
 pub(crate) const THREAD_PREFIX: &str = "_VEGA";
@@ -28,9 +42,83 @@ static CONF: OnceCell<Configuration> = OnceCell::new();
 static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);
 
-
 pub(crate) static SHUFFLE_CACHE: Lazy<ShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
 pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(BoundedMemoryCache::new);
+pub(crate) static RDDB_MAP: Lazy<RddBMap> = Lazy::new(|| RddBMap::new()); 
+
+pub(crate) struct RddBMap {
+    map: Arc<DashMap<usize, Arc<dyn RddBase>>>, //op_id -> rddbase
+    lp_boundary: Vec<(usize, usize, usize)>,
+}
+
+impl RddBMap {
+    pub fn new() -> Self {
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let mut lp_bd_ptr = 0;
+        let sgx_status = unsafe { 
+            get_lp_boundary(
+                eid,
+                &mut lp_bd_ptr,
+            )
+        };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            }
+        }
+        let lp_boundary_ = unsafe {
+            Box::from_raw(lp_bd_ptr as *mut u8 as *mut Vec<(usize, usize, usize)>)
+        };
+        let lp_boundary = *lp_boundary_.clone();
+        forget(lp_boundary_);
+        let sgx_status = unsafe { 
+            free_lp_boundary(
+                eid,
+                lp_bd_ptr as *mut u8,
+            )
+        };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            }
+        }
+
+        RddBMap {
+            map: Arc::new(DashMap::new()),
+            lp_boundary,
+        }
+    }
+
+    pub fn get_rddb(&self, rdd_id: usize) -> Option<Arc<dyn RddBase>> {
+        self.map.get(&self.map_id(rdd_id)).map(|x| x.clone())
+    }
+
+    pub fn insert(&self, rdd_id: usize, rdd_base: Arc<dyn RddBase>) {
+        self.map.insert(self.map_id(rdd_id), rdd_base);
+    }
+
+    pub fn map_id(&self, rdd_id: usize) -> usize {
+        let lp_bd = &self.lp_boundary;
+        if lp_bd.len() == 0 {
+            return rdd_id;
+        }
+        let mut sum_rep = 0;
+        for &i in lp_bd.iter() {
+            let lower_bound = i.0 + sum_rep;
+            let upper_bound = lower_bound + i.2 * (i.1 - i.0);
+            if rdd_id <= lower_bound {   //outside loop
+                return rdd_id - sum_rep;
+            } else if rdd_id > lower_bound && rdd_id <= upper_bound { //inside loop
+                let dedup_id = rdd_id - sum_rep;
+                return  (dedup_id + i.1 - 2 * i.0 - 1) % (i.1 - i.0) + i.0 + 1;
+            }
+            sum_rep += (i.2 - 1) * (i.1 - i.0);
+        }
+        return rdd_id - sum_rep;
+    }
+}
 
 pub(crate) struct Env {
     pub map_output_tracker: MapOutputTracker,
@@ -107,7 +195,6 @@ impl Env {
                 false => Arc::new(Mutex::new(Some(Env::init_enclave(&enclave_path_str)
                               .unwrap_or_else(|x| panic!("[-] Init Enclave Failed {}!", x.as_str()))))),
             };
-
             Env {
                 map_output_tracker,
                 shuffle_manager,
