@@ -85,7 +85,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                 acc_arg.steps_to_caching,
                 acc_arg.steps_to_cached,
             );
-            let block_len = (1 << (8+10)) / data_size;  //each block: 256KB
+            let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -93,7 +93,8 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     false => cur + block_len,
                 };
                 
-                if !acc_arg.cached(&sub_part_id) {
+                //currently, all sub_partitions are not cached as long as coming to this rdd
+                if !acc_arg.cached(&sub_part_id) {  
                     cache_meta.set_sub_part_id(sub_part_id);
                     println!("insert_subpid {:?}, {:?}, {:?}", cache_meta.caching_rdd_id, part_id, sub_part_id);
                     BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
