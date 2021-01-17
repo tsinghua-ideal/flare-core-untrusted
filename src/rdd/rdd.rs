@@ -79,7 +79,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         tid: u64,
-        rdd_id: usize,
+        rdd_ids: *const u8,
         cache_meta: CacheMeta,
         is_shuffle: u8,
         input: *mut u8,
@@ -396,7 +396,7 @@ pub fn secure_compute_cached(
     if cached_sub_parts.len() > 0 {
         acc_arg.step_cached(true);
         // Compute based on cached values
-        let rdd_id = acc_arg.rdd_id;
+        let rdd_ids = acc_arg.rdd_ids.clone();
         let caching_rdd_id = acc_arg.caching_rdd_id;
         let steps_to_caching = acc_arg.steps_to_caching;
         let steps_to_cached = acc_arg.steps_to_cached;
@@ -417,7 +417,7 @@ pub fn secure_compute_cached(
                         eid,
                         &mut result_ptr,
                         tid,
-                        rdd_id, 
+                        &rdd_ids as *const Vec<(usize, usize)> as *const u8, 
                         cache_meta,
                         is_shuffle,   
                         data_ptr as *mut u8 ,
@@ -445,7 +445,8 @@ pub fn secure_compute_cached(
 
 #[derive(Clone)]
 pub struct AccArg {
-    pub rdd_id: usize,
+    pub rdd_ids: Vec<(usize, usize)>,
+    cur_cont_seg: usize, 
     pub is_shuffle: u8,
     pub caching_rdd_id: usize,
     pub steps_to_caching: usize,
@@ -457,9 +458,10 @@ pub struct AccArg {
 }
 
 impl AccArg {
-    pub fn new(rdd_id: usize, is_shuffle: u8, steps_to_caching: usize, steps_to_cached: usize) -> Self {
+    pub fn new(final_rdd_id: usize, is_shuffle: u8, steps_to_caching: usize, steps_to_cached: usize) -> Self {
         AccArg {
-            rdd_id,
+            rdd_ids: vec![(final_rdd_id, final_rdd_id)],
+            cur_cont_seg: 0,
             is_shuffle,
             caching_rdd_id: 0,
             steps_to_caching,
@@ -508,6 +510,17 @@ impl AccArg {
 
     pub fn cached(&self, subpid: &usize) -> bool {
         self.cached_sub_parts.contains(subpid)
+    }
+
+    pub fn insert_rdd_id(&mut self, rdd_id: usize) {
+        let cur = &mut self.cur_cont_seg;
+        let lower = &mut self.rdd_ids[*cur].1;
+        if rdd_id == *lower - 1 || rdd_id == *lower {
+            *lower = rdd_id;
+        } else {
+            self.rdd_ids.push((rdd_id, rdd_id));
+            *cur += 1;
+        }
     }
 }
 
@@ -949,6 +962,8 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cur_rdd_id = self.get_rdd_id();
+        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -956,7 +971,7 @@ pub trait RddE: Rdd {
                 eid,
                 &mut result_ptr,
                 tid,
-                self.get_rdd_id(),  //shuffle rdd id
+                &rdd_ids as *const Vec<(usize, usize)> as *const u8,
                 CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
                 3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
@@ -1025,6 +1040,8 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cur_rdd_id = self.get_rdd_id();
+        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -1032,7 +1049,7 @@ pub trait RddE: Rdd {
                 eid,
                 &mut result_ptr,
                 tid,
-                self.get_rdd_id(),  //shuffle rdd id
+                &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
                 CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
                 3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
@@ -1101,6 +1118,8 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cur_rdd_id = self.get_rdd_id();
+        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -1108,7 +1127,7 @@ pub trait RddE: Rdd {
                 eid,
                 &mut result_ptr,
                 tid,
-                self.get_rdd_id(),  //shuffle rdd id
+                &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
                 CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
                 3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
@@ -1281,6 +1300,8 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cur_rdd_id = self.get_rdd_id();
+        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -1288,7 +1309,7 @@ pub trait RddE: Rdd {
                 eid,
                 &mut result_ptr,
                 tid,
-                self.get_rdd_id(),  //shuffle rdd id
+                &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
                 CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
                 3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,

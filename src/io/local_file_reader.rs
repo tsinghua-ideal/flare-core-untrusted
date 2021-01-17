@@ -504,6 +504,8 @@ impl Rdd for LocalFsReader<BytesReader> {
             .collect::<Vec<_>>();  //Vec<Vec<u8>>
         let len = data.len();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cur_rdd_id = self.get_rdd_id();
+        acc_arg.insert_rdd_id(cur_rdd_id);
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
@@ -534,7 +536,7 @@ impl Rdd for LocalFsReader<BytesReader> {
                             eid,
                             &mut result_bl_ptr,
                             tid,
-                            acc_arg.rdd_id,
+                            &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8,
                             cache_meta,
                             acc_arg.is_shuffle,  
                             block_ptr as *mut u8,

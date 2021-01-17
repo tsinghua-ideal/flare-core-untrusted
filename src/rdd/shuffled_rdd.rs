@@ -269,8 +269,10 @@ where
         let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cur_rdd_id = self.get_rdd_id();
+        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
+        acc_arg.insert_rdd_id(cur_rdd_id);
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let cur_id = self.get_rdd_id();
 
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
@@ -318,7 +320,7 @@ where
                             eid,
                             &mut result_bl_ptr,
                             tid,
-                            cur_id,  //shuffle rdd id
+                            &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
                             cache_meta,    //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
                             2,   //shuffle read
                             block_ptr as *mut u8, 
@@ -341,7 +343,7 @@ where
                             eid,
                             &mut result_bl_ptr,
                             tid,
-                            acc_arg.rdd_id,
+                            &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8,
                             cache_meta,
                             acc_arg.is_shuffle,  
                             block_ptr,

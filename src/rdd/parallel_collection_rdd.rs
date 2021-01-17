@@ -40,7 +40,7 @@ enum DataForm<T, TE> {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ParallelCollectionSplit<T> {
-    rdd_id: i64,
+    rdd_id: usize,
     index: usize,
     values: Arc<Vec<T>>,
 }
@@ -52,7 +52,7 @@ impl<T: Data> Split for ParallelCollectionSplit<T> {
 }
 
 impl<T: Data> ParallelCollectionSplit<T> {
-    fn new(rdd_id: i64, index: usize, values: Arc<Vec<T>>) -> Self {
+    fn new(rdd_id: usize, index: usize, values: Arc<Vec<T>>) -> Self {
         ParallelCollectionSplit {
             rdd_id,
             index,
@@ -73,6 +73,8 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let data_size = data.get_aprox_size() / len;
         let part_id = self.get_index();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+        let cur_rdd_id = self.rdd_id;
+        acc_arg.insert_rdd_id(cur_rdd_id);
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         //sub-partition
         let mut acc_arg = acc_arg.clone();
@@ -105,12 +107,13 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     while *EENTER_LOCK.lock().unwrap() {
                         //wait
                     }
+                    println!("rdd ids(before secure_executing) {:?}", acc_arg.rdd_ids);
                     let sgx_status = unsafe {
                         secure_executing(
                             eid,
                             &mut result_bl_ptr,
                             tid,
-                            acc_arg.rdd_id,
+                            &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8,
                             cache_meta,
                             acc_arg.is_shuffle,  
                             block_ptr as *mut u8,
@@ -372,7 +375,7 @@ where
                 (0..self.rdd_vals.num_slices)
                 .map(|i| {
                     Box::new(ParallelCollectionSplit::new(
-                        self.rdd_vals.vals.id as i64,
+                        self.rdd_vals.vals.id,
                         i,
                         splits[i as usize].clone(),
                     )) as Box<dyn Split>
@@ -383,7 +386,7 @@ where
                 (0..self.rdd_vals.num_slices)
                 .map(|i| {
                     Box::new(ParallelCollectionSplit::new(
-                        self.rdd_vals.vals.id as i64,
+                        self.rdd_vals.vals.id,
                         i,
                         splits[i as usize].clone(),
                     )) as Box<dyn Split>

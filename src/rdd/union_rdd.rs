@@ -447,6 +447,9 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
 
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
+        let cur_rdd_id = self.get_rdd_id();
+        acc_arg.insert_rdd_id(cur_rdd_id);
+
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         match &self.0 {
             NonUniquePartitioner { rdds, .. } => {
@@ -482,7 +485,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                                     eid,
                                     &mut result_bl_ptr,
                                     tid,
-                                    acc_arg.rdd_id, 
+                                    &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8, 
                                     cache_meta,
                                     acc_arg.is_shuffle, 
                                     received as *mut u8, 
@@ -537,7 +540,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                                     eid,
                                     &mut result_bl_ptr,
                                     tid,
-                                    acc_arg.rdd_id, 
+                                    &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8, 
                                     cache_meta,
                                     acc_arg.is_shuffle, 
                                     received as *mut u8, 

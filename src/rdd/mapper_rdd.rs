@@ -228,6 +228,7 @@ where
     
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
+        acc_arg.insert_rdd_id(cur_rdd_id);
         let part_id = split.get_index();
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
