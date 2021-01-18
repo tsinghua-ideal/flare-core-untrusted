@@ -135,7 +135,7 @@ pub unsafe extern "C" fn ocall_cache_to_outside(rdd_id: usize,
     data_ptr: usize,
 ) -> u8 {
     //need to clone from memory alloced by ucmalloc to memory alloced by default allocator
-    Env::get().cache_tracker.put_sdata((rdd_id, part_id, sub_part_id), data_ptr as *mut u8);
+    Env::get().cache_tracker.put_sdata((rdd_id, part_id, sub_part_id), data_ptr as *mut u8, 0);
     0  //need to revise
 }
 
@@ -370,11 +370,11 @@ pub fn cached_or_caching_in_enclave(rdd_id: usize, part: usize) -> HashSet<usize
 pub fn secure_compute_cached(
     acc_arg: &mut AccArg,
     cur_rdd_id: usize, 
-    part_id: usize, 
     tx: SyncSender<usize>,
     captured_vars: HashMap<usize, Vec<u8>>,
 ) -> Vec<JoinHandle<()>> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let part_id = acc_arg.part_id;
     //check whether it is cached inside enclave
     let mut cached_sub_parts = cached_or_caching_in_enclave(cur_rdd_id, part_id);
     //check whether it is cached outside enclave
@@ -394,13 +394,10 @@ pub fn secure_compute_cached(
     acc_arg.sub_parts_len = subpids.len();
     let mut handles = Vec::new();
     if cached_sub_parts.len() > 0 {
-        acc_arg.step_cached(true);
+        acc_arg.set_cached_rdd_id(cur_rdd_id);
         // Compute based on cached values
         let rdd_ids = acc_arg.rdd_ids.clone();
-        let caching_rdd_id = acc_arg.caching_rdd_id;
-        let steps_to_caching = acc_arg.steps_to_caching;
-        let steps_to_cached = acc_arg.steps_to_cached;
-        let mut cache_meta = CacheMeta::new(caching_rdd_id, cur_rdd_id, part_id, steps_to_caching, steps_to_cached);
+        let mut cache_meta = acc_arg.to_cache_meta();
         let is_shuffle = acc_arg.is_shuffle;
 
         let handle = std::thread::spawn(move || {
@@ -436,7 +433,6 @@ pub fn secure_compute_cached(
         });
         handles.push(handle);
     } else {
-        acc_arg.step_cached(false);
         acc_arg.set_caching_rdd_id(cur_rdd_id);
     }
     handles
@@ -446,28 +442,24 @@ pub fn secure_compute_cached(
 #[derive(Clone)]
 pub struct AccArg {
     pub rdd_ids: Vec<(usize, usize)>,
-    cur_cont_seg: usize, 
+    cur_cont_seg: usize,
+    part_id: usize,
     pub is_shuffle: u8,
-    pub caching_rdd_id: usize,
-    pub steps_to_caching: usize,
-    pub steps_to_cached: usize,
-    pub step_caching_end: bool,
-    pub step_cached_end: bool,
+    caching_rdd_id: usize,
+    cached_rdd_id: usize,
     pub cached_sub_parts: HashSet<usize>,
     pub sub_parts_len: usize,
 }
 
 impl AccArg {
-    pub fn new(final_rdd_id: usize, is_shuffle: u8, steps_to_caching: usize, steps_to_cached: usize) -> Self {
+    pub fn new(final_rdd_id: usize, part_id: usize, is_shuffle: u8) -> Self {
         AccArg {
             rdd_ids: vec![(final_rdd_id, final_rdd_id)],
             cur_cont_seg: 0,
+            part_id,
             is_shuffle,
             caching_rdd_id: 0,
-            steps_to_caching,
-            steps_to_cached,
-            step_caching_end: false,
-            step_cached_end: false,
+            cached_rdd_id: 0,
             cached_sub_parts: HashSet::new(),
             sub_parts_len: 0,
         }
@@ -484,22 +476,23 @@ impl AccArg {
         }
     }
 
-    fn step_caching(&mut self, should_cache: bool) {
-        let b = should_cache || self.step_caching_end;
-        match b {
-            true => self.step_caching_end = true,
-            false => self.steps_to_caching += 1,
+    //set the have_cached rdd and return whether the set is successfully
+    pub fn set_cached_rdd_id(&mut self, cached_rdd_id: usize) -> bool {
+        match self.cached_rdd_id == 0 {
+            true => {
+                self.cached_rdd_id = cached_rdd_id;
+                return true;
+            },
+            false => return false,
         }
-        println!("step_caching step = {:?}, end = {:?}", self.steps_to_caching, self.step_caching_end);
     }
 
-    fn step_cached(&mut self, have_cache: bool) {
-        let b = have_cache || self.step_cached_end;
-        match b {
-            true => self.step_cached_end = true,
-            false => self.steps_to_cached += 1,
-        }
-        println!("step_cachd step = {:?}, end = {:?}", self.steps_to_cached, self.step_cached_end);
+    pub fn to_cache_meta(&self) -> CacheMeta {
+        CacheMeta::new(
+            self.caching_rdd_id,
+            self.cached_rdd_id,
+            self.part_id,
+        )
     }
 
     pub fn totally_cached(&self) -> bool {
@@ -522,6 +515,10 @@ impl AccArg {
             *cur += 1;
         }
     }
+
+    pub fn is_caching_final_rdd(&self) -> bool {
+        self.rdd_ids[0].0 == self.caching_rdd_id
+    }
 }
 
 #[repr(C)]
@@ -531,29 +528,31 @@ pub struct CacheMeta {
     cached_rdd_id: usize,
     part_id: usize,
     sub_part_id: usize, 
-    steps_to_caching: usize, 
-    steps_to_cached: usize,
 }
 
 impl CacheMeta {
     pub fn new(caching_rdd_id: usize,
         cached_rdd_id: usize,
         part_id: usize,
-        steps_to_caching: usize,
-        steps_to_cached: usize,
     ) -> Self {
         CacheMeta {
             caching_rdd_id,
             cached_rdd_id,
             part_id,
-            sub_part_id: 0, 
-            steps_to_caching,
-            steps_to_cached,
+            sub_part_id: 0,
         }
     }
 
     pub fn set_sub_part_id(&mut self, sub_part_id: usize) {
         self.sub_part_id = sub_part_id;
+    }
+
+    pub fn get_triplet(&self) -> (usize, usize, usize) {
+        (
+            self.caching_rdd_id,
+            self.part_id,
+            self.sub_part_id,    
+        )
     }
 }
 
@@ -802,15 +801,29 @@ pub trait RddE: Rdd {
 
     fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let (tx, rx) = sync_channel(0);
-        let mut acc_arg = AccArg::new(self.get_rdd_id(), 0, 0, 0);
+        let rdd_id = self.get_rdd_id();
+        let part_id = split.get_index();
+        let mut acc_arg = AccArg::new(rdd_id, part_id, 0);
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
+        let caching = acc_arg.is_caching_final_rdd();
 
         let mut result = Vec::new();
+        let mut sub_part_id = 0;
         for received in rx {
             println!("in secure_iterator");
             let mut result_bl = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 0, received as *mut u8);
             *EENTER_LOCK.lock().unwrap() = false;
-            result.append(result_bl.borrow_mut());
+            if caching {
+                //collect result
+                result.extend_from_slice(&result_bl);
+                //cache
+                let size = result_bl.get_size();
+                let data_ptr = Box::into_raw(result_bl);
+                Env::get().cache_tracker.put_sdata((rdd_id, part_id, sub_part_id), data_ptr as *mut u8, size);
+            } else {
+                result.append(result_bl.borrow_mut());
+            }
+            sub_part_id += 1;
         }
         for handle in handles {
             handle.join().unwrap();
@@ -972,7 +985,7 @@ pub trait RddE: Rdd {
                 &mut result_ptr,
                 tid,
                 &rdd_ids as *const Vec<(usize, usize)> as *const u8,
-                CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
+                CacheMeta::new(0, 0, 0),  //meaningless
                 3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
@@ -1050,7 +1063,7 @@ pub trait RddE: Rdd {
                 &mut result_ptr,
                 tid,
                 &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
-                CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
+                CacheMeta::new(0, 0, 0),  //meaningless
                 3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
@@ -1128,7 +1141,7 @@ pub trait RddE: Rdd {
                 &mut result_ptr,
                 tid,
                 &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
-                CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
+                CacheMeta::new(0, 0, 0),  //meaningless
                 3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
@@ -1310,7 +1323,7 @@ pub trait RddE: Rdd {
                 &mut result_ptr,
                 tid,
                 &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
-                CacheMeta::new(0, 0, 0, 0, 0),  //meaningless
+                CacheMeta::new(0, 0, 0),  //meaningless
                 3,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,

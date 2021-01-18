@@ -446,7 +446,6 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
     }
 
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
-        let part_id = split.get_index();
         let cur_rdd_id = self.get_rdd_id();
         acc_arg.insert_rdd_id(cur_rdd_id);
 
@@ -458,10 +457,12 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                 let part = &*split
                     .downcast::<UnionSplit<T, TE>>()
                     .or(Err(Error::DowncastFailure("UnionSplit")))?;
+                let split = part.parent_partition();
                 let parent = &rdds[part.parent_rdd_index];
                 let rdd_id = parent.get_rdd_id();
-                let mut acc_arg_un = AccArg::new(rdd_id, 0, 0, 0);
-                let handle_uns = parent.secure_compute(part.parent_partition(), &mut acc_arg_un, tx_un.clone())?; 
+                let part_id = split.get_index();
+                let mut acc_arg_un = AccArg::new(rdd_id, part_id,0);
+                let handle_uns = parent.secure_compute(split, &mut acc_arg_un, tx_un.clone())?; 
                 
                 let acc_arg = acc_arg.clone();
                 let handle = std::thread::spawn(move || {
@@ -469,16 +470,11 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                     let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
                     
                     let mut sub_part_id = 0;
-                    let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
-                        0,   //indicate it cannot find the cached data
-                        part_id, 
-                        acc_arg.steps_to_caching,
-                        acc_arg.steps_to_cached,
-                    );
+                    let mut cache_meta = acc_arg.to_cache_meta();
                     for received in rx_un {
                         if !acc_arg.cached(&sub_part_id) {
                             cache_meta.set_sub_part_id(sub_part_id);
-                            BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
+                            BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
                                 secure_executing(
@@ -515,7 +511,8 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                 let mut handle_uns = Vec::new(); 
                 for (rdd, p) in iter {
                     let rdd_id = rdd.get_rdd_id();
-                    let mut acc_arg_un = AccArg::new(rdd_id, 0, 0, 0);
+                    let part_id = p.get_index();
+                    let mut acc_arg_un = AccArg::new(rdd_id, part_id, 0);
                     handle_uns.append(&mut rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un.clone())?);
                 }
 
@@ -524,16 +521,11 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                     let tid: u64 = thread::current().id().as_u64().into();
                     let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
                     let mut sub_part_id = 0;
-                    let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
-                        0,   //indicate it cannot find the cached data
-                        part_id, 
-                        acc_arg.steps_to_caching,
-                        acc_arg.steps_to_cached,
-                    );
+                    let mut cache_meta = acc_arg.to_cache_meta();
                     for received in rx_un {
                         if !acc_arg.cached(&sub_part_id) {
                             cache_meta.set_sub_part_id(sub_part_id);
-                            BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
+                            BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
                                 secure_executing(

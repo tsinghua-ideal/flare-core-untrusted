@@ -511,12 +511,7 @@ impl Rdd for LocalFsReader<BytesReader> {
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
             let mut sub_part_id = 0;
-            let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
-                0,   //indicate it cannot find the cached data
-                idx,
-                acc_arg.steps_to_caching,
-                acc_arg.steps_to_cached,
-            );
+            let mut cache_meta = acc_arg.to_cache_meta();
             //TODO need to sub-partition
             let block_len = len; //temporary 
             let mut cur = 0;
@@ -527,7 +522,7 @@ impl Rdd for LocalFsReader<BytesReader> {
                 };
                 if !acc_arg.cached(&sub_part_id) {
                     cache_meta.set_sub_part_id(sub_part_id);
-                    BOUNDED_MEM_CACHE.insert_subpid(acc_arg.caching_rdd_id, idx, sub_part_id);
+                    BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                     let block = Box::new((&data[cur..next]).to_vec());
                     let block_ptr = Box::into_raw(block);
                     let mut result_bl_ptr: usize = 0;

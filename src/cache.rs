@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use serde_derive::{Deserialize, Serialize};
 
 use crate::env::RDDB_MAP;
+use crate::rdd::CacheMeta;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum CachePutResponse {
@@ -93,13 +94,19 @@ impl BoundedMemoryCache {
         dataset_id: (usize, usize),
         part_id: usize,
         sub_part_id: usize,
-        value: *mut u8,
+        value_ptr: *mut u8,
+        avoid_moving: usize, //0 for need, and >0 for size in case of no need
     ) -> CachePutResponse {
         let rdd_base = match RDDB_MAP.get_rddb(dataset_id.1) {
             Some(rdd_base) => rdd_base,
             None => return CachePutResponse::CachePutFailure,
         };
-        let (value, size) = rdd_base.move_allocation(value);
+        let (value, size) = if avoid_moving == 0 {
+            rdd_base.move_allocation(value_ptr)
+        } else {
+            (value_ptr, avoid_moving)
+        };
+
         let key = (dataset_id, part_id, sub_part_id);
         if size as f64 / (1000.0 * 1000.0) > self.max_mbytes as f64 {
             if let Some(subpids) = self.subpid_map.get(&(dataset_id.1, part_id)) {
@@ -134,7 +141,8 @@ impl BoundedMemoryCache {
         }
     }
 
-    pub fn insert_subpid(&self, rdd_id: usize, part_id: usize, sub_part_id: usize) {
+    pub fn insert_subpid(&self, cache_meta: &CacheMeta) {
+        let (rdd_id, part_id, sub_part_id) = cache_meta.get_triplet();
         if let Some(mut set) = self.subpid_map.get_mut(&(rdd_id, part_id)) {
             set.insert(sub_part_id);
             return;
@@ -194,9 +202,9 @@ impl<'a> KeySpace<'a> {
     pub fn sget(&self, dataset_id: usize, part_id: usize, sub_part_id: usize) -> Option<usize> {
         self.cache.sget((self.key_space_id, dataset_id), part_id, sub_part_id)
     }
-    pub fn sput(&self, dataset_id: usize, part_id: usize, sub_part_id: usize, value: *mut u8) -> CachePutResponse {
+    pub fn sput(&self, dataset_id: usize, part_id: usize, sub_part_id: usize, value: *mut u8, avoid_moving: usize) -> CachePutResponse {
         self.cache
-            .sput((self.key_space_id, dataset_id), part_id, sub_part_id, value)
+            .sput((self.key_space_id, dataset_id), part_id, sub_part_id, value, avoid_moving)
     }
     pub fn get_capacity(&self) -> usize {
         self.cache.max_mbytes

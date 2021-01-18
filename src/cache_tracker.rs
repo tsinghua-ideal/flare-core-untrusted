@@ -363,9 +363,10 @@ impl CacheTracker {
         &self,
         key: (usize, usize, usize),
         value: *mut u8,
+        avoid_moving: usize,
     ) {
         let (rdd_id, part_id, sub_part_id) = key;
-        let put_response = self.cache.sput(rdd_id, part_id, sub_part_id, value);
+        let put_response = self.cache.sput(rdd_id, part_id, sub_part_id, value, avoid_moving);
         if let CachePutResponse::CachePutSuccess(size) = put_response {
             futures::executor::block_on(self.client(CacheTrackerMessage::AddedToCache {
                 rdd_id: rdd_id,

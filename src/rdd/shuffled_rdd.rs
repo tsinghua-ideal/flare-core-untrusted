@@ -286,12 +286,7 @@ where
             }
             
             let mut sub_part_id = 0;
-            let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
-                0,   //indicate it cannot find the cached data
-                part_id,
-                acc_arg.steps_to_caching,
-                acc_arg.steps_to_cached,
-            );
+            let mut cache_meta = acc_arg.to_cache_meta();
             while !iter_vec.is_empty() {
                 //get block (memory inefficient)
                 blocks.clear();
@@ -312,7 +307,7 @@ where
                 
                 if !acc_arg.cached(&sub_part_id) {
                     cache_meta.set_sub_part_id(sub_part_id);
-                    BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
+                    BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                     let block_ptr = Box::into_raw(Box::new(blocks));
                     let mut result_bl_ptr: usize = 0; 
                     let sgx_status = unsafe {

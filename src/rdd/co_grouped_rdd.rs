@@ -399,11 +399,10 @@ where
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let cur_rdd_id = self.get_rdd_id();
-            let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
             acc_arg.insert_rdd_id(cur_rdd_id);
+            let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
             let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
 
-            let part_id = split.get_index();
             println!("secure_compute in co_group_rdd");
             let mut deps = split.clone().deps;
             let mut chunk_size = 0; 
@@ -412,7 +411,7 @@ where
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), 0, 0, 0);
+                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), split.get_index(), 0);
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_rdd_id(), 0, received as *mut u8);
@@ -443,7 +442,7 @@ where
             match deps.remove(0) {    //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), 0, 0, 0);
+                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), split.get_index(), 0);
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_rdd_id(), 0, received as *mut u8);
@@ -486,12 +485,7 @@ where
                 let mut block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     
                 let mut sub_part_id = 0;
-                let mut cache_meta = CacheMeta::new(acc_arg.caching_rdd_id,
-                    0,   //indicate it cannot find the cached data
-                    part_id, 
-                    acc_arg.steps_to_caching,
-                    acc_arg.steps_to_cached,
-                );
+                let mut cache_meta = acc_arg.to_cache_meta();
                 while !(kv_iter.0.is_empty() && kv_iter.1.is_empty() && 
                         kw_iter.0.is_empty() && kw_iter.1.is_empty() ) 
                 {
@@ -503,7 +497,7 @@ where
 
                     if !acc_arg.cached(&sub_part_id) {
                         cache_meta.set_sub_part_id(sub_part_id);
-                        BOUNDED_MEM_CACHE.insert_subpid(cache_meta.caching_rdd_id, part_id, sub_part_id);
+                        BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                         let block_ptr = Box::into_raw(Box::new(block));
                         let mut result_bl_ptr: usize = 0;
                         let sgx_status = unsafe {

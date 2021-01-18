@@ -201,7 +201,7 @@ where
             log::debug!("split index: {}", split.get_index());
             let (tx, rx) = mpsc::sync_channel(0);
             let rdd_id = rdd_base.get_rdd_id();
-            let mut acc_arg = AccArg::new(rdd_id, 1, 0, 0);
+            let mut acc_arg = AccArg::new(rdd_id, partition, 1);
             let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
             let now = Instant::now();
             let num_output_splits = self.partitioner.get_num_of_partitions();
