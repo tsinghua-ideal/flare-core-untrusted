@@ -520,8 +520,10 @@ impl Rdd for LocalFsReader<BytesReader> {
                     true => len,
                     false => cur + block_len,
                 };
+                let is_survivor = next == len; 
                 if !acc_arg.cached(&sub_part_id) {
                     cache_meta.set_sub_part_id(sub_part_id);
+                    cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                     let block = Box::new((&data[cur..next]).to_vec());
                     let block_ptr = Box::into_raw(block);

@@ -1,5 +1,5 @@
 use std::net::Ipv4Addr;
-use std::sync::{Arc, mpsc::{sync_channel, SyncSender}};
+use std::sync::{Arc, mpsc::{sync_channel, TryRecvError ,SyncSender}};
 use std::thread::JoinHandle;
 
 use itertools::{Itertools, MinMaxResult};
@@ -471,9 +471,14 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                     
                     let mut sub_part_id = 0;
                     let mut cache_meta = acc_arg.to_cache_meta();
-                    for received in rx_un {
+                    let mut r = rx_un.recv();
+                    while r.is_ok() {
+                        //The last connected one will survive in cache
+                        let r_next = rx_un.try_recv();
+                        let is_survivor = r_next == Err(TryRecvError::Disconnected);
                         if !acc_arg.cached(&sub_part_id) {
                             cache_meta.set_sub_part_id(sub_part_id);
+                            cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
@@ -484,13 +489,18 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                                     &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8, 
                                     cache_meta,
                                     acc_arg.is_shuffle, 
-                                    received as *mut u8, 
+                                    r.unwrap() as *mut u8, 
                                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                                 )
                             };
                             tx.send(result_bl_ptr).unwrap();
                         }
                         sub_part_id += 1;
+                        if r_next.is_ok() {  // this branch is unreachable actually
+                            r = Ok(r_next.unwrap());
+                        } else {
+                            r = rx_un.recv();
+                        }
                     }
                     for handle_un in handle_uns {
                         handle_un.join().unwrap();
@@ -522,9 +532,14 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                     let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
                     let mut sub_part_id = 0;
                     let mut cache_meta = acc_arg.to_cache_meta();
-                    for received in rx_un {
+                    let mut r = rx_un.recv();
+                    while r.is_ok() {
+                        //The last connected one will survive in cache
+                        let r_next = rx_un.try_recv();
+                        let is_survivor = r_next == Err(TryRecvError::Disconnected);
                         if !acc_arg.cached(&sub_part_id) {
                             cache_meta.set_sub_part_id(sub_part_id);
+                            cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
@@ -535,13 +550,18 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                                     &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8, 
                                     cache_meta,
                                     acc_arg.is_shuffle, 
-                                    received as *mut u8, 
+                                    r.unwrap() as *mut u8, 
                                     &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                                 )
                             };
                             tx.send(result_bl_ptr).unwrap();
                         }
                         sub_part_id += 1;
+                        if r_next.is_ok() {  // this branch is unreachable actually
+                            r = Ok(r_next.unwrap());
+                        } else {
+                            r = rx_un.recv();
+                        }
                     }
 
                     for handle_un in handle_uns {
