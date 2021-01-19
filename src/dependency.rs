@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::forget;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, atomic, mpsc};
 use std::time::{Duration, Instant};
 
 // Revise if enum is good choice. Considering enum since down casting one trait object to another trait object is difficult.
@@ -201,7 +201,7 @@ where
             log::debug!("split index: {}", split.get_index());
             let (tx, rx) = mpsc::sync_channel(0);
             let rdd_id = rdd_base.get_rdd_id();
-            let mut acc_arg = AccArg::new(rdd_id, partition, 1);
+            let mut acc_arg = AccArg::new(rdd_id, partition, 11);  //10 and 11 have the same effect, always need_encryption
             let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
             let now = Instant::now();
             let num_output_splits = self.partitioner.get_num_of_partitions();
@@ -211,7 +211,7 @@ where
 
             for block_ptr in rx { 
                 let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_id, 1, block_ptr as *mut u8);
-                *EENTER_LOCK.lock().unwrap() = false;
+                assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
                 for (i, bucket) in buckets_bl.into_iter().enumerate() {
                     buckets[i].push(bucket); 
                 }

@@ -461,7 +461,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                 let parent = &rdds[part.parent_rdd_index];
                 let rdd_id = parent.get_rdd_id();
                 let part_id = split.get_index();
-                let mut acc_arg_un = AccArg::new(rdd_id, part_id,0);
+                let mut acc_arg_un = AccArg::new(rdd_id, part_id,00);
                 let handle_uns = parent.secure_compute(split, &mut acc_arg_un, tx_un.clone())?; 
                 
                 let acc_arg = acc_arg.clone();
@@ -512,7 +512,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                 for (rdd, p) in iter {
                     let rdd_id = rdd.get_rdd_id();
                     let part_id = p.get_index();
-                    let mut acc_arg_un = AccArg::new(rdd_id, part_id, 0);
+                    let mut acc_arg_un = AccArg::new(rdd_id, part_id, 00);
                     handle_uns.append(&mut rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un.clone())?);
                 }
 

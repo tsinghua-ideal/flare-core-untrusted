@@ -70,9 +70,7 @@ pub use union_rdd::*;
 
 pub const MAX_ENC_BL: usize = 1000;
 static immediate_cout: bool = true;
-lazy_static! {
-    pub static ref EENTER_LOCK: Arc<std::sync::Mutex<bool>> = Arc::new(std::sync::Mutex::new(false));
-}
+pub static EENTER_LOCK: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
     pub fn secure_executing(
@@ -406,7 +404,7 @@ pub fn secure_compute_cached(
                 cache_meta.set_sub_part_id(sub_part);
                 let data_ptr: usize = 0;  //invalid pointer
                 let mut result_ptr: usize = 0;
-                while *EENTER_LOCK.lock().unwrap() {
+                while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                     //wait
                 }
                 let sgx_status = unsafe {
@@ -421,7 +419,6 @@ pub fn secure_compute_cached(
                         &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                     )
                 };
-                *EENTER_LOCK.lock().unwrap() =  true;
                 match sgx_status {
                     sgx_status_t::SGX_SUCCESS => {},
                     _ => {
@@ -528,6 +525,7 @@ pub struct CacheMeta {
     cached_rdd_id: usize,
     part_id: usize,
     sub_part_id: usize, 
+    is_survivor: u8,
 }
 
 impl CacheMeta {
@@ -540,11 +538,19 @@ impl CacheMeta {
             cached_rdd_id,
             part_id,
             sub_part_id: 0,
+            is_survivor: 0,
         }
     }
 
     pub fn set_sub_part_id(&mut self, sub_part_id: usize) {
         self.sub_part_id = sub_part_id;
+    }
+
+    pub fn set_is_survivor(&mut self, is_survivor: bool) {
+        match is_survivor {
+            true => self.is_survivor = 1,
+            false => self.is_survivor = 0,
+        }
     }
 
     pub fn get_triplet(&self) -> (usize, usize, usize) {
@@ -803,7 +809,7 @@ pub trait RddE: Rdd {
         let (tx, rx) = sync_channel(0);
         let rdd_id = self.get_rdd_id();
         let part_id = split.get_index();
-        let mut acc_arg = AccArg::new(rdd_id, part_id, 0);
+        let mut acc_arg = AccArg::new(rdd_id, part_id, 01);
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
@@ -811,8 +817,8 @@ pub trait RddE: Rdd {
         let mut sub_part_id = 0;
         for received in rx {
             println!("in secure_iterator");
-            let mut result_bl = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 0, received as *mut u8);
-            *EENTER_LOCK.lock().unwrap() = false;
+            let mut result_bl = get_encrypted_data::<Self::ItemE>(rdd_id, acc_arg.is_shuffle, received as *mut u8);
+            assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
             if caching {
                 //collect result
                 result.extend_from_slice(&result_bl);
@@ -986,7 +992,7 @@ pub trait RddE: Rdd {
                 tid,
                 &rdd_ids as *const Vec<(usize, usize)> as *const u8,
                 CacheMeta::new(0, 0, 0),  //meaningless
-                3,   //3 is for reduce & fold
+                31,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )
@@ -1064,7 +1070,7 @@ pub trait RddE: Rdd {
                 tid,
                 &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
                 CacheMeta::new(0, 0, 0),  //meaningless
-                3,   //3 is for reduce & fold
+                31,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )
@@ -1142,7 +1148,7 @@ pub trait RddE: Rdd {
                 tid,
                 &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
                 CacheMeta::new(0, 0, 0),  //meaningless
-                3,   //3 is for reduce & fold
+                31,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )
@@ -1324,7 +1330,7 @@ pub trait RddE: Rdd {
                 tid,
                 &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
                 CacheMeta::new(0, 0, 0),  //meaningless
-                3,   //3 is for reduce & fold
+                31,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
             )

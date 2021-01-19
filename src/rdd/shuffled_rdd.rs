@@ -304,12 +304,17 @@ where
                 for idx in empty_idxs {
                     iter_vec.remove(idx);
                 }
+                let is_survivor = blocks.is_empty();
                 
                 if !acc_arg.cached(&sub_part_id) {
                     cache_meta.set_sub_part_id(sub_part_id);
+                    cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                     let block_ptr = Box::into_raw(Box::new(blocks));
-                    let mut result_bl_ptr: usize = 0; 
+                    let mut result_bl_ptr: usize = 0;
+                    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+                        //wait
+                    } 
                     let sgx_status = unsafe {
                         secure_executing(
                             eid,
@@ -317,7 +322,7 @@ where
                             tid,
                             &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
                             cache_meta,    //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
-                            2,   //shuffle read
+                            20,   //shuffle read
                             block_ptr as *mut u8, 
                             &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                         )

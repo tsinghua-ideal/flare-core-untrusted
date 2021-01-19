@@ -88,16 +88,18 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     true => len,
                     false => cur + block_len,
                 };
-                
+                let is_survivor = next == len; 
+                println!("is_survivor = {:?}", is_survivor);
                 //currently, all sub_partitions are not cached as long as coming to this rdd
                 if !acc_arg.cached(&sub_part_id) {  
                     cache_meta.set_sub_part_id(sub_part_id);
+                    cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                     let now = Instant::now();
                     let block = Box::new((&data[cur..next]).to_vec());
                     let block_ptr = Box::into_raw(block);
                     let mut result_bl_ptr: usize = 0;
-                    while *EENTER_LOCK.lock().unwrap() {
+                    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                         //wait
                     }
                     println!("rdd ids(before secure_executing) {:?}", acc_arg.rdd_ids);
@@ -113,7 +115,6 @@ impl<T: Data> ParallelCollectionSplit<T> {
                             &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
                         )
                     };
-                    *EENTER_LOCK.lock().unwrap() =  true;
 
                     let _block = unsafe{ Box::from_raw(block_ptr) };
                     let _r = match sgx_status {
