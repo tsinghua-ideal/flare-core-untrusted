@@ -374,21 +374,33 @@ pub fn secure_compute_cached(
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let part_id = acc_arg.part_id;
     //check whether it is cached inside enclave
-    let mut cached_sub_parts = cached_or_caching_in_enclave(cur_rdd_id, part_id);
+    let cached_sub_parts_in = cached_or_caching_in_enclave(cur_rdd_id, part_id);
     //check whether it is cached outside enclave
-    let mut uncached_sub_parts = Env::get().cache_tracker.get_uncached_subpids(cur_rdd_id, part_id);
-    uncached_sub_parts = uncached_sub_parts.difference(&cached_sub_parts)
+    let uncached_sub_parts = Env::get().cache_tracker
+        .get_uncached_subpids(cur_rdd_id, part_id)
+        .difference(&cached_sub_parts_in)
         .map(|x| *x)
         .collect::<HashSet<_>>();
+    let mut cached_sub_parts_out = Env::get().cache_tracker
+        .get_cached_subpids(cur_rdd_id, part_id)
+        .difference(&cached_sub_parts_in)
+        .map(|x| *x)
+        .collect::<Vec<_>>();
+    let mut cached_sub_parts = cached_sub_parts_in.into_iter().collect::<Vec<_>>();
+    cached_sub_parts.append(&mut cached_sub_parts_out);
+    // this cannot guarantee that cached data in enclave is used first
+    /*
     cached_sub_parts = cached_sub_parts.union(&Env::get().cache_tracker.get_cached_subpids(cur_rdd_id, part_id))
         .map(|x| *x)
         .collect::<HashSet<_>>();
+    */
+    
     println!("get_subpids {:?}, {:?}", cur_rdd_id, part_id);
     let subpids = Env::get().cache_tracker.get_subpids(cur_rdd_id, part_id);
     println!("subpids = {:?}, cached = {:?}, uncached = {:?}", subpids, cached_sub_parts, uncached_sub_parts);
     assert_eq!(uncached_sub_parts.len() + cached_sub_parts.len(), subpids.len());
 
-    acc_arg.cached_sub_parts = cached_sub_parts.clone();
+    acc_arg.cached_sub_parts = cached_sub_parts.clone().into_iter().collect::<HashSet<_>>();
     acc_arg.sub_parts_len = subpids.len();
     let mut handles = Vec::new();
     if cached_sub_parts.len() > 0 {
