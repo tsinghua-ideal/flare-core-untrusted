@@ -127,7 +127,7 @@ pub(crate) struct Env {
     pub cache_tracker: Arc<CacheTracker>,
     pub enclave: Arc<Mutex<Option<SgxEnclave>>>,
     pub enclave_path: PathBuf,
-    pub captured_vars: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
+    pub captured_vars: Arc<Mutex<HashMap<usize, Vec<Vec<u8>>>>>,
 }
 
 impl Env {

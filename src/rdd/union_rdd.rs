@@ -490,7 +490,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                                     cache_meta,
                                     acc_arg.is_shuffle, 
                                     r.unwrap() as *mut u8, 
-                                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                                    &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                                 )
                             };
                             tx.send(result_bl_ptr).unwrap();
@@ -551,7 +551,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                                     cache_meta,
                                     acc_arg.is_shuffle, 
                                     r.unwrap() as *mut u8, 
-                                    &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                                    &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                                 )
                             };
                             tx.send(result_bl_ptr).unwrap();

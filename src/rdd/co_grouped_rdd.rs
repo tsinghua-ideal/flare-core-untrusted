@@ -516,7 +516,7 @@ where
                                 cache_meta, //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
                                 20, //shuffle read and no encryption for result
                                 block_ptr as *mut u8,
-                                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                             )
                         };
                         let _r = match sgx_status {
@@ -546,7 +546,7 @@ where
                                 cache_meta,
                                 acc_arg.is_shuffle,  
                                 block_ptr,
-                                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                             )
                         };
                         match sgx_status {

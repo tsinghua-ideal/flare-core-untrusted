@@ -112,7 +112,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                             cache_meta,
                             acc_arg.is_shuffle,  
                             block_ptr as *mut u8,
-                            &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                            &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                         )
                     };
 

@@ -4,15 +4,16 @@
     coerce_unsized,
     core_intrinsics,
     fn_traits,
+    map_first_last,
     never_type,
     proc_macro_hygiene,
     specialization,
     thread_id_value,
+    type_ascription,
     unboxed_closures,
     unsize,
     vec_into_raw_parts,
-    vec_resize_default,
-    map_first_last
+    vec_resize_default
 )]
 #![allow(dead_code, where_clauses_object_safety, deprecated)]
 #![allow(clippy::single_component_path_imports)]

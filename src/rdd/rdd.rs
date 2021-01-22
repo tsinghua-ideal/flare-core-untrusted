@@ -369,7 +369,7 @@ pub fn secure_compute_cached(
     acc_arg: &mut AccArg,
     cur_rdd_id: usize, 
     tx: SyncSender<usize>,
-    captured_vars: HashMap<usize, Vec<u8>>,
+    captured_vars: HashMap<usize, Vec<Vec<u8>>>,
 ) -> Vec<JoinHandle<()>> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let part_id = acc_arg.part_id;
@@ -428,7 +428,7 @@ pub fn secure_compute_cached(
                         cache_meta,
                         is_shuffle,   
                         data_ptr as *mut u8 ,
-                        &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                        &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                     )
                 };
                 match sgx_status {
@@ -1006,7 +1006,7 @@ pub trait RddE: Rdd {
                 CacheMeta::new(0, 0, 0),  //meaningless
                 31,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
-                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             )
         };
         let _data = unsafe{ Box::from_raw(data_ptr) };
@@ -1084,7 +1084,7 @@ pub trait RddE: Rdd {
                 CacheMeta::new(0, 0, 0),  //meaningless
                 31,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
-                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             )
         };
         let _data = unsafe{ Box::from_raw(data_ptr) };
@@ -1162,7 +1162,7 @@ pub trait RddE: Rdd {
                 CacheMeta::new(0, 0, 0),  //meaningless
                 31,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
-                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             )
         };
         let _data = unsafe{ Box::from_raw(data_ptr) };
@@ -1344,7 +1344,7 @@ pub trait RddE: Rdd {
                 CacheMeta::new(0, 0, 0),  //meaningless
                 31,   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
-                &captured_vars as *const HashMap<usize, Vec<u8>> as *const u8,
+                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             )
         };
         let _data = unsafe{ Box::from_raw(data_ptr) };

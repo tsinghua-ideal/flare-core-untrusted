@@ -354,7 +354,16 @@ impl<'de, Args: 'static, Output: 'static> serde::de::Deserialize<'de>
 impl<Args: 'static, Output: 'static> Peep 
     for boxed::Box<dyn Func<Args, Output = Output>>
 {
-    fn get_ser_captured_var(&self) -> Vec<u8> {
+    fn get_ser_captured_var(&self) -> Vec<Vec<u8>> {
         (**self).get_ser_captured_var()
     }
+    
+    fn deser_captured_var(&mut self, ser: &Vec<Vec<u8>>) {
+        (**self).deser_captured_var(ser)
+    }
+
+    fn has_captured_var(&self) -> bool {
+        (**self).has_captured_var()
+    }
+    
 }
