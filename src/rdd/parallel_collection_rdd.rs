@@ -69,6 +69,9 @@ impl<T: Data> ParallelCollectionSplit<T> {
     fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
+        if len == 0 {
+            return std::thread::spawn(|| {});
+        }
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
         let data_size = data.get_aprox_size() / len;
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());

@@ -979,10 +979,13 @@ pub trait RddE: Rdd {
         result
     }
 
-    fn secure_reduce<F>(&self, f: F) -> Result<Option<Self::ItemE>> 
+    fn secure_reduce<F, UE, FE, FD>(&self, f: F, fe: FE, fd: FD) -> Result<Option<UE>> 
     where
         Self: Sized,
+        UE: Data,
         F: SerFunc(Self::Item, Self::Item) -> Self::Item,
+        FE: SerFunc(Vec<Self::Item>) -> UE,
+        FD: SerFunc(UE) -> Vec<Self::Item>,
     {
 
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
@@ -1018,7 +1021,7 @@ pub trait RddE: Rdd {
         };
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in reduce, ecall {:?}s", dur);
-        let temp = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 3, result_ptr as *mut u8);
+        let temp = get_encrypted_data::<UE>(self.get_rdd_id(), 31, result_ptr as *mut u8);
         let result = match temp.is_empty() {
             true => None,
             false => Some(temp[0].clone()),
@@ -1058,10 +1061,13 @@ pub trait RddE: Rdd {
         Ok(results?.into_iter().fold(init, f))
     }
 
-    fn secure_fold<F>(&self, init: Self::Item, f: F) -> Result<Self::ItemE> 
+    fn secure_fold<F, UE, FE, FD>(&self, init: Self::Item, f: F, fe: FE, fd: FD) -> Result<UE> 
     where
         Self: Sized,
+        UE: Data,
         F: SerFunc(Self::Item, Self::Item) -> Self::Item,
+        FE: SerFunc(Vec<Self::Item>) -> UE,
+        FD: SerFunc(UE) -> Vec<Self::Item>,
     {
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
         let data = self.get_context().run_job(self.get_rdde(), cl)?
@@ -1096,7 +1102,7 @@ pub trait RddE: Rdd {
         };
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in fold, ecall {:?}s", dur);
-        let mut temp = get_encrypted_data::<Self::ItemE>(self.get_rdd_id(), 3, result_ptr as *mut u8);
+        let mut temp = get_encrypted_data::<UE>(self.get_rdd_id(), 31, result_ptr as *mut u8);
         //temp only contains one element
         Ok(temp.pop().unwrap())
     }
@@ -1174,7 +1180,7 @@ pub trait RddE: Rdd {
         };
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in aggregate, ecall {:?}s", dur);
-        let mut temp = get_encrypted_data::<UE>(self.get_rdd_id(), 3, result_ptr as *mut u8);
+        let mut temp = get_encrypted_data::<UE>(self.get_rdd_id(), 31, result_ptr as *mut u8);
         //temp only contains one element
         Ok(temp.pop().unwrap())
     }
@@ -1357,7 +1363,7 @@ pub trait RddE: Rdd {
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in aggregate, ecall {:?}s", dur);
         /*
-        let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 3, result_ptr as *mut u8);
+        let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 31, result_ptr as *mut u8);
         //temp only contains one element
         Ok(temp.pop().unwrap())
         */
