@@ -115,6 +115,7 @@ where
         let secure = rdd0.get_secure() || rdd1.get_secure() ;  //
 
         let mut vals = RddVals::new(context.clone(), secure);
+        let cur_rdd_id = vals.id;
         let mut deps = Vec::new();
 
         if rdd0.partitioner()
@@ -136,6 +137,8 @@ where
                     rdd_base,
                     aggr,
                     part.clone(),
+                    0,
+                    cur_rdd_id,
                 )) as Arc<dyn ShuffleDependencyTrait>,
             ));
         }
@@ -159,6 +162,8 @@ where
                     rdd_base,
                     aggr,
                     part.clone(),
+                    1,
+                    cur_rdd_id,
                 )) as Arc<dyn ShuffleDependencyTrait>,
             ));
         }
@@ -401,7 +406,6 @@ where
             let cur_rdd_id = self.get_rdd_id();
             acc_arg.insert_rdd_id(cur_rdd_id);
             let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
-            let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
 
             println!("secure_compute in co_group_rdd");
             let mut deps = split.clone().deps;
@@ -411,10 +415,10 @@ where
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), split.get_index(), 01);
+                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), split.get_index(), DepInfo::padding_new(01));
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
-                        let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_rdd_id(), acc_arg_cg.is_shuffle, received as *mut u8);
+                        let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_rdd_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         if result_bl.len() != 0 {
                             chunk_size += result_bl.get_aprox_size() / result_bl.len();
                             num_sub_part += 1;
@@ -442,10 +446,10 @@ where
             match deps.remove(0) {    //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), split.get_index(), 01);
+                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), split.get_index(), DepInfo::padding_new(01));
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
-                        let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_rdd_id(), acc_arg_cg.is_shuffle, received as *mut u8);
+                        let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_rdd_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         if result_bl.len() != 0 {
                             chunk_size += result_bl.get_aprox_size() / result_bl.len();
                             num_sub_part += 1;
@@ -472,7 +476,6 @@ where
 
             let acc_arg = acc_arg.clone();
             let handle = std::thread::spawn(move || {
-                let tid: u64 = thread::current().id().as_u64().into();
                 let now = Instant::now();
                 let mut kv_iter = (Vec::new(), Vec::new());
                 let mut kw_iter = (Vec::new(), Vec::new());
@@ -482,69 +485,55 @@ where
                 init_chunks(&kw.0, &mut kw_iter.0, chunk_len);
                 init_chunks(&kw.1, &mut kw_iter.1, chunk_len);
 
-                let mut block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                
     
                 let mut sub_part_id = 0;
                 let mut cache_meta = acc_arg.to_cache_meta();
                 while !(kv_iter.0.is_empty() && kv_iter.1.is_empty() && 
                         kw_iter.0.is_empty() && kw_iter.1.is_empty() ) 
                 {
+                    let mut block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
                     //get block (memory inefficient)
                     step_forward(&mut block.0, &mut kv_iter.0);
                     step_forward(&mut block.1, &mut kv_iter.1);
                     step_forward(&mut block.2, &mut kw_iter.0);
                     step_forward(&mut block.3, &mut kw_iter.1);
 
-                    let is_survivor = block.0.is_empty() && block.1.is_empty() 
+                    let mut is_survivor = block.0.is_empty() && block.1.is_empty() 
                         && block.2.is_empty() && block.3.is_empty(); 
 
                     if !acc_arg.cached(&sub_part_id) {
+                        let mut result_bl_ptr = wrapper_secure_execute(
+                            &rdd_ids,
+                            cache_meta, //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
+                            DepInfo::padding_new(20), //shuffle read and no encryption for result
+                            Box::new(block),
+                            &captured_vars,
+                        );
+                        let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+                            acc_arg.get_final_rdd_id(), 
+                            cache_meta, 
+                            acc_arg.dep_info,
+                        );
+                        if spec_call_seq_ptr != 0 {
+                            is_survivor = true;
+                        }
                         cache_meta.set_sub_part_id(sub_part_id);
                         cache_meta.set_is_survivor(is_survivor);
                         BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                        let block_ptr = Box::into_raw(Box::new(block));
-                        let mut result_bl_ptr: usize = 0;
-                        while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                            //wait
-                        }
-                        let sgx_status = unsafe {
-                            secure_executing(
-                                eid,
-                                &mut result_bl_ptr,
-                                tid,
-                                &rdd_ids as *const Vec<(usize, usize)> as *const u8,
-                                cache_meta, //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
-                                20, //shuffle read and no encryption for result
-                                block_ptr as *mut u8,
-                                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-                            )
-                        };
-                        let _r = match sgx_status {
-                            sgx_status_t::SGX_SUCCESS => {},
-                            _ => {
-                                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                            },
-                        };
-                                        
-                        block = *unsafe{ Box::from_raw(block_ptr) };
-                        let _r = match sgx_status {
-                            sgx_status_t::SGX_SUCCESS => {},
-                            _ => {
-                                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                            },
-                        };
-                        
                         // this block is in enclave, cannot access
                         let block_ptr = result_bl_ptr as *mut u8;
+                        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
                         result_bl_ptr = 0;
+                        let tid: u64 = thread::current().id().as_u64().into();
                         let sgx_status = unsafe {
-                            secure_executing(
+                            secure_execute(
                                 eid,
                                 &mut result_bl_ptr,
                                 tid,
                                 &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8,
                                 cache_meta,
-                                acc_arg.is_shuffle,  
+                                acc_arg.dep_info,  
                                 block_ptr,
                                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                             )
@@ -555,6 +544,11 @@ where
                                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                             },
                         };
+                        wrapper_spec_execute(
+                            spec_call_seq_ptr, 
+                            cache_meta, 
+                            0 as *mut u8,
+                        );
                         tx.send(result_bl_ptr).unwrap();
 
                     }
@@ -610,7 +604,6 @@ pub fn init_chunks<'a, T: Clone>(v: &'a Vec<Vec<T>>, iter_vec: &mut Vec<Chunks<'
 }
 
 pub fn step_forward<T: Clone>(blocks: &mut Vec<Vec<T>>, iter_vec: &mut Vec<Chunks<T>>) {
-    blocks.clear();
     let mut empty_idxs = Vec::new();
     for (idx, iter) in iter_vec.iter_mut().enumerate() {
         let nxt = iter.next();

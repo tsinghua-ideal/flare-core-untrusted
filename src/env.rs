@@ -34,6 +34,8 @@ extern "C" {
 
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
 type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
+/// The key is: {parent_rdd_id}/{parent_op_id}/{child_rdd_id}/{child_op_id}/{input_id(part_id)}
+type SpecShuffleCache =  Arc<DashMap<(usize, usize, usize, usize, usize), Vec<Vec<Vec<u8>>> >>;
 
 
 const ENV_VAR_PREFIX: &str = "VEGA_";
@@ -43,6 +45,7 @@ static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);
 
 pub(crate) static SHUFFLE_CACHE: Lazy<ShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
+pub(crate) static SPEC_SHUFFLE_CACHE: Lazy<SpecShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
 pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(BoundedMemoryCache::new);
 pub(crate) static RDDB_MAP: Lazy<RddBMap> = Lazy::new(|| RddBMap::new()); 
 

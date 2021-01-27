@@ -506,10 +506,8 @@ impl Rdd for LocalFsReader<BytesReader> {
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.get_rdd_id();
         acc_arg.insert_rdd_id(cur_rdd_id);
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
-            let tid: u64 = thread::current().id().as_u64().into();
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
             //TODO need to sub-partition
@@ -520,33 +518,32 @@ impl Rdd for LocalFsReader<BytesReader> {
                     true => len,
                     false => cur + block_len,
                 };
-                let is_survivor = next == len; 
+                let mut is_survivor = next == len; 
                 if !acc_arg.cached(&sub_part_id) {
+                    let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+                        acc_arg.get_final_rdd_id(), 
+                        cache_meta, 
+                        acc_arg.dep_info,
+                    );
+                    if spec_call_seq_ptr != 0 {
+                        is_survivor = true;
+                    }
                     cache_meta.set_sub_part_id(sub_part_id);
                     cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                     let block = Box::new((&data[cur..next]).to_vec());
-                    let block_ptr = Box::into_raw(block);
-                    let mut result_bl_ptr: usize = 0;
-                    let sgx_status = unsafe {
-                        secure_executing(
-                            eid,
-                            &mut result_bl_ptr,
-                            tid,
-                            &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8,
-                            cache_meta,
-                            acc_arg.is_shuffle,  
-                            block_ptr as *mut u8,
-                            &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-                        )
-                    };
-                    let _block = unsafe{ Box::from_raw(block_ptr) };
-                    let _r = match sgx_status {
-                        sgx_status_t::SGX_SUCCESS => {},
-                        _ => {
-                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                        },
-                    };
+                    let result_bl_ptr = wrapper_secure_execute(
+                        &acc_arg.rdd_ids, 
+                        cache_meta, 
+                        acc_arg.dep_info, 
+                        block, 
+                        &captured_vars
+                    );
+                    wrapper_spec_execute(
+                        spec_call_seq_ptr, 
+                        cache_meta, 
+                        0 as *mut u8,
+                    );
                     tx.send(result_bl_ptr).unwrap();
                 }
                 sub_part_id += 1;

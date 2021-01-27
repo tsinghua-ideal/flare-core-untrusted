@@ -1,4 +1,4 @@
-use crate::aggregator::Aggregator;
+use crate::{aggregator::Aggregator, executor};
 use crate::env;
 use crate::partitioner::Partitioner;
 use crate::rdd::{AccArg, get_encrypted_data, RddBase, EENTER_LOCK};
@@ -7,11 +7,47 @@ use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::forget;
 use std::sync::{Arc, atomic, mpsc};
 use std::time::{Duration, Instant};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct DepInfo {
+    is_shuffle: u8,
+    identifier: usize,
+    parent_rdd_id: usize,
+    child_rdd_id: usize, 
+}
+
+impl DepInfo {
+    pub fn new(is_shuffle: u8,
+        identifier: usize,
+        parent_rdd_id: usize,
+        child_rdd_id: usize
+    ) -> Self {
+        // The last three items is useful only when is_shuffle == 1x, x == 0 or x == 1
+        DepInfo {
+            is_shuffle,
+            identifier,
+            parent_rdd_id,
+            child_rdd_id, 
+        }
+    }
+
+    //This for shuffle read or narrow
+    pub fn padding_new(is_shuffle: u8) -> Self {
+        DepInfo {
+            is_shuffle,
+            identifier: 0,
+            parent_rdd_id: 0,
+            child_rdd_id: 0, 
+        }
+    }
+}
 
 // Revise if enum is good choice. Considering enum since down casting one trait object to another trait object is difficult.
 #[derive(Clone, Serialize, Deserialize)]
@@ -93,6 +129,7 @@ impl NarrowDependencyTrait for RangeDependency {
 }
 
 pub trait ShuffleDependencyTrait: Serialize + Deserialize + Send + Sync {
+    fn get_dep_info(&self) -> DepInfo;
     fn get_shuffle_id(&self) -> usize;
     fn get_rdd_base(&self) -> Arc<dyn RddBase>;
     fn is_shuffle(&self) -> bool;
@@ -137,6 +174,9 @@ where
     #[serde(with = "serde_traitobject")]
     pub partitioner: Box<dyn Partitioner>,
     is_shuffle: bool,
+    identifier: usize,
+    parent_rdd_id: usize,
+    child_rdd_id: usize,
     _marker_ke: PhantomData<KE>,
     _marker_ce: PhantomData<CE>,
 }
@@ -155,7 +195,10 @@ where
         rdd_base: Arc<dyn RddBase>,
         aggregator: Arc<Aggregator<K, V, C>>,
         partitioner: Box<dyn Partitioner>,
+        identifier: usize,
+        child_rdd_id: usize,
     ) -> Self {
+        let parent_rdd_id = rdd_base.get_rdd_id();
         ShuffleDependency {
             shuffle_id,
             is_cogroup,
@@ -163,6 +206,9 @@ where
             aggregator,
             partitioner,
             is_shuffle: true,
+            identifier,
+            parent_rdd_id,
+            child_rdd_id,
             _marker_ke: PhantomData,
             _marker_ce: PhantomData,
         }
@@ -177,6 +223,15 @@ where
     KE: Data,
     CE: Data,
 {
+    fn get_dep_info(&self) -> DepInfo {
+        DepInfo::new(
+            11,  //10 and 11 have the same effect, always need_encryption
+            self.identifier,
+            self.parent_rdd_id,
+            self.child_rdd_id,
+        )
+    }
+
     fn get_shuffle_id(&self) -> usize {
         self.shuffle_id
     }
@@ -197,39 +252,75 @@ where
         );
         log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
         if rdd_base.get_secure() {
-            let split = rdd_base.splits()[partition].clone();
-            log::debug!("split index: {}", split.get_index());
-            let (tx, rx) = mpsc::sync_channel(0);
-            let rdd_id = rdd_base.get_rdd_id();
-            let mut acc_arg = AccArg::new(rdd_id, partition, 11);  //10 and 11 have the same effect, always need_encryption
-            let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
-            let now = Instant::now();
-            let num_output_splits = self.partitioner.get_num_of_partitions();
-            let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
+            let key = (
+                self.parent_rdd_id, 
+                env::RDDB_MAP.map_id(self.parent_rdd_id), 
+                self.child_rdd_id, 
+                env::RDDB_MAP.map_id(self.child_rdd_id), 
+                partition,
+            );
+            let res = env::SPEC_SHUFFLE_CACHE.get(&key)
+                .map(|entry| entry.clone());
+            match res {
+                Some(item) => {
+                    let mut ser_result = HashMap::new();
+                    let mut acc_header = HashMap::new();
+                    for (_sub_part_id, buckets) in item.into_iter().enumerate() {
+                        for (reduce_id, bucket) in buckets.into_iter().enumerate() {
+                            //bukcet with the same reduce id merge together
+                            let entry = ser_result.entry(reduce_id).or_insert(vec![0; 8]);
+                            let header = acc_header.entry(reduce_id).or_insert(0 as usize);
+                            *header += 1;
+                            entry.extend_from_slice(&bucket[..]);
+                        }
+                    }
 
-            for block_ptr in rx { 
-                let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_id, 1, block_ptr as *mut u8);
-                assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
-                for (i, bucket) in buckets_bl.into_iter().enumerate() {
-                    buckets[i].push(bucket); 
-                }
-            }
-            println!("finish getting encrypted data");
-            
-            for (i, bucket) in buckets.into_iter().enumerate() {
-                let ser_bytes = bincode::serialize(&bucket).unwrap();
-                env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
-            }
-            
-            for handle in handles {
-                handle.join().unwrap();
+                    for (reduce_id, mut bucket) in ser_result {
+                        for (idx, v) in acc_header[&reduce_id].to_le_bytes().iter().enumerate() {
+                            bucket[idx] = *v;
+                        }
+                        env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, reduce_id), bucket);
+                    }
+                    env::Env::get().shuffle_manager.get_server_uri()          
+                },
+                None => {
+                    let split = rdd_base.splits()[partition].clone();
+                    log::debug!("split index: {}", split.get_index());
+                    let (tx, rx) = mpsc::sync_channel(0);
+                    let rdd_id = rdd_base.get_rdd_id();
+                    let dep_info = self.get_dep_info();
+                    let mut acc_arg = AccArg::new(rdd_id, partition, dep_info);  
+                    let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
+                    let now = Instant::now();
+                    let num_output_splits = self.partitioner.get_num_of_partitions();
+                    let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
+                        .map(|_| Vec::new())
+                        .collect::<Vec<_>>();
+        
+                    for block_ptr in rx { 
+                        let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_id, dep_info, block_ptr as *mut u8, false);
+                        assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                        for (i, bucket) in buckets_bl.into_iter().enumerate() {
+                            buckets[i].push(bucket); 
+                        }
+                    }
+                    
+                    for (i, bucket) in buckets.into_iter().enumerate() {
+                        let ser_bytes = bincode::serialize(&bucket).unwrap();
+                        env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
+                    }
+                    
+                    for handle in handles {
+                        handle.join().unwrap();
+                    }
+        
+                    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                    println!("in dependency, total {:?}", dur);
+                    env::Env::get().shuffle_manager.get_server_uri()  
+                },
             }
 
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("in dependency, total {:?}", dur);
-            env::Env::get().shuffle_manager.get_server_uri()    
+  
         } else {
             let split = rdd_base.splits()[partition].clone();
             log::debug!("split index: {}", split.get_index());

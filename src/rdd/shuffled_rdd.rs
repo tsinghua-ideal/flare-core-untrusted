@@ -105,6 +105,7 @@ where
         let ecall_ids = parent.get_ecall_ids();
         let shuffle_id = ctx.new_shuffle_id();
         let mut vals = RddVals::new(ctx, secure);
+        let cur_rdd_id = vals.id;
 
         vals.dependencies
             .push(Dependency::ShuffleDependency(Arc::new(
@@ -114,6 +115,8 @@ where
                     parent.get_rdd_base(),
                     aggregator.clone(),
                     part.clone(),
+                    0,
+                    cur_rdd_id,
                 ),
             )));
         let vals = Arc::new(vals);
@@ -272,13 +275,10 @@ where
         let cur_rdd_id = self.get_rdd_id();
         let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
         acc_arg.insert_rdd_id(cur_rdd_id);
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
 
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
-            let tid: u64 = thread::current().id().as_u64().into();
             let now = Instant::now();
-            let mut blocks = Vec::new(); 
             let chunk_size = 1000;   //num of entries = 1000*num of sub_part
             let mut iter_vec = Vec::new();
             for idx_subpar in 0..bucket.len() {
@@ -289,7 +289,7 @@ where
             let mut cache_meta = acc_arg.to_cache_meta();
             while !iter_vec.is_empty() {
                 //get block (memory inefficient)
-                blocks.clear();
+                let mut blocks = Vec::new(); 
                 let mut empty_idxs = Vec::new();
                 for (idx, iter) in iter_vec.iter_mut().enumerate() {
                     let nxt = iter.next();
@@ -304,48 +304,40 @@ where
                 for idx in empty_idxs {
                     iter_vec.remove(idx);
                 }
-                let is_survivor = blocks.is_empty();
+                let mut is_survivor = blocks.is_empty();
                 
                 if !acc_arg.cached(&sub_part_id) {
+                    let mut result_bl_ptr = wrapper_secure_execute(
+                        &rdd_ids,
+                        cache_meta,
+                        DepInfo::padding_new(20),   //shuffle read
+                        Box::new(blocks), 
+                        &captured_vars,
+                    );
+                    let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+                        acc_arg.get_final_rdd_id(), 
+                        cache_meta, 
+                        acc_arg.dep_info,
+                    );
+                    if spec_call_seq_ptr != 0 {
+                        is_survivor = true;
+                    }
                     cache_meta.set_sub_part_id(sub_part_id);
                     cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                    let block_ptr = Box::into_raw(Box::new(blocks));
-                    let mut result_bl_ptr: usize = 0;
-                    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                        //wait
-                    } 
-                    let sgx_status = unsafe {
-                        secure_executing(
-                            eid,
-                            &mut result_bl_ptr,
-                            tid,
-                            &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
-                            cache_meta,    //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
-                            20,   //shuffle read
-                            block_ptr as *mut u8, 
-                            &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-                        )
-                    };
-                    blocks = *unsafe{ Box::from_raw(block_ptr) };
-                    let _r = match sgx_status {
-                        sgx_status_t::SGX_SUCCESS => {},
-                        _ => {
-                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                        },
-                    };
-                    
                     // this block is in enclave, cannot access
                     let block_ptr = result_bl_ptr as *mut u8;
+                    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
                     result_bl_ptr = 0;
+                    let tid: u64 = thread::current().id().as_u64().into();
                     let sgx_status = unsafe {
-                        secure_executing(
+                        secure_execute(
                             eid,
                             &mut result_bl_ptr,
                             tid,
                             &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8,
                             cache_meta,
-                            acc_arg.is_shuffle,  
+                            acc_arg.dep_info,  
                             block_ptr,
                             &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                         )
@@ -356,6 +348,11 @@ where
                             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                         },
                     };
+                    wrapper_spec_execute(
+                        spec_call_seq_ptr, 
+                        cache_meta, 
+                        0 as *mut u8,
+                    );
                     tx.send(result_bl_ptr).unwrap();
                 }
                 sub_part_id += 1;

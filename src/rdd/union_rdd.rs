@@ -461,7 +461,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                 let parent = &rdds[part.parent_rdd_index];
                 let rdd_id = parent.get_rdd_id();
                 let part_id = split.get_index();
-                let mut acc_arg_un = AccArg::new(rdd_id, part_id,00);
+                let mut acc_arg_un = AccArg::new(rdd_id, part_id,DepInfo::padding_new(00));
                 let handle_uns = parent.secure_compute(split, &mut acc_arg_un, tx_un.clone())?; 
                 
                 let acc_arg = acc_arg.clone();
@@ -475,24 +475,37 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                     while r.is_ok() {
                         //The last connected one will survive in cache
                         let r_next = rx_un.try_recv();
-                        let is_survivor = r_next == Err(TryRecvError::Disconnected);
+                        let mut is_survivor = r_next == Err(TryRecvError::Disconnected);
                         if !acc_arg.cached(&sub_part_id) {
+                            let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+                                acc_arg.get_final_rdd_id(), 
+                                cache_meta, 
+                                acc_arg.dep_info,
+                            );
+                            if spec_call_seq_ptr != 0 {
+                                is_survivor = true;
+                            }
                             cache_meta.set_sub_part_id(sub_part_id);
                             cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
-                                secure_executing(
+                                secure_execute(
                                     eid,
                                     &mut result_bl_ptr,
                                     tid,
                                     &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8, 
                                     cache_meta,
-                                    acc_arg.is_shuffle, 
+                                    acc_arg.dep_info, 
                                     r.unwrap() as *mut u8, 
                                     &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                                 )
                             };
+                            wrapper_spec_execute(
+                                spec_call_seq_ptr, 
+                                cache_meta, 
+                                0 as *mut u8,
+                            );
                             tx.send(result_bl_ptr).unwrap();
                         }
                         sub_part_id += 1;
@@ -522,7 +535,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                 for (rdd, p) in iter {
                     let rdd_id = rdd.get_rdd_id();
                     let part_id = p.get_index();
-                    let mut acc_arg_un = AccArg::new(rdd_id, part_id, 00);
+                    let mut acc_arg_un = AccArg::new(rdd_id, part_id, DepInfo::padding_new(00));
                     handle_uns.append(&mut rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un.clone())?);
                 }
 
@@ -536,24 +549,37 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
                     while r.is_ok() {
                         //The last connected one will survive in cache
                         let r_next = rx_un.try_recv();
-                        let is_survivor = r_next == Err(TryRecvError::Disconnected);
+                        let mut is_survivor = r_next == Err(TryRecvError::Disconnected);
                         if !acc_arg.cached(&sub_part_id) {
+                            let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+                                acc_arg.get_final_rdd_id(), 
+                                cache_meta, 
+                                acc_arg.dep_info,
+                            );
+                            if spec_call_seq_ptr != 0 {
+                                is_survivor = true;
+                            }
                             cache_meta.set_sub_part_id(sub_part_id);
                             cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
-                                secure_executing(
+                                secure_execute(
                                     eid,
                                     &mut result_bl_ptr,
                                     tid,
                                     &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8, 
                                     cache_meta,
-                                    acc_arg.is_shuffle, 
+                                    acc_arg.dep_info, 
                                     r.unwrap() as *mut u8, 
                                     &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                                 )
                             };
+                            wrapper_spec_execute(
+                                spec_call_seq_ptr, 
+                                cache_meta, 
+                                0 as *mut u8,
+                            );
                             tx.send(result_bl_ptr).unwrap();
                         }
                         sub_part_id += 1;
