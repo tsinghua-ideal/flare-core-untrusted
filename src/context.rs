@@ -1,3 +1,4 @@
+use core::panic::Location;
 use std::fmt::Debug;
 use std::fs;
 use std::io::Write;
@@ -6,8 +7,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+    atomic::{AtomicU32, AtomicUsize, Ordering},
+    Arc, RwLock,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::executor::{Executor, Signal};
 use crate::io::ReaderConfiguration;
 use crate::partial::{ApproximateEvaluator, PartialResult};
-use crate::rdd::{ParallelCollection, Rdd, RddE, RddBase, UnionRdd, ser_encrypt, ser_decrypt};
+use crate::rdd::{OpId, ParallelCollection, Rdd, RddE, RddBase, UnionRdd, ser_encrypt, ser_decrypt};
 use crate::scheduler::{DistributedScheduler, LocalScheduler, NativeScheduler, TaskContext};
 use crate::serializable_traits::{Data, SerFunc};
 use crate::serialized_data_capnp::serialized_data;
@@ -136,6 +137,9 @@ pub struct Context {
     distributed_driver: bool,
     /// this context/session temp work dir
     work_dir: PathBuf,
+    last_loc_file: RwLock<&'static str>,
+    last_loc_line: AtomicU32,
+    num: AtomicUsize,
 }
 
 impl Drop for Context {
@@ -224,6 +228,9 @@ impl Context {
             address_map: vec![SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)],
             distributed_driver: false,
             work_dir: job_work_dir,
+            last_loc_file: RwLock::new("null"),
+            last_loc_line: AtomicU32::new(0), 
+            num: AtomicUsize::new(0),
         }))
     }
 
@@ -356,6 +363,9 @@ impl Context {
             address_map,
             distributed_driver: true,
             work_dir: job_work_dir,
+            last_loc_file: RwLock::new("null"),
+            last_loc_line: AtomicU32::new(0), 
+            num: AtomicUsize::new(0),
         }))
     }
 
@@ -469,10 +479,43 @@ impl Context {
         self.next_rdd_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    pub fn add_num(self: &Arc<Self>, addend: usize) -> usize {
+        self.num.fetch_add(addend, Ordering::SeqCst)
+    }
+
+    pub fn set_num(self: &Arc<Self>, num: usize) {
+        self.num.store(num, Ordering::SeqCst)
+    }
+
+    pub fn new_op_id(self: &Arc<Self>, loc: &'static Location<'static>) -> OpId {
+        use Ordering::SeqCst;
+        let file = loc.file();
+        let line = loc.line();
+        
+        let num = if *self.last_loc_file.read().unwrap() != file || self.last_loc_line.load(SeqCst) != line {
+            *self.last_loc_file.write().unwrap() = file;
+            self.last_loc_line.store(line, SeqCst);
+            self.num.store(0, SeqCst);
+            0
+        } else {
+            self.num.load(SeqCst)
+        };
+        
+        let op_id = 
+        OpId::new(
+            file,
+            line,
+            num,
+        );
+        //println!("file = {:?}, line = {:?}, num = {:?}, op_id = {:?}", file, line, num, op_id);
+        op_id
+    }
+
     pub fn new_shuffle_id(self: &Arc<Self>) -> usize {
         self.next_shuffle_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    #[track_caller]
     pub fn make_rdd<T: Data, TE: Data, I, IE, FE, FD>(
         self: &Arc<Self>,
         seq: I,
@@ -492,6 +535,7 @@ impl Context {
         rdd
     }
 
+    #[track_caller]
     pub fn range(
         self: &Arc<Self>,
         start: u64,
@@ -514,6 +558,7 @@ impl Context {
         rdd
     }
 
+    #[track_caller]
     pub fn parallelize<T: Data, TE: Data, I, IE, FE, FD>(
         self: &Arc<Self>,
         seq: I,
@@ -532,6 +577,7 @@ impl Context {
     }
 
     /// Load from a distributed source and turns it into a parallel collection.
+    #[track_caller]
     pub fn read_source<F, C, FE, FD, I: Data, O: Data, OE: Data>(
         self: &Arc<Self>,
         config: C,
@@ -629,6 +675,7 @@ impl Context {
         }
     }
 
+    #[track_caller]
     pub fn union<T: Data, TE: Data>(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Result<impl RddE<Item = T, ItemE = TE>> {
         UnionRdd::new(rdds)
     }

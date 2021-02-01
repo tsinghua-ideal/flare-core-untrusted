@@ -93,6 +93,7 @@ where
     FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
     FD: Func((KE, CE)) -> Vec<(K, C)> + Clone, 
 {
+    #[track_caller]
     pub(crate) fn new(
         parent: Arc<dyn Rdd<Item = (K, V)>>,
         aggregator: Arc<Aggregator<K, V, C>>,
@@ -106,6 +107,7 @@ where
         let shuffle_id = ctx.new_shuffle_id();
         let mut vals = RddVals::new(ctx, secure);
         let cur_rdd_id = vals.id;
+        let cur_op_id = vals.op_id;
 
         vals.dependencies
             .push(Dependency::ShuffleDependency(Arc::new(
@@ -117,6 +119,7 @@ where
                     part.clone(),
                     0,
                     cur_rdd_id,
+                    cur_op_id,
                 ),
             )));
         let vals = Arc::new(vals);
@@ -165,6 +168,14 @@ where
         self.vals.id
     }
 
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+    }
+
     fn get_context(&self) -> Arc<Context> {
         self.vals.context.upgrade().unwrap()
     }
@@ -189,7 +200,7 @@ where
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         // rdd_id is actually op_id
-        let value = move_data::<(KE, CE)>(self.get_rdd_id(), value_ptr);
+        let value = move_data::<(KE, CE)>(self.get_op_id(), value_ptr);
         let size = value.get_size();
         (Box::into_raw(value) as *mut u8, size)
     }
@@ -273,8 +284,11 @@ where
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.get_rdd_id();
-        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
+        let cur_op_id = self.get_op_id();
         acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
+        let rdd_ids = vec![cur_rdd_id];
+        let op_ids = vec![cur_op_id];
 
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
@@ -309,13 +323,14 @@ where
                 if !acc_arg.cached(&sub_part_id) {
                     let mut result_bl_ptr = wrapper_secure_execute(
                         &rdd_ids,
+                        &op_ids,
                         cache_meta,
                         DepInfo::padding_new(20),   //shuffle read
                         Box::new(blocks), 
                         &captured_vars,
                     );
                     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                        acc_arg.get_final_rdd_id(), 
+                        &acc_arg.op_ids,
                         cache_meta, 
                         acc_arg.dep_info,
                     );
@@ -335,7 +350,8 @@ where
                             eid,
                             &mut result_bl_ptr,
                             tid,
-                            &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8,
+                            &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
+                            &acc_arg.op_ids as *const Vec<OpId> as *const u8,
                             cache_meta,
                             acc_arg.dep_info,  
                             block_ptr,

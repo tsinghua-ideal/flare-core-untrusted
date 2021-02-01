@@ -9,6 +9,7 @@ mod local_file_reader;
 pub use local_file_reader::{LocalFsReader, LocalFsReaderConfig};
 
 pub trait ReaderConfiguration<I: Data> {
+    #[track_caller]
     fn make_reader<F, O, OE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = O, ItemE = OE>>
     where
         O: Data,

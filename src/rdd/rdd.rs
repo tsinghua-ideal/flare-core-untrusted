@@ -1,11 +1,12 @@
+use core::panic::Location;
 use std::any::TypeId;
 use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::convert::TryInto;
 use std::fs;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::mem::forget;
 use std::net::Ipv4Addr;
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::context::Context;
 use crate::dependency::{Dependency, DepInfo};
-use crate::env::{self, RDDB_MAP, Env};
+use crate::env::{self, Env};
 use crate::error::{Error, Result};
 use crate::partial::{BoundedDouble, CountEvaluator, GroupedCountEvaluator, PartialResult};
 use crate::partitioner::{HashPartitioner, Partitioner};
@@ -78,6 +79,7 @@ extern "C" {
         retval: *mut usize,
         tid: u64,
         rdd_ids: *const u8,
+        op_ids: *const u8,
         cache_meta: CacheMeta,
         dep_info: DepInfo,
         input: *mut u8,
@@ -87,7 +89,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         tid: u64, 
-        start_rdd_id: usize,
+        op_ids: *const u8,
         cache_meta: CacheMeta,
         dep_info: DepInfo,  
     ) -> sgx_status_t;
@@ -98,25 +100,24 @@ extern "C" {
         spec_call_seq: usize,
         cache_meta: CacheMeta,
         input: *mut u8, 
-        parent_rdd_id: *mut usize,
-        child_rdd_id: *mut usize,
+        hash_ops: *mut u64,
     ) -> sgx_status_t;
     pub fn free_res_enc(
         eid: sgx_enclave_id_t,
-        op_id: usize,
+        op_id: OpId,
         dep_info: DepInfo,
         input: *mut u8,
         is_spec: u8,
     ) -> sgx_status_t;
     pub fn priv_free_res_enc(
         eid: sgx_enclave_id_t,
-        op_id: usize,
+        op_id: OpId,
         dep_info: DepInfo,
         input: *mut u8,  
     ) -> sgx_status_t;
     pub fn get_sketch(
         eid: sgx_enclave_id_t,
-        rdd_id: usize,
+        op_id: OpId,
         dep_info: DepInfo,
         p_buf: *mut u8,
         p_data_enc: *mut u8,
@@ -124,7 +125,7 @@ extern "C" {
     ) -> sgx_status_t;
     pub fn clone_out(
         eid: sgx_enclave_id_t,
-        rdd_id: usize,
+        op_id: OpId,
         dep_info: DepInfo,
         p_out: usize,
         p_data_enc: *mut u8,
@@ -170,8 +171,15 @@ pub unsafe extern "C" fn ocall_cache_from_outside(rdd_id: usize,
     }
 }
 
+pub fn default_hash<T: Hash>(t: &T) -> u64 {
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
+}
+
 pub fn wrapper_secure_execute<T>(
-    rdd_ids: &Vec<(usize, usize)>, 
+    rdd_ids: &Vec<usize>, 
+    op_ids: &Vec<OpId>,
     cache_meta: CacheMeta,
     dep_info: DepInfo, 
     data: Box<T>,
@@ -190,7 +198,8 @@ pub fn wrapper_secure_execute<T>(
             eid,
             &mut result_bl_ptr,
             tid,
-            rdd_ids as *const Vec<(usize, usize)> as *const u8,
+            rdd_ids as *const Vec<usize> as *const u8,
+            op_ids as *const Vec<OpId> as *const u8,
             cache_meta,
             dep_info,
             block_ptr as *mut u8,
@@ -208,8 +217,8 @@ pub fn wrapper_secure_execute<T>(
 }
 
 
-pub fn wrapper_exploit_spec_oppty(    
-    final_rdd_id: usize,
+pub fn wrapper_exploit_spec_oppty(
+    op_ids: &Vec<OpId>,
     cache_meta: CacheMeta,
     dep_info: DepInfo
 ) -> usize {
@@ -220,8 +229,8 @@ pub fn wrapper_exploit_spec_oppty(
         exploit_spec_oppty(
             eid,
             &mut retval,
-            tid, 
-            final_rdd_id,
+            tid,
+            op_ids as *const Vec<OpId> as *const u8,
             cache_meta,
             dep_info,  
         )
@@ -245,8 +254,7 @@ pub fn wrapper_spec_execute(
         return;
     }
     println!("begin speculative execution");
-    let mut parent_rdd_id: usize = 0;
-    let mut child_rdd_id: usize = 0;
+    let mut hash_ops: u64= 0;
 
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut retval: usize = 0;
@@ -259,8 +267,7 @@ pub fn wrapper_spec_execute(
             spec_call_seq,
             cache_meta,
             input,
-            &mut parent_rdd_id,
-            &mut child_rdd_id, 
+            &mut hash_ops,
         )
     };
     let _r = match sgx_status {
@@ -270,12 +277,9 @@ pub fn wrapper_spec_execute(
         },
     };
     //The first two args are not used in this case actually
-    let res = get_encrypted_data::<Vec<u8>>(0, DepInfo::padding_new(11), retval as *mut u8, true);
+    let res = get_encrypted_data::<Vec<u8>>(Default::default(), DepInfo::padding_new(11), retval as *mut u8, true);
     let key = (
-        parent_rdd_id, 
-        RDDB_MAP.map_id(parent_rdd_id), 
-        child_rdd_id, 
-        RDDB_MAP.map_id(child_rdd_id), 
+        hash_ops,
         cache_meta.part_id,
     );
 
@@ -287,7 +291,7 @@ pub fn wrapper_spec_execute(
 }
 
 
-pub fn get_encrypted_data<T>(rdd_id: usize, dep_info: DepInfo, p_data_enc: *mut u8, is_spec: bool) -> Box<Vec<T>> 
+pub fn get_encrypted_data<T>(op_id: OpId, dep_info: DepInfo, p_data_enc: *mut u8, is_spec: bool) -> Box<Vec<T>> 
 where
     T:  std::fmt::Debug 
         + Clone 
@@ -303,7 +307,6 @@ where
         true => 1,
     };
     if immediate_cout {
-        let op_id = RDDB_MAP.map_id(rdd_id);
         let res_ = unsafe{ Box::from_raw(p_data_enc as *mut Vec<T>) };
         let res = res_.clone();
         forget(res_);
@@ -331,7 +334,7 @@ where
         let sgx_status = unsafe {
             get_sketch(
                 eid,
-                rdd_id,
+                op_id,
                 dep_info,
                 size_buf_ptr as *mut u8,
                 p_data_enc,   //shuffle write
@@ -356,7 +359,7 @@ where
         let sgx_status = unsafe {
             clone_out(
                 eid,
-                rdd_id,
+                op_id,
                 dep_info,
                 ptr_out,
                 p_data_enc,
@@ -386,7 +389,7 @@ where
     }
 }
 
-pub fn move_data<T: Clone>(op_id: usize, data: *mut u8) -> Box<Vec<T>> {
+pub fn move_data<T: Clone>(op_id: OpId, data: *mut u8) -> Box<Vec<T>> {
     let res_ = unsafe{ Box::from_raw(data as *mut Vec<T>) };
     let res = res_.clone();
     forget(res_);
@@ -553,6 +556,7 @@ pub fn secure_compute_cached(
         // Compute based on cached values
         let final_rdd_id = acc_arg.get_final_rdd_id();
         let rdd_ids = acc_arg.rdd_ids.clone();
+        let op_ids = acc_arg.op_ids.clone();
         let mut cache_meta = acc_arg.to_cache_meta();
         let dep_info = acc_arg.dep_info;
 
@@ -561,7 +565,7 @@ pub fn secure_compute_cached(
             for (seq_id, sub_part) in cached_sub_parts.into_iter().enumerate() {
                 let mut is_survivor = cached_sub_parts_len == subpids.len() &&  cached_sub_parts_len-1 == seq_id;
                 let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                    final_rdd_id, 
+                    &op_ids, 
                     cache_meta, 
                     dep_info,
                 );
@@ -580,7 +584,8 @@ pub fn secure_compute_cached(
                         eid,
                         &mut result_ptr,
                         tid,
-                        &rdd_ids as *const Vec<(usize, usize)> as *const u8, 
+                        &rdd_ids as *const Vec<usize> as *const u8,
+                        &op_ids as *const Vec<OpId> as *const u8, 
                         cache_meta,
                         dep_info,   
                         data_ptr as *mut u8 ,
@@ -611,8 +616,8 @@ pub fn secure_compute_cached(
 
 #[derive(Clone, Debug)]
 pub struct AccArg {
-    pub rdd_ids: Vec<(usize, usize)>,
-    cur_cont_seg: usize,
+    pub rdd_ids: Vec<usize>,
+    pub op_ids: Vec<OpId>,
     part_id: usize,
     pub dep_info: DepInfo,
     caching_rdd_id: usize,
@@ -622,10 +627,10 @@ pub struct AccArg {
 }
 
 impl AccArg {
-    pub fn new(final_rdd_id: usize, part_id: usize, dep_info: DepInfo) -> Self {
+    pub fn new(part_id: usize, dep_info: DepInfo) -> Self {
         AccArg {
-            rdd_ids: vec![(final_rdd_id, final_rdd_id)],
-            cur_cont_seg: 0,
+            rdd_ids: Vec::new(),
+            op_ids: Vec::new(),
             part_id,
             dep_info,
             caching_rdd_id: 0,
@@ -636,7 +641,7 @@ impl AccArg {
     }
 
     pub fn get_final_rdd_id(&self) -> usize {
-        self.rdd_ids[0].0
+        self.rdd_ids[0]
     }
 
     //set the to_be_cached rdd and return whether the set is successfully
@@ -662,9 +667,24 @@ impl AccArg {
     }
 
     pub fn to_cache_meta(&self) -> CacheMeta {
+        let len = self.rdd_ids.len();
+        assert_eq!(len, self.op_ids.len());
+        let mut caching_op_id = Default::default();
+        let mut cached_op_id = Default::default();
+        for idx in 0..len {
+            if self.caching_rdd_id == self.rdd_ids[idx] {
+                caching_op_id = self.op_ids[idx];
+            }
+            if self.cached_rdd_id == self.rdd_ids[idx] {
+                cached_op_id = self.op_ids[idx];
+            }
+        }
+
         CacheMeta::new(
             self.caching_rdd_id,
+            caching_op_id,
             self.cached_rdd_id,
+            cached_op_id,
             self.part_id,
         )
     }
@@ -680,39 +700,43 @@ impl AccArg {
     }
 
     pub fn insert_rdd_id(&mut self, rdd_id: usize) {
-        let cur = &mut self.cur_cont_seg;
-        let lower = &mut self.rdd_ids[*cur].1;
-        if rdd_id == *lower - 1 || rdd_id == *lower {
-            *lower = rdd_id;
-        } else {
-            self.rdd_ids.push((rdd_id, rdd_id));
-            *cur += 1;
-        }
+        self.rdd_ids.push(rdd_id);
+    }
+
+    pub fn insert_op_id(&mut self, op_id: OpId) {
+        self.op_ids.push(op_id);
     }
 
     pub fn is_caching_final_rdd(&self) -> bool {
-        self.rdd_ids[0].0 == self.caching_rdd_id
+        self.rdd_ids[0] == self.caching_rdd_id
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CacheMeta {
     caching_rdd_id: usize,
+    caching_op_id: OpId,
     cached_rdd_id: usize,
+    cached_op_id: OpId,
     part_id: usize,
     sub_part_id: usize, 
     is_survivor: u8,
 }
 
 impl CacheMeta {
-    pub fn new(caching_rdd_id: usize,
+    pub fn new(
+        caching_rdd_id: usize,
+        caching_op_id: OpId,
         cached_rdd_id: usize,
+        cached_op_id: OpId,
         part_id: usize,
     ) -> Self {
         CacheMeta {
             caching_rdd_id,
+            caching_op_id,
             cached_rdd_id,
+            cached_op_id,
             part_id,
             sub_part_id: 0,
             is_survivor: 0,
@@ -739,10 +763,26 @@ impl CacheMeta {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct OpId {
+    h: u64,
+}
+
+impl OpId {
+    pub fn new(file: &'static str, line: u32, num: usize) -> Self {
+        let h = default_hash(&(file.to_string(), line, num));
+        OpId {
+            h,
+        }
+    }
+}
+
 // Values which are needed for all RDDs
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RddVals {
     pub id: usize,
+    pub op_id: OpId,
     pub dependencies: Vec<Dependency>,
     should_cache_: AtomicBool,
     secure: bool,
@@ -751,9 +791,12 @@ pub(crate) struct RddVals {
 }
 
 impl RddVals {
+    #[track_caller]
     pub fn new(sc: Arc<Context>, secure: bool) -> Self {
+        let loc = Location::caller(); 
         RddVals {
             id: sc.new_rdd_id(),
+            op_id: sc.new_op_id(loc),
             dependencies: Vec::new(),
             should_cache_: AtomicBool::new(false),
             secure,
@@ -779,6 +822,8 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn should_cache(&self) -> bool;
     fn free_data_enc(&self, ptr: *mut u8);
     fn get_rdd_id(&self) -> usize;
+    fn get_op_id(&self) -> OpId;
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>);
     fn get_context(&self) -> Arc<Context>;
     fn get_op_name(&self) -> String {
         "unknown".to_owned()
@@ -850,6 +895,12 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     }
     fn get_rdd_id(&self) -> usize {
         (**self).get_rdd_base().get_rdd_id()
+    }
+    fn get_op_id(&self) -> OpId {
+        (**self).get_rdd_base().get_op_id()
+    }
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        (**self).get_rdd_base().get_op_ids(op_ids)
     }
     fn get_context(&self) -> Arc<Context> {
         (**self).get_rdd_base().get_context()
@@ -985,16 +1036,17 @@ pub trait RddE: Rdd {
     fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let (tx, rx) = sync_channel(0);
         let rdd_id = self.get_rdd_id();
+        let op_id = self.get_op_id();
         let part_id = split.get_index();
         let dep_info = DepInfo::padding_new(01);
-        let mut acc_arg = AccArg::new(rdd_id, part_id, dep_info);
+        let mut acc_arg = AccArg::new(part_id, dep_info);
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
         let mut result = Vec::new();
         let mut sub_part_id = 0;
         for received in rx {
-            let mut result_bl = get_encrypted_data::<Self::ItemE>(rdd_id, dep_info, received as *mut u8, false);
+            let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
             assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
             if caching {
                 //collect result
@@ -1015,6 +1067,7 @@ pub trait RddE: Rdd {
     }
 
     /// Return a new RDD containing only the elements that satisfy a predicate.
+    #[track_caller]
     fn filter<F>(&self, predicate: F) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         F: SerFunc(&Self::Item) -> bool + Copy,
@@ -1028,6 +1081,7 @@ pub trait RddE: Rdd {
         SerArc::new(MapPartitionsRdd::new(self.get_rdd(), filter_fn, self.get_fe(), self.get_fd()))
     }
 
+    #[track_caller]
     fn map<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Self::Item) -> U,
@@ -1038,6 +1092,7 @@ pub trait RddE: Rdd {
         SerArc::new(MapperRdd::new(self.get_rdd(), f, fe, fd))
     }
 
+    #[track_caller]
     fn flat_map<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Self::Item) -> Box<dyn Iterator<Item = U>>,
@@ -1049,6 +1104,7 @@ pub trait RddE: Rdd {
     }
 
     /// Return a new RDD by applying a function to each partition of this RDD.
+    #[track_caller]
     fn map_partitions<U: Data, UE: Data, F, FE, FD>(&self, func: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Box<dyn Iterator<Item = Self::Item>>) -> Box<dyn Iterator<Item = U>>,
@@ -1064,6 +1120,7 @@ pub trait RddE: Rdd {
 
     /// Return a new RDD by applying a function to each partition of this RDD,
     /// while tracking the index of the original partition.
+    #[track_caller]
     fn map_partitions_with_index<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(usize, Box<dyn Iterator<Item = Self::Item>>) -> Box<dyn Iterator<Item = U>>,
@@ -1076,6 +1133,7 @@ pub trait RddE: Rdd {
 
     /// Return an RDD created by coalescing all elements within each partition into an array.
     #[allow(clippy::type_complexity)]
+    #[track_caller]
     fn glom(&self) -> SerArc<dyn RddE<Item = Vec<Self::Item>, ItemE = Vec<Self::ItemE>>>
     where
         Self: Sized,
@@ -1161,8 +1219,8 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cur_rdd_id = self.get_rdd_id();
-        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
+        let rdd_ids = vec![self.get_rdd_id()];
+        let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -1170,8 +1228,9 @@ pub trait RddE: Rdd {
                 eid,
                 &mut result_ptr,
                 tid,
-                &rdd_ids as *const Vec<(usize, usize)> as *const u8,
-                CacheMeta::new(0, 0, 0),  //meaningless
+                &rdd_ids as *const Vec<usize> as *const u8,
+                &op_ids as *const Vec<OpId> as *const u8,
+                Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
@@ -1187,7 +1246,7 @@ pub trait RddE: Rdd {
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in reduce, ecall {:?}s", dur);
         let temp = get_encrypted_data::<UE>(
-            self.get_rdd_id(), 
+            self.get_op_id(), 
             DepInfo::padding_new(31), 
             result_ptr as *mut u8,
             false,
@@ -1247,8 +1306,8 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cur_rdd_id = self.get_rdd_id();
-        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
+        let rdd_ids = vec![self.get_rdd_id()];
+        let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -1256,8 +1315,9 @@ pub trait RddE: Rdd {
                 eid,
                 &mut result_ptr,
                 tid,
-                &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
-                CacheMeta::new(0, 0, 0),  //meaningless
+                &rdd_ids as *const Vec<usize> as *const u8,
+                &op_ids as *const Vec<OpId> as *const u8,
+                Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
@@ -1273,7 +1333,7 @@ pub trait RddE: Rdd {
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in fold, ecall {:?}s", dur);
         let mut temp = get_encrypted_data::<UE>(
-            self.get_rdd_id(), 
+            self.get_op_id(), 
             DepInfo::padding_new(31), 
             result_ptr as *mut u8,
             false,
@@ -1330,8 +1390,8 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cur_rdd_id = self.get_rdd_id();
-        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
+        let rdd_ids = vec![self.get_rdd_id()];
+        let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -1339,8 +1399,9 @@ pub trait RddE: Rdd {
                 eid,
                 &mut result_ptr,
                 tid,
-                &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
-                CacheMeta::new(0, 0, 0),  //meaningless
+                &rdd_ids as *const Vec<usize> as *const u8,
+                &op_ids as *const Vec<OpId> as *const u8,
+                Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
@@ -1356,7 +1417,7 @@ pub trait RddE: Rdd {
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("in aggregate, ecall {:?}s", dur);
         let mut temp = get_encrypted_data::<UE>(
-            self.get_rdd_id(), 
+            self.get_op_id(), 
             DepInfo::padding_new(31), 
             result_ptr as *mut u8,
             false,
@@ -1367,6 +1428,7 @@ pub trait RddE: Rdd {
 
     /// Return the Cartesian product of this RDD and another one, that is, the RDD of all pairs of
     /// elements (a, b) where a is in `this` and b is in `other`.
+    #[track_caller]
     fn cartesian<U, UE>(
         &self,
         other: SerArc<dyn RddE<Item = U, ItemE = UE>>,
@@ -1413,6 +1475,7 @@ pub trait RddE: Rdd {
     /// coalesce(1000, shuffle = true) will result in 1000 partitions with the
     /// data distributed using a hash partitioner. The optional partition coalescer
     /// passed in must be serializable.
+    #[track_caller]
     fn coalesce(&self, num_partitions: usize, shuffle: bool) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Sized,
@@ -1449,13 +1512,19 @@ pub trait RddE: Rdd {
             let map_steep: SerArc<dyn RddE<Item = (usize, Self::Item), ItemE = (Vec<usize>, Self::ItemE)>> =
                 SerArc::new(MapPartitionsRdd::new(self.get_rdd(), distributed_partition, fe_wrapper_mpp, fd_wrapper_mpp));
             let partitioner = Box::new(HashPartitioner::<usize>::new(num_partitions));
-            SerArc::new(CoalescedRdd::new(
-                Arc::new(map_steep.partition_by_key(partitioner, self.get_fe(), self.get_fd())),
+            self.get_context().add_num(1);
+            let map_steep_part = map_steep.partition_by_key(partitioner, self.get_fe(), self.get_fd());
+            self.get_context().add_num(1);
+            let coalesced = SerArc::new(CoalescedRdd::new(
+                Arc::new(map_steep_part),
                 num_partitions,
                 self.get_fe(),
                 self.get_fd(),
-            ))
+            ));
+            self.get_context().add_num(1);
+            coalesced
         } else {
+            self.get_context().add_num(4);
             SerArc::new(CoalescedRdd::new(self.get_rdd(), num_partitions, self.get_fe(), self.get_fd()))
         }
     }
@@ -1517,8 +1586,8 @@ pub trait RddE: Rdd {
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cur_rdd_id = self.get_rdd_id();
-        let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
+        let rdd_ids = vec![self.get_rdd_id()];
+        let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
@@ -1526,8 +1595,9 @@ pub trait RddE: Rdd {
                 eid,
                 &mut result_ptr,
                 tid,
-                &rdd_ids as *const Vec<(usize, usize)> as *const u8,  //shuffle rdd id
-                CacheMeta::new(0, 0, 0),  //meaningless
+                &rdd_ids as *const Vec<usize> as *const u8,
+                &op_ids as *const Vec<OpId> as *const u8,
+                Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
                 data_ptr as *mut u8 ,
                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
@@ -1553,6 +1623,7 @@ pub trait RddE: Rdd {
 
     /// Return the count of each unique value in this RDD as a dictionary of (value, count) pairs.
     /// TODO fe and fd should be drived from RddE automatically, not act as input
+    #[track_caller]
     fn count_by_value(&self) -> SerArc<dyn RddE<Item = (Self::Item, u64), ItemE = (Self::ItemE, Vec<u8>)>>
     where
         Self: Sized,
@@ -1588,8 +1659,9 @@ pub trait RddE: Rdd {
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
         //TODO modify reduce_by_key
-        self.map(Fn!(|x| (x, 1u64)), fe_wrapper_mp, fd_wrapper_mp)
-        .reduce_by_key(
+        let mapped = self.map(Fn!(|x| (x, 1u64)), fe_wrapper_mp, fd_wrapper_mp);
+        self.get_context().add_num(1);
+        mapped.reduce_by_key(
             Box::new(Fn!(|(x, y)| x + y)) as Box<dyn Func((u64, u64))->u64>,
             self.number_of_splits(),
             fe_wrapper_rd,
@@ -1641,6 +1713,7 @@ pub trait RddE: Rdd {
     }
 
     /// Return a new RDD containing the distinct elements in this RDD.
+    #[track_caller]
     fn distinct_with_num_partitions(
         &self,
         num_partitions: usize,
@@ -1675,15 +1748,17 @@ pub trait RddE: Rdd {
             pt
         });
 
-        self.map(Box::new(Fn!(|x| (Some(x), None)))
+        let mapped = self.map(Box::new(Fn!(|x| (Some(x), None)))
             as Box<
                 dyn Func(Self::Item) -> (Option<Self::Item>, Option<Self::Item>),
-            >, fe_wrapper_mp0, fd_wrapper_mp0)
-        .reduce_by_key(Box::new(Fn!(|(_x, y)| y)),
+            >, fe_wrapper_mp0, fd_wrapper_mp0);
+        self.get_context().add_num(1);
+        let reduced_by_key = mapped.reduce_by_key(Box::new(Fn!(|(_x, y)| y)),
             num_partitions,
             fe_wrapper_rd,
-            fd_wrapper_rd)
-        .map(Box::new(Fn!(|x: (
+            fd_wrapper_rd);
+        self.get_context().add_num(1);
+        reduced_by_key.map(Box::new(Fn!(|x: (
             Option<Self::Item>,
             Option<Self::Item>
         )| {
@@ -1693,6 +1768,7 @@ pub trait RddE: Rdd {
     }
 
     /// Return a new RDD containing the distinct elements in this RDD.
+    #[track_caller]
     fn distinct(&self) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Sized,
@@ -1721,6 +1797,7 @@ pub trait RddE: Rdd {
     ///
     /// If you are decreasing the number of partitions in this RDD, consider using `coalesce`,
     /// which can avoid performing a shuffle.
+    #[track_caller]
     fn repartition(&self, num_partitions: usize) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Sized,
@@ -1792,6 +1869,7 @@ pub trait RddE: Rdd {
     }
 
     /// Randomly splits this RDD with the provided weights.
+    #[track_caller]
     fn random_split(
         &self,
         weights: Vec<f64>,
@@ -1836,6 +1914,7 @@ pub trait RddE: Rdd {
 
                 Box::new(sampler_func(partition).into_iter())
             });
+            //TODO decide whether to add_num
             let rdd = SerArc::new(MapPartitionsRdd::new(self.get_rdd(), func, self.get_fe(), self.get_fd()));
             splitted_rdds.push(rdd.clone());
         }
@@ -1859,6 +1938,7 @@ pub trait RddE: Rdd {
     ///
     /// Replacement requires extra allocations due to the nature of the used sampler (Poisson distribution).
     /// This implies a performance penalty but should be negligible unless fraction and the dataset are rather large.
+    #[track_caller]
     fn sample(&self, with_replacement: bool, fraction: f64) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Sized,
@@ -1886,6 +1966,7 @@ pub trait RddE: Rdd {
     ///
     /// Replacement requires extra allocations due to the nature of the used sampler (Poisson distribution).
     /// This implies a performance penalty but should be negligible unless fraction and the dataset are rather large.
+    #[track_caller]
     fn take_sample(
         &self,
         with_replacement: bool,
@@ -1974,6 +2055,7 @@ pub trait RddE: Rdd {
         self.get_context().run_job(self.get_rdde(), func)
     }
 
+    #[track_caller]
     fn union(
         &self,
         other: Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>,
@@ -1987,6 +2069,7 @@ pub trait RddE: Rdd {
         ])?))
     }
 
+    #[track_caller]
     fn zip<S: Data>(
         &self,
         second: Arc<dyn Rdd<Item = S>>,
@@ -2000,6 +2083,7 @@ pub trait RddE: Rdd {
         ))
     }
 
+    #[track_caller]
     fn intersection<T>(&self, other: Arc<T>) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Clone,
@@ -2013,6 +2097,7 @@ pub trait RddE: Rdd {
     /// subtract function, same as the one found in apache spark 
     /// example of subtract can be found in subtract.rs
     /// performs a full outer join followed by and intersection with self to get subtraction.
+    #[track_caller]
     fn subtract<T>(&self, other: Arc<T>) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Clone,
@@ -2024,6 +2109,7 @@ pub trait RddE: Rdd {
     }
     
     //Both should have consistent security guarantee (encrypted columns)
+    #[track_caller]
     fn subtract_with_num_partition<T>(
         &self,
         other: Arc<T>,
@@ -2078,16 +2164,20 @@ pub trait RddE: Rdd {
                 |x: Self::Item| -> (Self::Item, Option<Self::Item>) { (x, None) }
             )), fe_wrapper_mp0.clone(), fd_wrapper_mp0.clone())
             .clone();
-        let rdd = self
+        self.get_context().add_num(1);
+        let mapped = self
             .map(Box::new(Fn!(
                 |x| -> (Self::Item, Option<Self::Item>) { (x, None) }
-            )), fe_wrapper_mp0, fd_wrapper_mp0)
-            .cogroup(
+            )), fe_wrapper_mp0, fd_wrapper_mp0);
+        self.get_context().add_num(1);
+        let cogrouped = mapped.cogroup(
                 other,
                 fe_wrapper_jn,
                 fd_wrapper_jn,
                 Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
-            ).map(Box::new(Fn!(|(x, (v1, v2)): (
+            );
+        self.get_context().add_num(1);
+        let mapped = cogrouped.map(Box::new(Fn!(|(x, (v1, v2)): (
                 Self::Item,
                 (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>)
             )|
@@ -2097,8 +2187,9 @@ pub trait RddE: Rdd {
                 } else {
                     None
                 }
-            })), fe_wrapper_mp1, fd_wrapper_mp1)
-            .map_partitions(Box::new(Fn!(|iter: Box<
+            })), fe_wrapper_mp1, fd_wrapper_mp1);
+        self.get_context().add_num(1);
+        let rdd = mapped.map_partitions(Box::new(Fn!(|iter: Box<
                 dyn Iterator<Item = Option<Self::Item>>,
             >|
              -> Box<
@@ -2107,12 +2198,13 @@ pub trait RddE: Rdd {
                 Box::new(iter.filter(|x| x.is_some()).map(|x| x.unwrap()))
                     as Box<dyn Iterator<Item = Self::Item>>
             })), self.get_fe(), self.get_fd());
-
+        self.get_context().add_num(1);
         let subtraction = self.intersection(Arc::new(rdd));
         (&*subtraction).register_op_name("subtraction");
         subtraction
     }
 
+    #[track_caller]
     fn intersection_with_num_partitions<T>(
         &self,
         other: Arc<T>,
@@ -2167,17 +2259,20 @@ pub trait RddE: Rdd {
                 |x: Self::Item| -> (Self::Item, Option<Self::Item>) { (x, None) }
             )), fe_wrapper_mp0.clone(), fd_wrapper_mp0.clone())
             .clone();
-        let rdd = self
+        self.get_context().add_num(1);
+        let mapped = self
             .map(Box::new(Fn!(
                 |x| -> (Self::Item, Option<Self::Item>) { (x, None) }
-            )), fe_wrapper_mp0, fd_wrapper_mp0)
-            .cogroup(
+            )), fe_wrapper_mp0, fd_wrapper_mp0);
+        self.get_context().add_num(1);
+        let cogrouped = mapped.cogroup(
                 other,
                 fe_wrapper_jn,
                 fd_wrapper_jn,
                 Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
-            )
-            .map(Box::new(Fn!(|(x, (v1, v2)): (
+            );
+        self.get_context().add_num(1);
+        let mapped = cogrouped.map(Box::new(Fn!(|(x, (v1, v2)): (
                 Self::Item,
                 (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>)
             )|
@@ -2187,8 +2282,9 @@ pub trait RddE: Rdd {
                 } else {
                     None
                 }
-            })), fe_wrapper_mp1, fd_wrapper_mp1)
-            .map_partitions(Box::new(Fn!(|iter: Box<
+            })), fe_wrapper_mp1, fd_wrapper_mp1);
+        self.get_context().add_num(1);
+        let rdd = mapped.map_partitions(Box::new(Fn!(|iter: Box<
                 dyn Iterator<Item = Option<Self::Item>>,
             >|
              -> Box<
@@ -2210,6 +2306,7 @@ pub trait RddE: Rdd {
     /// This operation may be very expensive. If you are grouping in order to perform an
     /// aggregation (such as a sum or average) over each key, using `aggregate_by_key`
     /// or `reduce_by_key` will provide much better performance.
+    #[track_caller]
     fn group_by<K, F>(&self, func: F) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Vec<u8>, Vec<Self::ItemE>)>>
     where
         Self: Sized,
@@ -2228,6 +2325,7 @@ pub trait RddE: Rdd {
     /// This operation may be very expensive. If you are grouping in order to perform an
     /// aggregation (such as a sum or average) over each key, using `aggregate_by_key`
     /// or `reduce_by_key` will provide much better performance.
+    #[track_caller]
     fn group_by_with_num_partitions<K, F>(
         &self,
         func: F,
@@ -2275,11 +2373,12 @@ pub trait RddE: Rdd {
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
 
-        self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
+        let mapped = self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
             let key = (func)(&val);
             (key, val)
-        })), fe_wrapper_mp, fd_wrapper_mp)
-        .group_by_key(fe_wrapper_gb, fd_wrapper_gb, num_splits)
+        })), fe_wrapper_mp, fd_wrapper_mp);
+        self.get_context().add_num(1);
+        mapped.group_by_key(fe_wrapper_gb, fd_wrapper_gb, num_splits)
     }
 
     /// Return an RDD of grouped items. Each group consists of a key and a sequence of elements
@@ -2291,6 +2390,7 @@ pub trait RddE: Rdd {
     /// This operation may be very expensive. If you are grouping in order to perform an
     /// aggregation (such as a sum or average) over each key, using `aggregate_by_key`
     /// or `reduce_by_key` will provide much better performance.
+    #[track_caller]
     fn group_by_with_partitioner<K, F>(
         &self,
         func: F,
@@ -2338,11 +2438,12 @@ pub trait RddE: Rdd {
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
 
-        self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
+        let mapped = self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
             let key = (func)(&val);
             (key, val)
-        })), fe_wrapper_mp, fd_wrapper_mp)
-        .group_by_key_using_partitioner(fe_wrapper_gb, fd_wrapper_gb, partitioner)
+        })), fe_wrapper_mp, fd_wrapper_mp);
+        self.get_context().add_num(1);
+        mapped.group_by_key_using_partitioner(fe_wrapper_gb, fd_wrapper_gb, partitioner)
     }
 
     /// Approximate version of count() that returns a potentially incomplete result
@@ -2389,6 +2490,7 @@ pub trait RddE: Rdd {
     }
 
     /// Creates tuples of the elements in this RDD by applying `f`.
+    #[track_caller]
     fn key_by<T, F>(&self, func: F) -> SerArc<dyn RddE<Item = (Self::Item, T), ItemE = (Self::ItemE, Vec<u8>)>>
     where
         Self: Sized,
@@ -2454,6 +2556,7 @@ pub trait RddE: Rdd {
     /// # Notes
     /// This method should only be used if the resulting array is expected to be small, as
     /// all the data is loaded into the driver's memory.
+    #[track_caller]
     fn top(&self, num: usize) -> Result<Vec<Self::Item>>
     where
         Self: Sized,
@@ -2468,9 +2571,9 @@ pub trait RddE: Rdd {
             (fd)(v).into_iter().map(|x| Reverse(x)).collect::<Vec<_>>()
         });
 
-        Ok(self
-            .map(Fn!(|x| Reverse(x)), fe_wrapper_mp, fd_wrapper_mp)
-            .take_ordered(num)?
+        let mapped = self.map(Fn!(|x| Reverse(x)), fe_wrapper_mp, fd_wrapper_mp);
+        self.get_context().add_num(1);
+        Ok(mapped.take_ordered(num)?
             .into_iter()
             .map(|x| x.0)
             .collect())
@@ -2481,6 +2584,7 @@ pub trait RddE: Rdd {
     /// # Notes
     /// This method should only be used if the resulting array is expected to be small, as
     /// all the data is loaded into the driver's memory.
+    #[track_caller]
     fn take_ordered(&self, num: usize) -> Result<Vec<Self::Item>>
     where
         Self: Sized,

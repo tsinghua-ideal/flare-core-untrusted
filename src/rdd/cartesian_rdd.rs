@@ -62,6 +62,7 @@ where
     FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
     FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
 {
+    #[track_caller]
     pub(crate) fn new(
         rdd1: Arc<dyn Rdd<Item = T>>,
         rdd2: Arc<dyn Rdd<Item = U>>,
@@ -140,6 +141,14 @@ where
         self.vals.id
     }
 
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        todo!()
+    }
+
     fn get_context(&self) -> Arc<Context> {
         self.vals.context.upgrade().unwrap()
     }
@@ -164,7 +173,7 @@ where
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         // rdd_id is actually op_id
-        let value = move_data::<(TE, UE)>(self.get_rdd_id(), value_ptr);
+        let value = move_data::<(TE, UE)>(self.get_op_id(), value_ptr);
         let size = value.get_size();
         (Box::into_raw(value) as *mut u8, size)
     }

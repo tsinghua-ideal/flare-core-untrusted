@@ -75,6 +75,14 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
         self.vals.id
     }
 
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        todo!()
+    }
+
     fn get_context(&self) -> Arc<Context> {
         self.vals.context.upgrade().unwrap()
     }
@@ -180,6 +188,7 @@ impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
 }
 
 impl<F: Data, S: Data> ZippedPartitionsRdd<F, S> {
+    #[track_caller]
     pub fn new(first: Arc<dyn Rdd<Item = F>>, second: Arc<dyn Rdd<Item = S>>) -> Self {
         let mut vals = RddVals::new(first.get_context(), first.get_secure()); //temp
         vals.dependencies

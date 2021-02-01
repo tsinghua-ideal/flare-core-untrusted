@@ -60,6 +60,7 @@ where
     FE: Func(Vec<U>) -> UE + Clone,
     FD: Func(UE) -> Vec<U> + Clone,
 {
+    #[track_caller]
     pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
@@ -110,6 +111,17 @@ where
         self.vals.id
     }
 
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+        if !self.should_cache() {
+            self.prev.get_op_ids(op_ids);
+        }
+    }
+
     fn get_context(&self) -> Arc<Context> {
         self.vals.context.upgrade().unwrap()
     }
@@ -134,7 +146,7 @@ where
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         // rdd_id is actually op_id
-        let value = move_data::<UE>(self.get_rdd_id(), value_ptr);
+        let value = move_data::<UE>(self.get_op_id(), value_ptr);
         let size = value.get_size();
         (Box::into_raw(value) as *mut u8, size)
     }
@@ -208,7 +220,9 @@ where
 
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
         acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             Env::get().captured_vars

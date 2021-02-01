@@ -104,6 +104,7 @@ where
     FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)) + Clone, 
     FD: Func((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone, 
 {
+    #[track_caller]
     pub fn new(
         rdd0: Arc<dyn RddE<Item = (K, V), ItemE = (KE, VE)>>,
         rdd1: Arc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>, 
@@ -116,6 +117,7 @@ where
 
         let mut vals = RddVals::new(context.clone(), secure);
         let cur_rdd_id = vals.id;
+        let cur_op_id = vals.op_id;
         let mut deps = Vec::new();
 
         if rdd0.partitioner()
@@ -139,6 +141,7 @@ where
                     part.clone(),
                     0,
                     cur_rdd_id,
+                    cur_op_id,
                 )) as Arc<dyn ShuffleDependencyTrait>,
             ));
         }
@@ -164,6 +167,7 @@ where
                     part.clone(),
                     1,
                     cur_rdd_id,
+                    cur_op_id,
                 )) as Arc<dyn ShuffleDependencyTrait>,
             ));
         }
@@ -218,6 +222,14 @@ where
         self.vals.id
     }
 
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+    }
+
     fn get_context(&self) -> Arc<Context> {
         self.vals.context.upgrade().unwrap()
     }
@@ -242,7 +254,7 @@ where
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         // rdd_id is actually op_id
-        let value = move_data::<(KE, (CE, DE))>(self.get_rdd_id(), value_ptr);
+        let value = move_data::<(KE, (CE, DE))>(self.get_op_id(), value_ptr);
         let size = value.get_size();
         (Box::into_raw(value) as *mut u8, size)
     }
@@ -404,8 +416,11 @@ where
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let cur_rdd_id = self.get_rdd_id();
+            let cur_op_id = self.get_op_id();
             acc_arg.insert_rdd_id(cur_rdd_id);
-            let rdd_ids = vec![(cur_rdd_id, cur_rdd_id)];
+            acc_arg.insert_op_id(cur_op_id);
+            let rdd_ids = vec![cur_rdd_id];
+            let op_ids = vec![cur_op_id];
 
             println!("secure_compute in co_group_rdd");
             let mut deps = split.clone().deps;
@@ -415,10 +430,10 @@ where
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), split.get_index(), DepInfo::padding_new(01));
+                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(01));
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
-                        let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_rdd_id(), acc_arg_cg.dep_info, received as *mut u8, false);
+                        let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         if result_bl.len() != 0 {
                             chunk_size += result_bl.get_aprox_size() / result_bl.len();
                             num_sub_part += 1;
@@ -446,10 +461,10 @@ where
             match deps.remove(0) {    //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(rdd.get_rdd_id(), split.get_index(), DepInfo::padding_new(01));
+                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(01));
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
-                        let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_rdd_id(), acc_arg_cg.dep_info, received as *mut u8, false);
+                        let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         if result_bl.len() != 0 {
                             chunk_size += result_bl.get_aprox_size() / result_bl.len();
                             num_sub_part += 1;
@@ -505,13 +520,14 @@ where
                     if !acc_arg.cached(&sub_part_id) {
                         let mut result_bl_ptr = wrapper_secure_execute(
                             &rdd_ids,
+                            &op_ids,
                             cache_meta, //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
                             DepInfo::padding_new(20), //shuffle read and no encryption for result
                             Box::new(block),
                             &captured_vars,
                         );
                         let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                            acc_arg.get_final_rdd_id(), 
+                            &acc_arg.op_ids,
                             cache_meta, 
                             acc_arg.dep_info,
                         );
@@ -531,7 +547,8 @@ where
                                 eid,
                                 &mut result_bl_ptr,
                                 tid,
-                                &acc_arg.rdd_ids as *const Vec<(usize, usize)> as *const u8,
+                                &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
+                                &acc_arg.op_ids as *const Vec<OpId> as *const u8,
                                 cache_meta,
                                 acc_arg.dep_info,  
                                 block_ptr,

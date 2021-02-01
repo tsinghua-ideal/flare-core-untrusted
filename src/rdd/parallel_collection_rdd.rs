@@ -41,6 +41,7 @@ enum DataForm<T, TE> {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ParallelCollectionSplit<T> {
     rdd_id: usize,
+    op_id: OpId,
     index: usize,
     values: Arc<Vec<T>>,
 }
@@ -52,9 +53,10 @@ impl<T: Data> Split for ParallelCollectionSplit<T> {
 }
 
 impl<T: Data> ParallelCollectionSplit<T> {
-    fn new(rdd_id: usize, index: usize, values: Arc<Vec<T>>) -> Self {
+    fn new(rdd_id: usize, op_id: OpId, index: usize, values: Arc<Vec<T>>) -> Self {
         ParallelCollectionSplit {
             rdd_id,
+            op_id,
             index,
             values,
         }
@@ -76,7 +78,9 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let data_size = data.get_aprox_size() / len;
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.rdd_id;
+        let cur_op_id = self.op_id;
         acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
         //sub-partition
         let mut acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
@@ -94,7 +98,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                 //currently, all sub_partitions are not cached as long as coming to this rdd
                 if !acc_arg.cached(&sub_part_id) {  
                     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                        acc_arg.get_final_rdd_id(), 
+                        &acc_arg.op_ids,
                         cache_meta, 
                         acc_arg.dep_info,
                     );
@@ -108,6 +112,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     let block = Box::new((&data[cur..next]).to_vec());
                     let result_bl_ptr = wrapper_secure_execute(
                         &acc_arg.rdd_ids,
+                        &acc_arg.op_ids,
                         cache_meta,
                         acc_arg.dep_info,
                         block,
@@ -177,6 +182,7 @@ where
     FE: Func(Vec<T>) -> TE + Clone,
     FD: Func(TE) -> Vec<T> + Clone,
 {
+    #[track_caller]
     pub fn new<I, IE>(context: Arc<Context>, data: I, data_enc: IE, fe: FE, fd: FD, num_slices: usize) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -321,6 +327,14 @@ where
         self.rdd_vals.vals.id
     }
 
+    fn get_op_id(&self) -> OpId {
+        self.rdd_vals.vals.op_id
+    }
+
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+    }
+
     fn get_context(&self) -> Arc<Context> {
         self.rdd_vals.vals.context.upgrade().unwrap()
     }
@@ -353,7 +367,7 @@ where
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         // rdd_id is actually op_id
-        let value = move_data::<TE>(self.get_rdd_id(), value_ptr);
+        let value = move_data::<TE>(self.get_op_id(), value_ptr);
         let size = value.get_size();
         (Box::into_raw(value) as *mut u8, size)
     }
@@ -365,6 +379,7 @@ where
                 .map(|i| {
                     Box::new(ParallelCollectionSplit::new(
                         self.rdd_vals.vals.id,
+                        self.rdd_vals.vals.op_id,
                         i,
                         splits[i as usize].clone(),
                     )) as Box<dyn Split>
@@ -376,6 +391,7 @@ where
                 .map(|i| {
                     Box::new(ParallelCollectionSplit::new(
                         self.rdd_vals.vals.id,
+                        self.rdd_vals.vals.op_id,
                         i,
                         splits[i as usize].clone(),
                     )) as Box<dyn Split>

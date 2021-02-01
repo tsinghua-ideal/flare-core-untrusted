@@ -1,3 +1,4 @@
+use core::panic::Location;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Read};
@@ -32,6 +33,7 @@ pub struct LocalFsReaderConfig {
 
 impl LocalFsReaderConfig {
     /// Read all the files from a directory or a path.
+    #[track_caller]
     pub fn new<T: Into<PathBuf>>(path: T) -> LocalFsReaderConfig {
         LocalFsReaderConfig {
             filter_ext: None,
@@ -140,6 +142,7 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LocalFsReader<T> {
     id: usize,
+    op_id: OpId,
     secure: bool,
     ecall_ids: Arc<Mutex<Vec<usize>>>,
     path: PathBuf,
@@ -156,6 +159,7 @@ pub struct LocalFsReader<T> {
 }
 
 impl<T: Data> LocalFsReader<T> {
+    #[track_caller]
     fn new(config: LocalFsReaderConfig, context: Arc<Context>) -> Self {
         let LocalFsReaderConfig {
             dir_path,
@@ -170,8 +174,11 @@ impl<T: Data> LocalFsReader<T> {
             path.is_file()
         };
 
+        let loc = Location::caller(); 
+
         LocalFsReader {
             id: context.new_rdd_id(),
+            op_id: context.new_op_id(loc),
             path: dir_path,
             is_single_file,
             filter_ext,
@@ -362,6 +369,14 @@ macro_rules! impl_common_lfs_rddb_funcs {
             self.id
         }
 
+        fn get_op_id(&self) -> OpId {
+            self.op_id
+        }
+
+        fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+            op_ids.push(self.get_op_id());
+        }
+
         fn get_context(&self) -> Arc<Context> {
             self.context.clone()
         }
@@ -505,7 +520,9 @@ impl Rdd for LocalFsReader<BytesReader> {
         let len = data.len();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
         acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let mut sub_part_id = 0;
@@ -521,7 +538,7 @@ impl Rdd for LocalFsReader<BytesReader> {
                 let mut is_survivor = next == len; 
                 if !acc_arg.cached(&sub_part_id) {
                     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                        acc_arg.get_final_rdd_id(), 
+                        &acc_arg.op_ids,
                         cache_meta, 
                         acc_arg.dep_info,
                     );
@@ -534,6 +551,7 @@ impl Rdd for LocalFsReader<BytesReader> {
                     let block = Box::new((&data[cur..next]).to_vec());
                     let result_bl_ptr = wrapper_secure_execute(
                         &acc_arg.rdd_ids, 
+                        &acc_arg.op_ids,
                         cache_meta, 
                         acc_arg.dep_info, 
                         block, 

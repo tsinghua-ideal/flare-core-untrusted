@@ -25,6 +25,7 @@ where
     KE: Data + Eq + Hash, 
     VE: Data,
 {
+    #[track_caller]
     fn combine_by_key<KE2: Data, C: Data, CE: Data, FE, FD>(
         &self,
         aggregator: Aggregator<K, V, C>,
@@ -46,6 +47,7 @@ where
         ))
     }
 
+    #[track_caller]
     fn group_by_key<CE, FE, FD>(&self, fe: FE, fd: FD, num_splits: usize) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, CE)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
@@ -60,6 +62,7 @@ where
         )
     }
 
+    #[track_caller]
     fn group_by_key_using_partitioner<CE, FE, FD>(
         &self,
         fe: FE,
@@ -75,6 +78,7 @@ where
         self.combine_by_key(Aggregator::<K, V, _>::default(), partitioner, fe, fd)
     }
 
+    #[track_caller]
     fn reduce_by_key<KE2, VE2, F, FE, FD>(&self, func: F, num_splits: usize, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = (K, V), ItemE = (KE2, VE2)>>
     where
         KE2: Data,
@@ -92,6 +96,7 @@ where
         )
     }
 
+    #[track_caller]
     fn reduce_by_key_using_partitioner<KE2, VE2, F, FE, FD>(
         &self,
         func: F,
@@ -115,6 +120,7 @@ where
         self.combine_by_key(aggregator, partitioner, fe, fd)
     }
 
+    #[track_caller]
     fn map_values<U, UE, F, FE, FD>(
         &self,
         f: F,
@@ -132,6 +138,7 @@ where
         SerArc::new(MappedValuesRdd::new(self.get_rdd(), f, fe, fd))
     }
 
+    #[track_caller]
     fn flat_map_values<U, UE, F, FE, FD>(
         &self,
         f: F,
@@ -149,6 +156,7 @@ where
         SerArc::new(FlatMappedValuesRdd::new(self.get_rdd(), f, fe, fd))
     }
 
+    #[track_caller]
     fn join<W, WE, FE, FD>(
         &self,
         other: SerArc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
@@ -198,15 +206,17 @@ where
                 ).collect::<Vec<_>>()
         });
 
-        self.cogroup(
+        let cogrouped = self.cogroup(
             other,
             fe_cg,
             fd_cg,
             Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
-        )
-        .flat_map_values(Box::new(f), fe, fd)
+        );
+        self.get_context().add_num(1);
+        cogrouped.flat_map_values(Box::new(f), fe, fd)
     }
 
+    #[track_caller]
     fn cogroup<W, WE, CE, DE, FE, FD>(
         &self,
         other: SerArc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
@@ -225,6 +235,7 @@ where
         SerArc::new(CoGroupedRdd::new(self.get_rdde(), other.get_rdde(), fe, fd, partitioner))
     }
 
+    #[track_caller]
     fn partition_by_key<FE, FD>(&self, partitioner: Box<dyn Partitioner>, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = V, ItemE = VE>>
     where 
         FE: SerFunc(Vec<V>) -> VE, 
@@ -263,6 +274,7 @@ where
             let iter: Box<dyn Iterator<Item = _>> = Box::new(values.into_iter());
             iter
         });
+        self.get_context().add_num(1);
         shuffle_steep.flat_map(flattener, fe, fd)
     }
 }
@@ -342,6 +354,7 @@ where
     FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
     FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
+    #[track_caller]
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
@@ -393,6 +406,15 @@ where
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+        if !self.should_cache() {
+            self.prev.get_op_ids(op_ids);
+        }
+    }
     fn get_context(&self) -> Arc<Context> {
         self.vals.context.upgrade().unwrap()
     }
@@ -416,7 +438,7 @@ where
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         // rdd_id is actually op_id
-        let value = move_data::<(KE, UE)>(self.get_rdd_id(), value_ptr);
+        let value = move_data::<(KE, UE)>(self.get_op_id(), value_ptr);
         let size = value.get_size();
         (Box::into_raw(value) as *mut u8, size)
     }
@@ -471,7 +493,9 @@ where
     }
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
         acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             Env::get().captured_vars
@@ -579,6 +603,7 @@ where
     FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
     FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
+    #[track_caller]
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         vals.dependencies
@@ -630,6 +655,15 @@ where
     fn get_rdd_id(&self) -> usize {
         self.vals.id
     }
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+        if !self.should_cache() {
+            self.prev.get_op_ids(op_ids);
+        }
+    }
     fn get_context(&self) -> Arc<Context> {
         self.vals.context.upgrade().unwrap()
     }
@@ -652,7 +686,7 @@ where
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         // rdd_id is actually op_id
-        let value = move_data::<(KE, UE)>(self.get_rdd_id(), value_ptr);
+        let value = move_data::<(KE, UE)>(self.get_op_id(), value_ptr);
         let size = value.get_size();
         (Box::into_raw(value) as *mut u8, size)
     }
@@ -709,7 +743,9 @@ where
     }
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
         acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             Env::get().captured_vars

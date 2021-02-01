@@ -39,6 +39,7 @@ where
     FE: Func(Vec<T>) -> TE + Clone,
     FD: Func(TE) -> Vec<T> + Clone,
 {
+    #[track_caller]
     pub(crate) fn new(
         prev: Arc<dyn Rdd<Item = T>>,
         sampler: Arc<dyn RandomSampler<T>>,
@@ -115,6 +116,17 @@ where
         self.vals.id
     }
 
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+        if !self.should_cache() {
+            self.prev.get_op_ids(op_ids);
+        }
+    }
+
     fn get_context(&self) -> Arc<Context> {
         self.vals.context.upgrade().unwrap()
     }
@@ -139,7 +151,7 @@ where
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         // rdd_id is actually op_id
-        let value = move_data::<TE>(self.get_rdd_id(), value_ptr);
+        let value = move_data::<TE>(self.get_op_id(), value_ptr);
         let size = value.get_size();
         (Box::into_raw(value) as *mut u8, size)
     }

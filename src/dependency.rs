@@ -1,7 +1,7 @@
-use crate::{aggregator::Aggregator, executor};
+use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
-use crate::rdd::{AccArg, get_encrypted_data, RddBase, EENTER_LOCK};
+use crate::rdd::{default_hash, get_encrypted_data, AccArg, OpId, RddBase, EENTER_LOCK};
 use crate::serializable_traits::Data;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
@@ -21,13 +21,17 @@ pub struct DepInfo {
     identifier: usize,
     parent_rdd_id: usize,
     child_rdd_id: usize, 
+    parent_op_id: OpId,
+    child_op_id: OpId,
 }
 
 impl DepInfo {
     pub fn new(is_shuffle: u8,
         identifier: usize,
         parent_rdd_id: usize,
-        child_rdd_id: usize
+        child_rdd_id: usize,
+        parent_op_id: OpId,
+        child_op_id: OpId,
     ) -> Self {
         // The last three items is useful only when is_shuffle == 1x, x == 0 or x == 1
         DepInfo {
@@ -35,6 +39,8 @@ impl DepInfo {
             identifier,
             parent_rdd_id,
             child_rdd_id, 
+            parent_op_id,
+            child_op_id,
         }
     }
 
@@ -45,6 +51,8 @@ impl DepInfo {
             identifier: 0,
             parent_rdd_id: 0,
             child_rdd_id: 0, 
+            parent_op_id: Default::default(),
+            child_op_id: Default::default(),
         }
     }
 }
@@ -177,6 +185,8 @@ where
     identifier: usize,
     parent_rdd_id: usize,
     child_rdd_id: usize,
+    parent_op_id: OpId,
+    child_op_id: OpId,
     _marker_ke: PhantomData<KE>,
     _marker_ce: PhantomData<CE>,
 }
@@ -197,8 +207,10 @@ where
         partitioner: Box<dyn Partitioner>,
         identifier: usize,
         child_rdd_id: usize,
+        child_op_id: OpId,
     ) -> Self {
         let parent_rdd_id = rdd_base.get_rdd_id();
+        let parent_op_id = rdd_base.get_op_id();
         ShuffleDependency {
             shuffle_id,
             is_cogroup,
@@ -209,6 +221,8 @@ where
             identifier,
             parent_rdd_id,
             child_rdd_id,
+            parent_op_id,
+            child_op_id,
             _marker_ke: PhantomData,
             _marker_ce: PhantomData,
         }
@@ -229,6 +243,8 @@ where
             self.identifier,
             self.parent_rdd_id,
             self.child_rdd_id,
+            self.parent_op_id,
+            self.child_op_id,
         )
     }
 
@@ -252,11 +268,11 @@ where
         );
         log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
         if rdd_base.get_secure() {
+            let mut op_ids = vec![self.child_op_id]; 
+            rdd_base.get_op_ids(&mut op_ids);
+            let hash_ops = default_hash(&op_ids);
             let key = (
-                self.parent_rdd_id, 
-                env::RDDB_MAP.map_id(self.parent_rdd_id), 
-                self.child_rdd_id, 
-                env::RDDB_MAP.map_id(self.child_rdd_id), 
+                hash_ops,
                 partition,
             );
             let res = env::SPEC_SHUFFLE_CACHE.get(&key)
@@ -287,9 +303,8 @@ where
                     let split = rdd_base.splits()[partition].clone();
                     log::debug!("split index: {}", split.get_index());
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let rdd_id = rdd_base.get_rdd_id();
                     let dep_info = self.get_dep_info();
-                    let mut acc_arg = AccArg::new(rdd_id, partition, dep_info);  
+                    let mut acc_arg = AccArg::new(partition, dep_info);  
                     let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
                     let now = Instant::now();
                     let num_output_splits = self.partitioner.get_num_of_partitions();
@@ -298,7 +313,7 @@ where
                         .collect::<Vec<_>>();
         
                     for block_ptr in rx { 
-                        let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_id, dep_info, block_ptr as *mut u8, false);
+                        let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8, false);
                         assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
                         for (i, bucket) in buckets_bl.into_iter().enumerate() {
                             buckets[i].push(bucket); 

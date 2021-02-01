@@ -21,21 +21,10 @@ use tokio::runtime::{Handle, Runtime};
 use sgx_types::*;
 use sgx_urts::SgxEnclave;
 
-extern "C" {
-    pub fn get_lp_boundary(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-    ) -> sgx_status_t;
-    pub fn free_lp_boundary(
-        eid: sgx_enclave_id_t,
-        lp_bd_ptr: *mut u8,
-    ) -> sgx_status_t;
-}
-
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
 type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
 /// The key is: {parent_rdd_id}/{parent_op_id}/{child_rdd_id}/{child_op_id}/{input_id(part_id)}
-type SpecShuffleCache =  Arc<DashMap<(usize, usize, usize, usize, usize), Vec<Vec<Vec<u8>>> >>;
+type SpecShuffleCache =  Arc<DashMap<(u64, usize), Vec<Vec<Vec<u8>>> >>;
 
 
 const ENV_VAR_PREFIX: &str = "VEGA_";
@@ -50,76 +39,23 @@ pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(Bounde
 pub(crate) static RDDB_MAP: Lazy<RddBMap> = Lazy::new(|| RddBMap::new()); 
 
 pub(crate) struct RddBMap {
-    map: Arc<DashMap<usize, Arc<dyn RddBase>>>, //op_id -> rddbase
-    lp_boundary: Vec<(usize, usize, usize)>,
+    map: Arc<DashMap<usize, Arc<dyn RddBase>>>, //rdd_id -> rddbase
 }
 
 impl RddBMap {
     pub fn new() -> Self {
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let mut lp_bd_ptr = 0;
-        let sgx_status = unsafe { 
-            get_lp_boundary(
-                eid,
-                &mut lp_bd_ptr,
-            )
-        };
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            }
-        }
-        let lp_boundary_ = unsafe {
-            Box::from_raw(lp_bd_ptr as *mut u8 as *mut Vec<(usize, usize, usize)>)
-        };
-        let lp_boundary = *lp_boundary_.clone();
-        forget(lp_boundary_);
-        let sgx_status = unsafe { 
-            free_lp_boundary(
-                eid,
-                lp_bd_ptr as *mut u8,
-            )
-        };
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            }
-        }
-
         RddBMap {
             map: Arc::new(DashMap::new()),
-            lp_boundary,
         }
     }
 
     pub fn get_rddb(&self, rdd_id: usize) -> Option<Arc<dyn RddBase>> {
-        self.map.get(&self.map_id(rdd_id)).map(|x| x.clone())
+        self.map.get(&rdd_id).map(|x| x.clone())
     }
 
     pub fn insert(&self, rdd_id: usize, rdd_base: Arc<dyn RddBase>) {
-        self.map.insert(self.map_id(rdd_id), rdd_base);
-    }
-
-    pub fn map_id(&self, rdd_id: usize) -> usize {
-        let lp_bd = &self.lp_boundary;
-        if lp_bd.len() == 0 {
-            return rdd_id;
-        }
-        let mut sum_rep = 0;
-        for &i in lp_bd.iter() {
-            let lower_bound = i.0 + sum_rep;
-            let upper_bound = lower_bound + i.2 * (i.1 - i.0);
-            if rdd_id <= lower_bound {   //outside loop
-                return rdd_id - sum_rep;
-            } else if rdd_id > lower_bound && rdd_id <= upper_bound { //inside loop
-                let dedup_id = rdd_id - sum_rep;
-                return  (dedup_id + i.1 - 2 * i.0 - 1) % (i.1 - i.0) + i.0 + 1;
-            }
-            sum_rep += (i.2 - 1) * (i.1 - i.0);
-        }
-        return rdd_id - sum_rep;
+        self.map.insert(rdd_id, rdd_base);
     }
 }
 
