@@ -47,7 +47,6 @@ where
     rdd2: Arc<dyn Rdd<Item = U>>,
     fe: FE,
     fd: FD,
-    ecall_ids: Arc<Mutex<Vec<usize>>>,
     num_partitions_in_rdd2: usize,
     _marker_t: PhantomData<T>,
     _market_u: PhantomData<U>,
@@ -70,7 +69,6 @@ where
         fd: FD,
     ) -> Self {
         let vals = Arc::new(RddVals::new(rdd1.get_context(), rdd1.get_secure()));
-        let ecall_ids = rdd1.get_ecall_ids();
         let num_partitions_in_rdd2 = rdd2.number_of_splits();
         CartesianRdd {
             vals,
@@ -78,7 +76,6 @@ where
             rdd2,
             fe,
             fd,
-            ecall_ids,
             num_partitions_in_rdd2,
             _marker_t: PhantomData,
             _market_u: PhantomData,
@@ -102,7 +99,6 @@ where
             rdd2: self.rdd2.clone(),
             fe: self.fe.clone(),
             fd: self.fd.clone(),
-            ecall_ids: self.ecall_ids.clone(),
             num_partitions_in_rdd2: self.num_partitions_in_rdd2,
             _marker_t: PhantomData,
             _market_u: PhantomData,
@@ -159,16 +155,6 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
-    }
-
-    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
-        self.ecall_ids.clone()
-    }
-
-    fn insert_ecall_id(&self) {
-        if self.vals.secure {
-            self.ecall_ids.lock().push(self.vals.id);
-        }
     }
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {

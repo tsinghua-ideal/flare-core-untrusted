@@ -51,7 +51,6 @@ where
     #[serde(with = "serde_traitobject")]
     aggregator: Arc<Aggregator<K, V, C>>,
     vals: Arc<RddVals>,
-    ecall_ids: Arc<Mutex<Vec<usize>>>,
     #[serde(with = "serde_traitobject")]
     part: Box<dyn Partitioner>,
     shuffle_id: usize,
@@ -74,7 +73,6 @@ where
             parent: self.parent.clone(),
             aggregator: self.aggregator.clone(),
             vals: self.vals.clone(),
-            ecall_ids: self.ecall_ids.clone(),
             part: self.part.clone(),
             shuffle_id: self.shuffle_id,
             fe: self.fe.clone(),
@@ -103,7 +101,6 @@ where
     ) -> Self {
         let ctx = parent.get_context();
         let secure = parent.get_secure();   //temp
-        let ecall_ids = parent.get_ecall_ids();
         let shuffle_id = ctx.new_shuffle_id();
         let mut vals = RddVals::new(ctx, secure);
         let cur_rdd_id = vals.id;
@@ -127,166 +124,20 @@ where
             parent,
             aggregator,
             vals,
-            ecall_ids,
             part,
             shuffle_id,
             fe,
             fd,
         }
     }
-}
 
-impl<K, V, C, KE, CE, FE, FD> RddBase for ShuffledRdd<K, V, C, KE, CE, FE, FD> 
-where
-    K: Data + Eq + Hash,
-    V: Data, 
-    C: Data,
-    KE: Data,
-    CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
-    FD: SerFunc((KE, CE)) -> Vec<(K, C)>, 
-{
-    fn cache(&self) {
-        self.vals.cache();
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
-    }
-
-    fn should_cache(&self) -> bool {
-        self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<(KE, CE)>)
-        };
-    }
-    
-    fn get_rdd_id(&self) -> usize {
-        self.vals.id
-    }
-
-    fn get_op_id(&self) -> OpId {
-        self.vals.op_id
-    }
-
-    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
-        op_ids.push(self.get_op_id());
-    }
-
-    fn get_context(&self) -> Arc<Context> {
-        self.vals.context.upgrade().unwrap()
-    }
-
-    fn get_dependencies(&self) -> Vec<Dependency> {
-        self.vals.dependencies.clone()
-    }
-
-    fn get_secure(&self) -> bool {
-        self.vals.secure
-    }
-
-    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
-        self.ecall_ids.clone()
-    }
-
-    fn insert_ecall_id(&self) {
-        if self.vals.secure {
-            self.ecall_ids.lock().push(self.vals.id);
-        }
-    }
-
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<(KE, CE)>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
-    }
-
-    fn splits(&self) -> Vec<Box<dyn Split>> {
-        (0..self.part.get_num_of_partitions())
-            .map(|x| Box::new(ShuffledRddSplit::new(x)) as Box<dyn Split>)
-            .collect()
-    }
-
-    fn number_of_splits(&self) -> usize {
-        self.part.get_num_of_partitions()
-    }
-
-    fn partitioner(&self) -> Option<Box<dyn Partitioner>> {
-        Some(self.part.clone())
-    }
-
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
-        self.secure_compute(split, acc_arg, tx)
-    }
-
-    fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        log::debug!("inside iterator_any shuffledrdd",);
-        Ok(Box::new(
-            self.iterator(split)?
-                .map(|(k, v)| Box::new((k, v)) as Box<dyn AnyData>),
-        ))
-    }
-}
-
-impl<K, V, C, KE, CE, FE, FD> Rdd for ShuffledRdd<K, V, C, KE, CE, FE, FD> 
-where
-    K: Data + Eq + Hash,
-    V: Data, 
-    C: Data,
-    KE: Data,
-    CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
-    FD: SerFunc((KE, CE)) -> Vec<(K, C)>, 
-{
-    type Item = (K, C);
-
-    fn get_rdd_base(&self) -> Arc<dyn RddBase> {
-        Arc::new(self.clone()) as Arc<dyn RddBase>
-    }
-
-    fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
-        Arc::new(self.clone())
-    }
-
-    fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
-        log::debug!("compute inside shuffled rdd");
-        let now = Instant::now();
-
-        let fut = ShuffleFetcher::fetch::<K, C>(self.shuffle_id, split.get_index());
-        let mut combiners: HashMap<K, Option<C>> = HashMap::new();
-        for (k, c) in futures::executor::block_on(fut)?.into_iter() {
-            if let Some(old_c) = combiners.get_mut(&k) {
-                let old = old_c.take().unwrap();
-                let input = ((old, c),);
-                let output = self.aggregator.merge_combiners.call(input);
-                *old_c = Some(output);
-            } else {
-                combiners.insert(k, Some(c));
-            }
-        }
-
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in ShuffledRdd shuffle read {:?}", dur);
-        Ok(Box::new(
-            combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
-        ))
-    }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
         let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cur_rdd_id = self.get_rdd_id();
-        let cur_op_id = self.get_op_id();
-        acc_arg.insert_rdd_id(cur_rdd_id);
-        acc_arg.insert_op_id(cur_op_id);
+        let cur_rdd_id = self.vals.id;
+        let cur_op_id = self.vals.op_id;
         let rdd_ids = vec![cur_rdd_id];
         let op_ids = vec![cur_op_id];
 
@@ -377,6 +228,166 @@ where
             println!("in ShuffledRdd, shuffle read + narrow {:?}", dur);  
         });
         Ok(vec![handle])
+    } 
+
+}
+
+impl<K, V, C, KE, CE, FE, FD> RddBase for ShuffledRdd<K, V, C, KE, CE, FE, FD> 
+where
+    K: Data + Eq + Hash,
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
+    FD: SerFunc((KE, CE)) -> Vec<(K, C)>, 
+{
+    fn cache(&self) {
+        self.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+
+    fn should_cache(&self) -> bool {
+        self.vals.should_cache()
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<(KE, CE)>)
+        };
+    }
+    
+    fn get_rdd_id(&self) -> usize {
+        self.vals.id
+    }
+
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+    }
+
+    fn get_context(&self) -> Arc<Context> {
+        self.vals.context.upgrade().unwrap()
+    }
+
+    fn get_dependencies(&self) -> Vec<Dependency> {
+        self.vals.dependencies.clone()
+    }
+
+    fn get_secure(&self) -> bool {
+        self.vals.secure
+    }
+
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<(KE, CE)>(self.get_op_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
+    }
+
+    fn splits(&self) -> Vec<Box<dyn Split>> {
+        (0..self.part.get_num_of_partitions())
+            .map(|x| Box::new(ShuffledRddSplit::new(x)) as Box<dyn Split>)
+            .collect()
+    }
+
+    fn number_of_splits(&self) -> usize {
+        self.part.get_num_of_partitions()
+    }
+
+    fn partitioner(&self) -> Option<Box<dyn Partitioner>> {
+        Some(self.part.clone())
+    }
+
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
+    }
+
+    fn iterator_any(
+        &self,
+        split: Box<dyn Split>,
+    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+        log::debug!("inside iterator_any shuffledrdd",);
+        Ok(Box::new(
+            self.iterator(split)?
+                .map(|(k, v)| Box::new((k, v)) as Box<dyn AnyData>),
+        ))
+    }
+}
+
+impl<K, V, C, KE, CE, FE, FD> Rdd for ShuffledRdd<K, V, C, KE, CE, FE, FD> 
+where
+    K: Data + Eq + Hash,
+    V: Data, 
+    C: Data,
+    KE: Data,
+    CE: Data,
+    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
+    FD: SerFunc((KE, CE)) -> Vec<(K, C)>, 
+{
+    type Item = (K, C);
+
+    fn get_rdd_base(&self) -> Arc<dyn RddBase> {
+        Arc::new(self.clone()) as Arc<dyn RddBase>
+    }
+
+    fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
+        Arc::new(self.clone())
+    }
+
+    fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+        log::debug!("compute inside shuffled rdd");
+        let now = Instant::now();
+
+        let fut = ShuffleFetcher::fetch::<K, C>(self.shuffle_id, split.get_index());
+        let mut combiners: HashMap<K, Option<C>> = HashMap::new();
+        for (k, c) in futures::executor::block_on(fut)?.into_iter() {
+            if let Some(old_c) = combiners.get_mut(&k) {
+                let old = old_c.take().unwrap();
+                let input = ((old, c),);
+                let output = self.aggregator.merge_combiners.call(input);
+                *old_c = Some(output);
+            } else {
+                combiners.insert(k, Some(c));
+            }
+        }
+
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("in ShuffledRdd shuffle read {:?}", dur);
+        Ok(Box::new(
+            combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
+        ))
+    }
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
+        acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
+
+        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
+        let should_cache = self.should_cache();
+        if should_cache {
+            let mut handles = secure_compute_cached(
+                acc_arg, 
+                cur_rdd_id, 
+                tx.clone(),
+                captured_vars,
+            );
+
+            if !acc_arg.totally_cached() {
+                handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
+            }
+            Ok(handles)     
+        } else {
+            self.secure_compute_prev(split, acc_arg, tx)
+        }
+
     }
 }
 

@@ -833,8 +833,6 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     }
     fn get_dependencies(&self) -> Vec<Dependency>;
     fn get_secure(&self) -> bool;
-    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>>;
-    fn insert_ecall_id(&self);
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize);
     fn preferred_locations(&self, _split: Box<dyn Split>) -> Vec<Ipv4Addr> {
         Vec::new()
@@ -911,14 +909,8 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn get_secure(&self) -> bool {
         (**self).get_rdd_base().get_secure()
     }
-    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
-        (**self).get_rdd_base().get_ecall_ids()
-    }
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
         (**self).move_allocation(value_ptr)
-    }
-    fn insert_ecall_id(&self) {
-        (**self).get_rdd_base().insert_ecall_id();
     }
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()

@@ -71,16 +71,17 @@ impl<T: Data> ParallelCollectionSplit<T> {
     fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
+        let cur_rdd_id = self.rdd_id;
+        let cur_op_id = self.op_id;
+        acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
         if len == 0 {
             return std::thread::spawn(|| {});
         }
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
         let data_size = data.get_aprox_size() / len;
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cur_rdd_id = self.rdd_id;
-        let cur_op_id = self.op_id;
-        acc_arg.insert_rdd_id(cur_rdd_id);
-        acc_arg.insert_op_id(cur_op_id);
+
         //sub-partition
         let mut acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
@@ -138,7 +139,6 @@ impl<T: Data> ParallelCollectionSplit<T> {
 #[derive(Serialize, Deserialize)]
 pub struct ParallelCollectionVals<T, TE> {
     vals: Arc<RddVals>,
-    ecall_ids: Arc<Mutex<Vec<usize>>>,
     #[serde(skip_serializing, skip_deserializing)]
     context: Weak<Context>,
     splits_: DataForm<T, TE>,
@@ -204,7 +204,6 @@ where
             rdd_vals: Arc::new(ParallelCollectionVals {
                 context: Arc::downgrade(&context),
                 vals: Arc::new(RddVals::new(context.clone(), secure)), //chain of security
-                ecall_ids: Arc::new(Mutex::new(Vec::new())),
                 splits_: ParallelCollection::<T, TE, FE, FD>::slice(data, data_enc, num_slices),
                 num_slices, //field init shorthand
             }),
@@ -354,15 +353,6 @@ where
     
     fn get_secure(&self) -> bool {
         self.rdd_vals.vals.secure
-    }
-
-    fn get_ecall_ids(&self) -> Arc<Mutex<Vec<usize>>> {
-        self.rdd_vals.ecall_ids.clone()
-    }
-    fn insert_ecall_id(&self) {
-        if self.rdd_vals.vals.secure {
-            self.rdd_vals.ecall_ids.lock().push(self.rdd_vals.vals.id);
-        }
     }
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
