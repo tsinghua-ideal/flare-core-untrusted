@@ -1482,7 +1482,6 @@ pub trait RddE: Rdd {
     {
         if shuffle {
             // Distributes elements evenly across output partitions, starting from a random partition.
-            use std::hash::Hasher;
             let distributed_partition = Fn!(
                 move |index: usize, items: Box<dyn Iterator<Item = Self::Item>>| {
                     let mut hasher = MetroHasher::default();

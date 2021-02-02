@@ -22,7 +22,7 @@ pub(crate) type EventQueue = Arc<DashMap<usize, VecDeque<CompletionEvent>>>;
 #[async_trait::async_trait]
 pub(crate) trait NativeScheduler: Send + Sync {
     /// Fast path for execution. Runs the DD in the driver main thread if possible.
-    fn local_execution<T: Data, TE: Data, U: Data, F, L>(
+    async fn local_execution<T: Data, TE: Data, U: Data, F, L>(
         jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<Option<Vec<U>>>
     where
@@ -33,30 +33,34 @@ pub(crate) trait NativeScheduler: Send + Sync {
             let split = (jt.final_rdd.splits()[jt.output_parts[0]]).clone();
             let task_context = TaskContext::new(jt.final_stage.id, jt.output_parts[0], 0);
             let now = Instant::now();
-            let res = Ok(Some(vec![(&jt.func)((
-                task_context,
-                match jt.final_rdd.get_secure() {
-                    true => (
-                        Box::new(Vec::new().into_iter()),                 
-                        match jt.final_rdd.secure_iterator(split) {
-                            Ok(r) => r,
-                            Err(_) => Box::new(Vec::new().into_iter()),
-                        }
-                    ),
-                    false => (
-                        match jt.final_rdd.iterator(split.clone()) {
-                            Ok(r) => r,
-                            Err(_) => Box::new(Vec::new().into_iter()),
-                        }, 
-                        Box::new(Vec::new().into_iter()), 
-                    ),
-                }
-            ))]));
-
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("result_task(allow local) {:?}s", dur);
-            
-            res
+            let func = jt.func.clone();
+            let final_rdd = jt.final_rdd.clone();
+            tokio::task::spawn_blocking(move || {
+                let res = Ok(Some(vec![(&func)((
+                    task_context,
+                    match final_rdd.get_secure() {
+                        true => (
+                            Box::new(Vec::new().into_iter()),                 
+                            match final_rdd.secure_iterator(split) {
+                                Ok(r) => r,
+                                Err(_) => Box::new(Vec::new().into_iter()),
+                            }
+                        ),
+                        false => (
+                            match final_rdd.iterator(split.clone()) {
+                                Ok(r) => r,
+                                Err(_) => Box::new(Vec::new().into_iter()),
+                            }, 
+                            Box::new(Vec::new().into_iter()), 
+                        ),
+                    }
+                ))]));
+    
+                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                println!("result_task(allow local) {:?}s", dur);
+                
+                res
+            }).await?
         } else {
             Ok(None)
         }

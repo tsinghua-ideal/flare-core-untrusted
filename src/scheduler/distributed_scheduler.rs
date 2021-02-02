@@ -212,7 +212,7 @@ impl DistributedScheduler {
     {
         // TODO: update cache
         if allow_local {
-            if let Some(result) = DistributedScheduler::local_execution(jt.clone())? {
+            if let Some(result) = DistributedScheduler::local_execution(jt.clone()).await? {
                 return Ok(result);
             }
         }

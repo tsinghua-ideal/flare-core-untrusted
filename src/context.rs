@@ -608,7 +608,7 @@ impl Context {
             func,
             rdd.clone(),
             (0..rdd.number_of_splits()).collect(),
-            false, //true will cause fault as call put
+            true,
         )
     }
 
@@ -641,7 +641,7 @@ impl Context {
             func,
             rdd.clone(),
             (0..rdd.number_of_splits()).collect(),
-            false,
+            true,
         )
     }
 

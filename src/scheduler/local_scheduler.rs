@@ -184,7 +184,7 @@ impl LocalScheduler {
         self.update_cache_locs().await?;
         
         if allow_local {
-            if let Some(result) = LocalScheduler::local_execution(jt.clone())? {
+            if let Some(result) = LocalScheduler::local_execution(jt.clone()).await? {
                 return Ok(result);
             }
         }
