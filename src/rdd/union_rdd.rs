@@ -77,8 +77,8 @@ where
     TE: Data,
 {
     #[track_caller]
-    pub(crate) fn new(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Result<Self> {
-        Ok(UnionRdd(UnionVariants::new(rdds)?))
+    pub(crate) fn new(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Self {
+        UnionRdd(UnionVariants::new(rdds))
     }
 
     fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
@@ -276,7 +276,7 @@ impl<T: Data, TE: Data> Clone for UnionVariants<T, TE> {
 
 impl<T: Data, TE: Data> UnionVariants<T, TE> {
     #[track_caller]
-    fn new(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Result<Self> {
+    fn new(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Self {
         let context = rdds[0].get_context();
         let secure = rdds[0].get_secure();  //temp
         let mut vals = RddVals::new(context, secure);
@@ -285,44 +285,21 @@ impl<T: Data, TE: Data> UnionVariants<T, TE> {
         let final_rdds: Vec<_> = rdds.iter().map(|rdd| rdd.clone().into()).collect();
 
         if !UnionVariants::has_unique_partitioner(rdds) {
-            let deps = rdds
-                .iter()
-                .map(|rdd| {
-                    let rdd_base = rdd.get_rdd_base();
-                    let num_parts = rdd_base.number_of_splits();
-                    let dep = Dependency::NarrowDependency(Arc::new(RangeDependency::new(
-                        rdd_base, 0, pos, num_parts,
-                    )));
-                    pos += num_parts;
-                    dep
-                })
-                .collect();
-            vals.dependencies = deps;
             let vals = Arc::new(vals);
             log::debug!("inside unique partitioner constructor");
-            Ok(NonUniquePartitioner {
+            NonUniquePartitioner {
                 rdds: final_rdds,
                 vals,
-            })
+            }
         } else {
-            let part = rdds[0].partitioner().ok_or(Error::LackingPartitioner)?;
+            let part = rdds[0].partitioner().ok_or(Error::LackingPartitioner).unwrap();
             log::debug!("inside partition aware constructor");
-            let deps = rdds
-                .iter()
-                .map(|x| {
-                    Dependency::NarrowDependency(
-                        Arc::new(OneToOneDependency::new(x.get_rdd_base()))
-                            as Arc<dyn NarrowDependencyTrait>,
-                    )
-                })
-                .collect();
-            vals.dependencies = deps;
             let vals = Arc::new(vals);
-            Ok(PartitionerAware {
+            PartitionerAware {
                 rdds: final_rdds,
                 vals,
                 part,
-            })
+            }
         }
     }
 
@@ -432,9 +409,41 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
     }
 
     fn get_dependencies(&self) -> Vec<Dependency> {
-        match &self.0 {
-            NonUniquePartitioner { vals, .. } => vals.dependencies.clone(),
-            PartitionerAware { vals, .. } => vals.dependencies.clone(),
+        let mut pos = 0;
+        let rdds = match &self.0 {
+            NonUniquePartitioner { rdds, .. } => 
+                rdds.iter().map(|rdd| rdd.clone().into()).collect::<Vec<_>>(),
+            PartitionerAware { rdds, .. } => 
+                rdds.iter().map(|rdd| rdd.clone().into()).collect::<Vec<_>>(),
+        };
+
+        if !UnionVariants::has_unique_partitioner(&rdds) {
+            let deps = rdds
+                .iter()
+                .map(|rdd| {
+                    let rdd_base = rdd.get_rdd_base();
+                    let num_parts = rdd_base.number_of_splits();
+                    let dep = Dependency::NarrowDependency(Arc::new(RangeDependency::new(
+                        rdd_base, 0, pos, num_parts,
+                    )));
+                    pos += num_parts;
+                    dep
+                })
+                .collect();
+            deps
+        } else {
+            let part = rdds[0].partitioner().ok_or(Error::LackingPartitioner).unwrap();
+            log::debug!("inside partition aware constructor");
+            let deps = rdds
+                .iter()
+                .map(|x| {
+                    Dependency::NarrowDependency(
+                        Arc::new(OneToOneDependency::new(x.get_rdd_base()))
+                            as Arc<dyn NarrowDependencyTrait>,
+                    )
+                })
+                .collect();
+            deps
         }
     }
 

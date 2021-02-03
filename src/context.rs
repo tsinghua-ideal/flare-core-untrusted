@@ -676,7 +676,7 @@ impl Context {
     }
 
     #[track_caller]
-    pub fn union<T: Data, TE: Data>(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Result<impl RddE<Item = T, ItemE = TE>> {
+    pub fn union<T: Data, TE: Data>(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> impl RddE<Item = T, ItemE = TE> {
         UnionRdd::new(rdds)
     }
 }

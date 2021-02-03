@@ -348,7 +348,7 @@ where
     }
 
     fn get_dependencies(&self) -> Vec<Dependency> {
-        self.rdd_vals.vals.dependencies.clone()
+        Vec::new()
     }
     
     fn get_secure(&self) -> bool {

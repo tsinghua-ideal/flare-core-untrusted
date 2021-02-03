@@ -105,20 +105,7 @@ where
         let mut vals = RddVals::new(ctx, secure);
         let cur_rdd_id = vals.id;
         let cur_op_id = vals.op_id;
-
-        vals.dependencies
-            .push(Dependency::ShuffleDependency(Arc::new(
-                ShuffleDependency::<_, _, _, KE, CE>::new(
-                    shuffle_id,
-                    false,
-                    parent.get_rdd_base(),
-                    aggregator.clone(),
-                    part.clone(),
-                    0,
-                    cur_rdd_id,
-                    cur_op_id,
-                ),
-            )));
+        vals.shuffle_ids.push(shuffle_id);
         let vals = Arc::new(vals);
         ShuffledRdd {
             parent,
@@ -277,7 +264,20 @@ where
     }
 
     fn get_dependencies(&self) -> Vec<Dependency> {
-        self.vals.dependencies.clone()
+        let cur_rdd_id = self.vals.id;
+        let cur_op_id = self.vals.op_id;
+        vec![Dependency::ShuffleDependency(Arc::new(
+                ShuffleDependency::<_, _, _, KE, CE>::new(
+                    self.shuffle_id,
+                    false,
+                    self.parent.get_rdd_base(),
+                    self.aggregator.clone(),
+                    self.part.clone(),
+                    0,
+                    cur_rdd_id,
+                    cur_op_id,
+                ),
+            ))]
     }
 
     fn get_secure(&self) -> bool {

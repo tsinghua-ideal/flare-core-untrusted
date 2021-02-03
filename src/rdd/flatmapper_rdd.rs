@@ -61,10 +61,6 @@ where
     #[track_caller]
     pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
-        vals.dependencies
-            .push(Dependency::NarrowDependency(Arc::new(
-                OneToOneDependency::new(prev.get_rdd_base()),
-            )));
         let vals = Arc::new(vals);
         FlatMapperRdd {
             prev,
@@ -123,7 +119,9 @@ where
     }
 
     fn get_dependencies(&self) -> Vec<Dependency> {
-        self.vals.dependencies.clone()
+        vec![Dependency::NarrowDependency(Arc::new(
+            OneToOneDependency::new(self.prev.get_rdd_base()),
+        ))]
     }
 
     fn get_secure(&self) -> bool {

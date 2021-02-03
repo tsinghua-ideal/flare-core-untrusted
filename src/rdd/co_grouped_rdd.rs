@@ -113,65 +113,20 @@ where
     ) -> Self {
         let context = rdd0.get_context();
         let secure = rdd0.get_secure() || rdd1.get_secure() ;  //
-
         let mut vals = RddVals::new(context.clone(), secure);
-        let cur_rdd_id = vals.id;
-        let cur_op_id = vals.op_id;
-        let mut deps = Vec::new();
 
-        if rdd0.partitioner()
+        if !rdd0.partitioner()
             .map_or(false, |p| p.equals(&part as &dyn Any)) 
         {
-            let rdd_base = rdd0.get_rdd_base();
-            deps.push(Dependency::NarrowDependency(
-                Arc::new(OneToOneDependency::new(rdd_base)) as Arc<dyn NarrowDependencyTrait>,
-            ));
-        } else {
-            let aggr = Arc::new(Aggregator::<K, V, _>::default());
-            let rdd_base = rdd0.get_rdd_base();
-            log::debug!("creating aggregator inside cogrouprdd");
-            deps.push(Dependency::ShuffleDependency(
-                //TODO need revision if fe & fd of group_by is passed 
-                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
-                    context.new_shuffle_id(),
-                    true,
-                    rdd_base,
-                    aggr,
-                    part.clone(),
-                    0,
-                    cur_rdd_id,
-                    cur_op_id,
-                )) as Arc<dyn ShuffleDependencyTrait>,
-            ));
+            vals.shuffle_ids.push(context.new_shuffle_id());
         }
 
-        if rdd1.partitioner()
+        if !rdd1.partitioner()
             .map_or(false, |p| p.equals(&part as &dyn Any)) 
         {
-            let rdd_base = rdd1.get_rdd_base();
-            deps.push(Dependency::NarrowDependency(
-                Arc::new(OneToOneDependency::new(rdd_base)) as Arc<dyn NarrowDependencyTrait>,
-            ));
-        } else {
-            let aggr = Arc::new(Aggregator::<K, W, _>::default());
-            let rdd_base = rdd1.get_rdd_base();
-            log::debug!("creating aggregator inside cogrouprdd");
-            deps.push(Dependency::ShuffleDependency(
-                //TODO need revision if fe & fd of group_by is passed 
-                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
-                    context.new_shuffle_id(),
-                    true,
-                    rdd_base,
-                    aggr,
-                    part.clone(),
-                    1,
-                    cur_rdd_id,
-                    cur_op_id,
-                )) as Arc<dyn ShuffleDependencyTrait>,
-            ));
+            vals.shuffle_ids.push(context.new_shuffle_id());
         }
 
-        vals.dependencies = deps;
         let vals = Arc::new(vals);
         CoGroupedRdd {
             vals,
@@ -402,7 +357,66 @@ where
     }
 
     fn get_dependencies(&self) -> Vec<Dependency> {
-        self.vals.dependencies.clone()
+        let cur_rdd_id = self.vals.id;
+        let cur_op_id = self.vals.op_id;
+        let rdd0 = &self.rdd0;
+        let rdd1 = &self.rdd1;
+        let part = self.part.clone();
+        let mut shuffle_ids = self.vals.shuffle_ids.clone();
+        let mut deps = Vec::new();
+
+        if rdd0.partitioner()
+            .map_or(false, |p| p.equals(&part as &dyn Any)) 
+        {
+            let rdd_base = rdd0.get_rdd_base();
+            deps.push(Dependency::NarrowDependency(
+                Arc::new(OneToOneDependency::new(rdd_base)) as Arc<dyn NarrowDependencyTrait>,
+            ));
+        } else {
+            let aggr = Arc::new(Aggregator::<K, V, _>::default());
+            let rdd_base = rdd0.get_rdd_base();
+            log::debug!("creating aggregator inside cogrouprdd");
+            deps.push(Dependency::ShuffleDependency(
+                //TODO need revision if fe & fd of group_by is passed 
+                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
+                    shuffle_ids.remove(0),
+                    true,
+                    rdd_base,
+                    aggr,
+                    part.clone(),
+                    0,
+                    cur_rdd_id,
+                    cur_op_id,
+                )) as Arc<dyn ShuffleDependencyTrait>,
+            ));
+        }
+
+        if rdd1.partitioner()
+            .map_or(false, |p| p.equals(&part as &dyn Any)) 
+        {
+            let rdd_base = rdd1.get_rdd_base();
+            deps.push(Dependency::NarrowDependency(
+                Arc::new(OneToOneDependency::new(rdd_base)) as Arc<dyn NarrowDependencyTrait>,
+            ));
+        } else {
+            let aggr = Arc::new(Aggregator::<K, W, _>::default());
+            let rdd_base = rdd1.get_rdd_base();
+            log::debug!("creating aggregator inside cogrouprdd");
+            deps.push(Dependency::ShuffleDependency(
+                //TODO need revision if fe & fd of group_by is passed 
+                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
+                    shuffle_ids.remove(0),
+                    true,
+                    rdd_base,
+                    aggr,
+                    part.clone(),
+                    1,
+                    cur_rdd_id,
+                    cur_op_id,
+                )) as Arc<dyn ShuffleDependencyTrait>,
+            ));
+        }
+        deps
     }
 
     fn get_secure(&self) -> bool {

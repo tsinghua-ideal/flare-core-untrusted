@@ -783,7 +783,7 @@ impl OpId {
 pub(crate) struct RddVals {
     pub id: usize,
     pub op_id: OpId,
-    pub dependencies: Vec<Dependency>,
+    pub shuffle_ids: Vec<usize>,
     should_cache_: AtomicBool,
     secure: bool,
     #[serde(skip_serializing, skip_deserializing)]
@@ -797,7 +797,7 @@ impl RddVals {
         RddVals {
             id: sc.new_rdd_id(),
             op_id: sc.new_op_id(loc),
-            dependencies: Vec::new(),
+            shuffle_ids: Vec::new(),
             should_cache_: AtomicBool::new(false),
             secure,
             context: Arc::downgrade(&sc),
@@ -2050,14 +2050,14 @@ pub trait RddE: Rdd {
     fn union(
         &self,
         other: Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>,
-    ) -> Result<SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>>
+    ) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Clone,
     {
-        Ok(SerArc::new(Context::union(&[
+        SerArc::new(Context::union(&[
             Arc::new(self.clone()) as Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>,
             other,
-        ])?))
+        ]))
     }
 
     #[track_caller]

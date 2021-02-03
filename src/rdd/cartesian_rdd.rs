@@ -150,7 +150,7 @@ where
     }
 
     fn get_dependencies(&self) -> Vec<Dependency> {
-        self.vals.dependencies.clone()
+        todo!()
     }
 
     fn get_secure(&self) -> bool {

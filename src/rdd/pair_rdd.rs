@@ -355,10 +355,6 @@ where
     #[track_caller]
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
-        vals.dependencies
-            .push(Dependency::NarrowDependency(Arc::new(
-                OneToOneDependency::new(prev.get_rdd_base()),
-            )));
         let vals = Arc::new(vals);
         MappedValuesRdd {
             prev,
@@ -415,7 +411,9 @@ where
         self.vals.context.upgrade().unwrap()
     }
     fn get_dependencies(&self) -> Vec<Dependency> {
-        self.vals.dependencies.clone()
+        vec![Dependency::NarrowDependency(Arc::new(
+            OneToOneDependency::new(self.prev.get_rdd_base()),
+        ))]
     }
 
     fn get_secure(&self) -> bool {
@@ -590,10 +588,6 @@ where
     #[track_caller]
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
-        vals.dependencies
-            .push(Dependency::NarrowDependency(Arc::new(
-                OneToOneDependency::new(prev.get_rdd_base()),
-            )));
         let vals = Arc::new(vals);
         FlatMappedValuesRdd {
             prev,
@@ -650,7 +644,9 @@ where
         self.vals.context.upgrade().unwrap()
     }
     fn get_dependencies(&self) -> Vec<Dependency> {
-        self.vals.dependencies.clone()
+        vec![Dependency::NarrowDependency(Arc::new(
+            OneToOneDependency::new(self.prev.get_rdd_base()),
+        ))]
     }
     fn get_secure(&self) -> bool {
         self.vals.secure
