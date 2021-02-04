@@ -3,7 +3,8 @@ use std::fs;
 use std::mem::forget;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, 
+    atomic::{AtomicUsize, Ordering}};
 
 use crate::cache::BoundedMemoryCache;
 use crate::cache_tracker::CacheTracker;
@@ -33,6 +34,7 @@ static CONF: OnceCell<Configuration> = OnceCell::new();
 static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);
 
+pub(crate) static ADDR_MAP_LEN: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
 pub(crate) static SHUFFLE_CACHE: Lazy<ShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
 pub(crate) static SPEC_SHUFFLE_CACHE: Lazy<SpecShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
 pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(BoundedMemoryCache::new);
@@ -109,9 +111,10 @@ impl Env {
     fn new() -> Self {
         Env::run_in_async_rt(|| -> Self {
             let conf = Configuration::get();
-            let master_addr = Hosts::get()
-                .expect("fatal error: failed loading host file")
-                .master;
+            let hosts = Hosts::get()
+                .expect("fatal error: failed loading host file");
+            let master_addr = hosts.master;
+            ADDR_MAP_LEN.store(hosts.slaves.len(), Ordering::SeqCst);
             let map_output_tracker = MapOutputTracker::new(conf.is_driver, master_addr);
             let shuffle_manager =
                 ShuffleManager::new().expect("fatal error: failed creating shuffle manager");

@@ -171,6 +171,11 @@ pub unsafe extern "C" fn ocall_cache_from_outside(rdd_id: usize,
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn ocall_get_addr_map_len() -> usize {
+    env::ADDR_MAP_LEN.load(atomic::Ordering::SeqCst)
+}
+
 pub fn default_hash<T: Hash>(t: &T) -> u64 {
     let mut s = DefaultHasher::new();
     t.hash(&mut s);

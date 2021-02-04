@@ -5,7 +5,7 @@ use std::io::{BufReader, Read};
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc::SyncSender};
+use std::sync::{Arc, mpsc::SyncSender, Weak};
 use std::thread::{JoinHandle, self};
 
 use crate::context::Context;
@@ -22,7 +22,6 @@ use rand::prelude::*;
 use serde_derive::{Deserialize, Serialize};
 use parking_lot::Mutex;
 use sgx_types::*;
-
 pub struct LocalFsReaderConfig {
     filter_ext: Option<std::ffi::OsString>,
     expect_dir: bool,
@@ -34,11 +33,11 @@ pub struct LocalFsReaderConfig {
 impl LocalFsReaderConfig {
     /// Read all the files from a directory or a path.
     #[track_caller]
-    pub fn new<T: Into<PathBuf>>(path: T) -> LocalFsReaderConfig {
+    pub fn new<T: Into<PathBuf>>(path: T, secure: bool) -> LocalFsReaderConfig {
         LocalFsReaderConfig {
             filter_ext: None,
             expect_dir: true,
-            secure: true,              //default: need security
+            secure, 
             dir_path: path.into(),
             executor_partitions: None,
         }
@@ -95,9 +94,11 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
             }
             pt
         });
+        reader.get_context().add_num(1);
         let files_per_executor = Arc::new(
             MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files, fe_mpp, fd_mpp).pin(),
         );
+        files_per_executor.get_context().add_num(1);
         let decoder = MapperRdd::new(files_per_executor, decoder, fe, fd).pin();
         decoder.register_op_name("local_fs_reader<bytes>");
         SerArc::new(decoder)
@@ -150,7 +151,7 @@ pub struct LocalFsReader<T> {
     expect_dir: bool,
     executor_partitions: Option<u64>,
     #[serde(skip_serializing, skip_deserializing)]
-    context: Arc<Context>,
+    context: Weak<Context>,
     // explicitly copy the address map as the map under context is not
     // deserialized in tasks and this is required:
     splits: Vec<SocketAddrV4>,
@@ -185,7 +186,7 @@ impl<T: Data> LocalFsReader<T> {
             secure,
             executor_partitions,
             splits: context.address_map.clone(),
-            context,
+            context: Arc::downgrade(&context),
             _marker_reader_data: PhantomData,
         }
     }
@@ -376,7 +377,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
         }
 
         fn get_context(&self) -> Arc<Context> {
-            self.context.clone()
+            self.context.upgrade().unwrap()
         }
 
         fn get_dependencies(&self) -> Vec<Dependency> {
