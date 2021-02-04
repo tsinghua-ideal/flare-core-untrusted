@@ -214,7 +214,27 @@ where
     }
     
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
-        todo!()
+        let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
+        acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
+        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
+        let should_cache = self.should_cache();
+        if should_cache {
+            let mut handles = secure_compute_cached(
+                acc_arg, 
+                cur_rdd_id, 
+                tx.clone(),
+                captured_vars,
+            );
+
+            if !acc_arg.totally_cached() {
+                handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
+            }
+            Ok(handles)     
+        } else {
+            self.prev.secure_compute(split, acc_arg, tx)
+        }
     }
 
 }

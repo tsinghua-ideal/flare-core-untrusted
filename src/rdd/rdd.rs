@@ -131,6 +131,21 @@ extern "C" {
         p_data_enc: *mut u8,
         is_spec: u8,
     ) -> sgx_status_t;
+    pub fn randomize_in_place(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        op_id: OpId,
+        input: *mut u8,
+        seed: u64,
+        is_some: u8,
+        num: u64,
+    ) -> sgx_status_t; 
+    pub fn set_sampler(
+        eid: sgx_enclave_id_t,
+        op_id: OpId,
+        with_replacement: u8,
+        fraction: f64,
+    ) -> sgx_status_t; 
     pub fn probe_caching(
         eid: sgx_enclave_id_t,
         ret_val: *mut usize,
@@ -293,6 +308,73 @@ pub fn wrapper_spec_execute(
         return;
     }
     env::SPEC_SHUFFLE_CACHE.insert(key, vec![*res]);
+}
+
+//This method should only be used if the resulting array is expected to be small,
+pub fn wrapper_randomize_in_place<T>(
+    op_id: OpId,
+    input: Vec<T>,
+    seed: Option<u64>,
+    num: u64,
+) -> Vec<T>
+where
+    T:  std::fmt::Debug 
+        + Clone 
+        + Serialize
+        + serde::ser::Serialize
+        + serde::de::DeserializeOwned
+        + 'static 
+{
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let input = Box::into_raw(Box::new(input));
+    let (seed, is_some) = match seed {
+        Some(seed) => (seed, 1),
+        None => (0, 0),
+    };
+
+    let mut retval: usize = 0;
+    let sgx_status = unsafe {
+        randomize_in_place(
+            eid,
+            &mut retval,
+            op_id,
+            input as *mut u8,
+            seed,
+            is_some,
+            num,
+        )
+    };
+    let _r = match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {},
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+    let _input = unsafe{ Box::from_raw(input) };
+    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(01), retval as *mut u8, false);
+    *res
+}
+
+pub fn wrapper_set_sampler(op_id: OpId, with_replacement: bool, fraction: f64) {
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let with_replacement = match with_replacement {
+        true => 1,
+        false => 0,
+    };
+    let sgx_status = unsafe {
+        set_sampler(
+            eid,
+            op_id,
+            with_replacement,
+            fraction,
+        )
+    };
+    let _r = match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {},
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
 }
 
 
@@ -1946,7 +2028,11 @@ pub trait RddE: Rdd {
         } else {
             Arc::new(BernoulliSampler::new(fraction)) as Arc<dyn RandomSampler<Self::Item>>
         };
-        SerArc::new(PartitionwiseSampledRdd::new(self.get_rdd(), sampler, true, self.get_fe(), self.get_fd()))
+        let rdd = SerArc::new(PartitionwiseSampledRdd::new(self.get_rdd(), sampler, true, self.get_fe(), self.get_fd()));
+        if rdd.get_secure() {
+            wrapper_set_sampler(rdd.get_op_id(), with_replacement, fraction);
+        }
+        rdd
     }
 
     /// Return a fixed-size sampled subset of this RDD in an array.
@@ -1983,6 +2069,7 @@ pub trait RddE: Rdd {
         }
 
         let initial_count = self.count()?;
+
         if initial_count == 0 {
             return Ok(vec![]);
         }
@@ -2001,6 +2088,7 @@ pub trait RddE: Rdd {
         if !with_replacement && num >= initial_count {
             let mut sample = self.collect()?;
             utils::randomize_in_place(&mut sample, &mut rng);
+            self.get_context().add_num(1);
             Ok(sample)
         } else {
             let fraction = utils::random::compute_fraction_for_sample_size(
@@ -2028,6 +2116,70 @@ pub trait RddE: Rdd {
 
             utils::randomize_in_place(&mut samples, &mut rng);
             Ok(samples.into_iter().take(num as usize).collect::<Vec<_>>())
+        }
+    }
+
+    #[track_caller]
+    fn secure_take_sample(
+        &self,
+        with_replacement: bool,
+        num: u64,
+        seed: Option<u64>,
+    ) -> Result<Vec<Self::ItemE>>
+    where
+        Self: Sized,
+    {
+        const NUM_STD_DEV: f64 = 10.0f64;
+        const REPETITION_GUARD: u8 = 100;
+        // TODO: this could be const eval when the support is there for the necessary functions
+        let max_sample_size = std::u64::MAX - (NUM_STD_DEV * (std::u64::MAX as f64).sqrt()) as u64;
+        assert!(num <= max_sample_size);
+
+        if num == 0 {
+            return Ok(vec![]);
+        }
+
+        let initial_count = self.secure_count()?;
+
+        if initial_count == 0 {
+            return Ok(vec![]);
+        }
+
+        if !with_replacement && num >= initial_count {
+            let mut sample = self.secure_collect()?;
+            sample = wrapper_randomize_in_place(self.get_op_id(), sample, seed, initial_count);
+            self.get_context().add_num(1);
+            Ok(sample)
+        } else {
+            let fraction = utils::random::compute_fraction_for_sample_size(
+                num,
+                initial_count,
+                with_replacement,
+            );
+            
+            let mut sample_rdd = self.sample(with_replacement, fraction);
+            sample_rdd.cache();
+            let mut samples_enc = sample_rdd.secure_collect()?;
+            let mut len = sample_rdd.secure_count().unwrap();
+            let mut num_iters = 0;
+            while len < num  && num_iters < REPETITION_GUARD {
+                log::warn!(
+                    "Needed to re-sample due to insufficient sample size. Repeat #{}",
+                    num_iters,
+                );
+                sample_rdd = self.sample(with_replacement, fraction);
+                sample_rdd.cache();
+                samples_enc = sample_rdd.secure_collect()?;
+                len = sample_rdd.secure_count().unwrap();
+                num_iters += 1;
+            }
+
+            if num_iters >= REPETITION_GUARD {
+                panic!("Repeated sampling {} times; aborting", REPETITION_GUARD)
+            }
+
+            samples_enc = wrapper_randomize_in_place(sample_rdd.get_op_id(), samples_enc, seed, num);
+            Ok(samples_enc)
         }
     }
 
