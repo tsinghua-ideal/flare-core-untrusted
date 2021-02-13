@@ -9,6 +9,7 @@
     proc_macro_hygiene,
     specialization,
     thread_id_value,
+    type_alias_impl_trait,
     type_ascription,
     unboxed_closures,
     unsize,
@@ -58,4 +59,4 @@ pub use context::Context;
 pub use error::*;
 pub use io::LocalFsReaderConfig;
 pub use partial::BoundedDouble;
-pub use rdd::{PairRdd, Rdd, RddE, encrypt, decrypt, ser_encrypt, ser_decrypt, MAX_ENC_BL};
+pub use rdd::{PairRdd, Rdd, RddE, TailCompInfo, Text, OText, wrapper_tail_compute, encrypt, decrypt, ser_encrypt, ser_decrypt, MAX_ENC_BL};
