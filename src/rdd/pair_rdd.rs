@@ -121,6 +121,20 @@ where
     }
 
     #[track_caller]
+    fn values<FE, FD>(
+        &self,
+        fe: FE,  //the type corresponding to the encryption form is fixed
+        fd: FD,
+    ) -> SerArc<dyn RddE<Item = V, ItemE = VE>>
+    where
+        Self: Sized,
+        FE: SerFunc(Vec<V>) -> VE, 
+        FD: SerFunc(VE) -> Vec<V>,
+    {
+        SerArc::new(ValuesRdd::new(self.get_rdd(), fe, fd))
+    }
+
+    #[track_caller]
     fn map_values<U, UE, F, FE, FD>(
         &self,
         f: F,
@@ -297,6 +311,210 @@ where
     KE: Data + Eq + Hash, 
     VE: Data,
 {}
+
+#[derive(Serialize, Deserialize)]
+pub struct ValuesRdd<K, V, VE, FE, FD>
+where
+    K: Data,
+    V: Data,
+    VE: Data,
+    FE: Func(Vec<V>) -> VE + Clone,
+    FD: Func(VE) -> Vec<V> + Clone,
+{
+    #[serde(with = "serde_traitobject")]
+    prev: Arc<dyn Rdd<Item = (K, V)>>,
+    vals: Arc<RddVals>,
+    fe: FE,
+    fd: FD,
+}
+ 
+impl<K, V, VE, FE, FD> Clone for ValuesRdd<K, V, VE, FE, FD>
+where
+    K: Data,
+    V: Data,
+    VE: Data,
+    FE: Func(Vec<V>) -> VE + Clone,
+    FD: Func(VE) -> Vec<V> + Clone,
+{
+    fn clone(&self) -> Self {
+        ValuesRdd {
+            prev: self.prev.clone(),
+            vals: self.vals.clone(),
+            fe: self.fe.clone(),
+            fd: self.fd.clone(),
+        }
+    }
+}
+
+impl<K, V, VE, FE, FD> ValuesRdd<K, V, VE, FE, FD>
+where
+    K: Data,
+    V: Data,
+    VE: Data,
+    FE: Func(Vec<V>) -> VE + Clone,
+    FD: Func(VE) -> Vec<V> + Clone,
+{
+    #[track_caller]
+    fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, fe: FE, fd: FD) -> Self {
+        let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
+        let vals = Arc::new(vals);
+        ValuesRdd {
+            prev,
+            vals,
+            fe,
+            fd,
+        }
+    }
+}
+
+impl<K, V, VE, FE, FD> RddBase for ValuesRdd<K, V, VE, FE, FD>
+where
+    K: Data,
+    V: Data,
+    VE: Data,
+    FE: SerFunc(Vec<V>) -> VE + Clone,
+    FD: SerFunc(VE) -> Vec<V> + Clone,
+{
+    fn cache(&self) {
+        self.vals.cache();
+        RDDB_MAP.insert(
+            self.get_rdd_id(), 
+            self.get_rdd_base()
+        );
+    }
+
+    fn should_cache(&self) -> bool {
+        self.vals.should_cache()
+    }
+
+    fn free_data_enc(&self, ptr: *mut u8) {
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<VE>)
+        };
+    }
+
+    fn get_rdd_id(&self) -> usize {
+        self.vals.id
+    }
+    fn get_op_id(&self) -> OpId {
+        self.vals.op_id
+    }
+    fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+        op_ids.push(self.get_op_id());
+        if !self.should_cache() {
+            self.prev.get_op_ids(op_ids);
+        }
+    }
+    fn get_context(&self) -> Arc<Context> {
+        self.vals.context.upgrade().unwrap()
+    }
+    fn get_dependencies(&self) -> Vec<Dependency> {
+        vec![Dependency::NarrowDependency(Arc::new(
+            OneToOneDependency::new(self.prev.get_rdd_base()),
+        ))]
+    }
+
+    fn get_secure(&self) -> bool {
+        self.vals.secure
+    }
+
+    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        // rdd_id is actually op_id
+        let value = move_data::<VE>(self.get_op_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
+    }
+
+    fn splits(&self) -> Vec<Box<dyn Split>> {
+        self.prev.splits()
+    }
+    fn number_of_splits(&self) -> usize {
+        self.prev.number_of_splits()
+    }
+
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        self.secure_compute(split, acc_arg, tx)
+    }
+
+    default fn iterator_any(
+        &self,
+        split: Box<dyn Split>,
+    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+        log::debug!("inside iterator_any flatmaprdd",);
+        Ok(Box::new(
+            self.iterator(split)?
+                .map(|x| Box::new(x) as Box<dyn AnyData>),
+        ))
+    }
+}
+
+impl<K, V, VE, FE, FD> Rdd for ValuesRdd<K, V, VE, FE, FD>
+where
+    K: Data,
+    V: Data,
+    VE: Data,
+    FE: SerFunc(Vec<V>) -> VE + Clone,
+    FD: SerFunc(VE) -> Vec<V> + Clone,
+{
+    type Item = V;
+    fn get_rdd_base(&self) -> Arc<dyn RddBase> {
+        Arc::new(self.clone()) as Arc<dyn RddBase>
+    }
+    fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
+        Arc::new(self.clone())
+    }
+    fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+        Ok(Box::new(
+            self.prev.iterator(split)?.map(|(k, v)| v)),
+        )
+    }
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
+        acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
+        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
+        let should_cache = self.should_cache();
+        if should_cache {
+            let mut handles = secure_compute_cached(
+                acc_arg, 
+                cur_rdd_id, 
+                tx.clone(),
+                captured_vars,
+            );
+
+            if !acc_arg.totally_cached() {
+                acc_arg.set_caching_rdd_id(cur_rdd_id);
+                handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
+            }
+            Ok(handles)     
+        } else {
+            self.prev.secure_compute(split, acc_arg, tx)
+        }
+    }
+}
+
+impl<K, V, VE, FE, FD> RddE for ValuesRdd<K, V, VE, FE, FD>
+where
+    K: Data,
+    V: Data,
+    VE: Data,
+    FE: SerFunc(Vec<V>) -> VE + Clone,
+    FD: SerFunc(VE) -> Vec<V> + Clone,
+{
+    type ItemE = VE;
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(self.clone())
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
+    }
+}
 
 
 #[derive(Serialize, Deserialize)]
@@ -498,6 +716,7 @@ where
             );
 
             if !acc_arg.totally_cached() {
+                acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
             }
             Ok(handles)     
@@ -732,6 +951,7 @@ where
             );
 
             if !acc_arg.totally_cached() {
+                acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
             }
             Ok(handles)     

@@ -245,6 +245,7 @@ where
             );
 
             if !acc_arg.totally_cached() {
+                acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
             }
             Ok(handles)     

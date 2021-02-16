@@ -812,6 +812,9 @@ impl AccArg {
 
     //set the to_be_cached rdd and return whether the set is successfully
     pub fn set_caching_rdd_id(&mut self, caching_rdd_id: usize) -> bool {
+        if self.cached_rdd_id == caching_rdd_id {
+            self.cached_rdd_id = 0;
+        }
         match self.caching_rdd_id == 0 {
             true => {
                 self.caching_rdd_id = caching_rdd_id;
