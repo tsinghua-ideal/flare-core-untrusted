@@ -59,4 +59,5 @@ pub use context::Context;
 pub use error::*;
 pub use io::LocalFsReaderConfig;
 pub use partial::BoundedDouble;
+pub use serialization_free::Construct;
 pub use rdd::{PairRdd, Rdd, RddE, TailCompInfo, Text, OText, wrapper_tail_compute, encrypt, decrypt, ser_encrypt, ser_decrypt, MAX_ENC_BL};

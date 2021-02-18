@@ -219,10 +219,14 @@ pub fn wrapper_secure_execute<T>(
     dep_info: DepInfo, 
     data: Box<T>,
     captured_vars: &HashMap<usize, Vec<Vec<u8>>>,
-) -> usize {
+) -> usize 
+where
+    T: Construct,
+{
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut result_bl_ptr: usize = 0;
     let tid: u64 = thread::current().id().as_u64().into();
+    println!("data size = {:?}", data.get_aprox_size());
     let block_ptr = Box::into_raw(data);
     
     while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {

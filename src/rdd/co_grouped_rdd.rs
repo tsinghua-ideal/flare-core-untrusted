@@ -218,13 +218,12 @@ where
                 let now = Instant::now();
                 let mut kv_iter = (Vec::new(), Vec::new());
                 let mut kw_iter = (Vec::new(), Vec::new());
-                let chunk_len = (1 << (10+10)) / (chunk_size * num_sub_part);  //each block: 1MB
+                let chunk_len = ((1 << 10+10) - 1) / (chunk_size * num_sub_part) + 1;  //each block: 1MB
                 init_chunks(&kv.0, &mut kv_iter.0, chunk_len);
                 init_chunks(&kv.1, &mut kv_iter.1, chunk_len);
                 init_chunks(&kw.0, &mut kw_iter.0, chunk_len);
                 init_chunks(&kw.1, &mut kw_iter.1, chunk_len);
 
-                
     
                 let mut sub_part_id = 0;
                 let mut cache_meta = acc_arg.to_cache_meta();

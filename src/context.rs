@@ -19,7 +19,7 @@ use crate::io::ReaderConfiguration;
 use crate::partial::{ApproximateEvaluator, PartialResult};
 use crate::rdd::{OpId, ParallelCollection, Rdd, RddE, RddBase, UnionRdd, ser_encrypt, ser_decrypt};
 use crate::scheduler::{DistributedScheduler, LocalScheduler, NativeScheduler, TaskContext};
-use crate::serializable_traits::{Data, SerFunc};
+use crate::serializable_traits::{Data, Func, SerFunc};
 use crate::serialized_data_capnp::serialized_data;
 use crate::{env, hosts, utils, Fn, SerArc};
 use log::error;
@@ -578,20 +578,24 @@ impl Context {
 
     /// Load from a distributed source and turns it into a parallel collection.
     #[track_caller]
-    pub fn read_source<F, C, FE, FD, I: Data, O: Data, OE: Data>(
+    pub fn read_source<C, FE, FD, I: Data, O: Data + Default, OE: Data>(
         self: &Arc<Self>,
         config: C,
-        func: F,
+        func: Option<Box<dyn Func(I) -> O >>,
+        sec_func: Option<Box<dyn Func(I) -> Vec<OE> >>,
         fe: FE,
         fd: FD,
     ) -> impl RddE<Item = O, ItemE = OE>
     where
-        F: SerFunc(I) -> O,
         C: ReaderConfiguration<I>,
         FE: SerFunc(Vec<O>) -> OE,
         FD: SerFunc(OE) -> Vec<O>,
     {
-        config.make_reader(self.clone(), func, fe, fd)
+        match func {
+            Some(func) => config.make_reader(self.clone(), Some(func), sec_func, fe, fd),
+            None => config.make_reader(self.clone(), Some(Fn!(|_v: I| Default::default() )), sec_func, fe, fd),
+        }
+        
     }
 
     pub fn run_job<T: Data, TE: Data, U: Data, F>(

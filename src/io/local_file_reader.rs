@@ -14,7 +14,8 @@ use crate::env::{BOUNDED_MEM_CACHE, Env};
 use crate::error::{Error, Result};
 use crate::io::*;
 use crate::rdd::*;
-use crate::serializable_traits::{AnyData, Data, SerFunc};
+use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
+use crate::serialization_free::Construct;
 use crate::split::Split;
 use crate::Fn;
 use log::debug;
@@ -25,7 +26,6 @@ use sgx_types::*;
 pub struct LocalFsReaderConfig {
     filter_ext: Option<std::ffi::OsString>,
     expect_dir: bool,
-    secure: bool,
     dir_path: PathBuf,
     executor_partitions: Option<u64>,
 }
@@ -33,11 +33,10 @@ pub struct LocalFsReaderConfig {
 impl LocalFsReaderConfig {
     /// Read all the files from a directory or a path.
     #[track_caller]
-    pub fn new<T: Into<PathBuf>>(path: T, secure: bool) -> LocalFsReaderConfig {
+    pub fn new<T: Into<PathBuf>>(path: T) -> LocalFsReaderConfig {
         LocalFsReaderConfig {
             filter_ext: None,
             expect_dir: true,
-            secure, 
             dir_path: path.into(),
             executor_partitions: None,
         }
@@ -64,15 +63,16 @@ impl LocalFsReaderConfig {
 }
 
 impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
-    fn make_reader<F, U, UE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
+    fn make_reader<F, F0, U, UE, FE, FD>(self, context: Arc<Context>, decoder: Option<F>, sec_decoder: Option<F0>, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Vec<u8>) -> U,
+        F0: SerFunc(Vec<u8>) -> Vec<UE>,
         U: Data,
         UE: Data,
         FE: SerFunc(Vec<U>) -> UE,
         FD: SerFunc(UE) -> Vec<U>,
     {
-        let reader = LocalFsReader::<BytesReader>::new(self, context);
+        let reader = LocalFsReader::<BytesReader, _, _, _>::new(self, context, sec_decoder.clone());
         let read_files = Fn!(
             |_part: usize, readers: Box<dyn Iterator<Item = BytesReader>>| {
                 Box::new(readers.into_iter().map(|file| file.into_iter()).flatten())    //Vec<Vec<Vec<u8>>> -> Vec<Vec<u8>>
@@ -99,22 +99,23 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
             MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files, fe_mpp, fd_mpp).pin(),
         );
         files_per_executor.get_context().add_num(1);
-        let decoder = MapperRdd::new(files_per_executor, decoder, fe, fd).pin();
+        let decoder = MapperRdd::new(files_per_executor, decoder.unwrap(), fe, fd).pin();
         decoder.register_op_name("local_fs_reader<bytes>");
         SerArc::new(decoder)
     }
 }
 
 impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
-    fn make_reader<F, U, UE, FE, FD>(self, context: Arc<Context>, decoder: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
+    fn make_reader<F, F0, U, UE, FE, FD>(self, context: Arc<Context>, decoder: Option<F>, sec_decoder: Option<F0>, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(PathBuf) -> U,
+        F0: SerFunc(PathBuf) -> Vec<UE>,
         U: Data,
         UE: Data,
         FE: SerFunc(Vec<U>) -> UE,
         FD: SerFunc(UE) -> Vec<U>,
     {
-        let reader = LocalFsReader::<FileReader>::new(self, context);
+        let reader = LocalFsReader::<FileReader, _, _, _>::new(self, context, sec_decoder.clone());
         let read_files = Fn!(
             |_part: usize, readers: Box<dyn Iterator<Item = FileReader>>| {
                 Box::new(readers.map(|reader| reader.into_iter()).flatten())
@@ -129,10 +130,12 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
         let fd_mpp = Fn!(|v: Vec<PathBuf>| {
             v
         });
+        reader.get_context().add_num(1);
         let files_per_executor = Arc::new(
             MapPartitionsRdd::new(Arc::new(reader) as Arc<dyn Rdd<Item = _>>, read_files, fe_mpp, fd_mpp).pin(),
         );
-        let decoder = MapperRdd::new(files_per_executor, decoder, fe, fd).pin();
+        files_per_executor.get_context().add_num(1);
+        let decoder = MapperRdd::new(files_per_executor, decoder.unwrap(), fe, fd).pin();
         decoder.register_op_name("local_fs_reader<files>");
         SerArc::new(decoder)
     }
@@ -141,10 +144,14 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
 /// Reads all files specified in a given directory from the local directory
 /// on all executors on every worker node.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct LocalFsReader<T> {
+pub struct LocalFsReader<T, I, UE, F0> 
+where
+    F0: Func(I) -> Vec<UE> + Clone,
+    UE: Data,
+{
     id: usize,
     op_id: OpId,
-    secure: bool,
+    sec_decoder: Option<F0>,
     path: PathBuf,
     is_single_file: bool,
     filter_ext: Option<std::ffi::OsString>,
@@ -156,15 +163,20 @@ pub struct LocalFsReader<T> {
     // deserialized in tasks and this is required:
     splits: Vec<SocketAddrV4>,
     _marker_reader_data: PhantomData<T>,
+    _marker_text_data: PhantomData<I>,
+    _marker_enc_data: PhantomData<UE>,
 }
 
-impl<T: Data> LocalFsReader<T> {
+impl<T, I, UE, F0> LocalFsReader<T, I, UE, F0> 
+where
+    F0: Func(I) -> Vec<UE> + Clone,
+    UE: Data,
+{
     #[track_caller]
-    fn new(config: LocalFsReaderConfig, context: Arc<Context>) -> Self {
+    fn new(config: LocalFsReaderConfig, context: Arc<Context>, sec_decoder: Option<F0>) -> Self {
         let LocalFsReaderConfig {
             dir_path,
             expect_dir,
-            secure,
             filter_ext,
             executor_partitions,
         } = config;
@@ -179,15 +191,17 @@ impl<T: Data> LocalFsReader<T> {
         LocalFsReader {
             id: context.new_rdd_id(),
             op_id: context.new_op_id(loc),
+            sec_decoder,
             path: dir_path,
             is_single_file,
             filter_ext,
             expect_dir,
-            secure,
             executor_partitions,
             splits: context.address_map.clone(),
             context: Arc::downgrade(&context),
             _marker_reader_data: PhantomData,
+            _marker_text_data: PhantomData,
+            _marker_enc_data: PhantomData,
         }
     }
 
@@ -348,176 +362,22 @@ impl<T: Data> LocalFsReader<T> {
             num_cpus::get() as u64
         }
     }
-}
 
-macro_rules! impl_common_lfs_rddb_funcs {
-    () => {
-        fn cache(&self) {
-            panic!("no cache for LocalFsReader");
-        }
-        
-        fn should_cache(&self) -> bool {
-            false
-        }
-
-        fn free_data_enc(&self, ptr: *mut u8) {
-            todo!()
-        }
-
-        fn get_rdd_id(&self) -> usize {
-            self.id
-        }
-
-        fn get_op_id(&self) -> OpId {
-            self.op_id
-        }
-
-        fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
-            op_ids.push(self.get_op_id());
-        }
-
-        fn get_context(&self) -> Arc<Context> {
-            self.context.upgrade().unwrap()
-        }
-
-        fn get_dependencies(&self) -> Vec<Dependency> {
-            vec![]
-        }
-
-        fn get_secure (&self) -> bool {
-            self.secure
-        }
-
-        fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-            todo!()
-        }
-
-        fn is_pinned(&self) -> bool {
-            true
-        }
-
-        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
-            self.secure_compute(split, acc_arg, tx)
-        }
-
-        default fn iterator_any(
-            &self,
-            split: Box<dyn Split>,
-        ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-            Ok(Box::new(
-                self.iterator(split)?
-                    .map(|x| Box::new(x) as Box<dyn AnyData>),
-            ))
-        }
-    };
-}
-
-impl RddBase for LocalFsReader<BytesReader> {
-    impl_common_lfs_rddb_funcs!();
-
-    fn preferred_locations(&self, split: Box<dyn Split>) -> Vec<Ipv4Addr> {
-        // for a given split there is only one preferred location because this is pinned,
-        // the preferred location is the host at which this split will be executed;
-        let split = split.downcast_ref::<BytesReader>().unwrap();
-        vec![split.host]
-    }
-
-    fn splits(&self) -> Vec<Box<dyn Split>> {
-        let mut splits = Vec::with_capacity(self.splits.len());
-        for (idx, host) in self.splits.iter().enumerate() {
-            splits.push(Box::new(BytesReader {
-                idx,
-                host: *host.ip(),
-                files: Vec::new(),
-            }) as Box<dyn Split>)
-        }
-        splits
-    }
-}
-
-impl RddBase for LocalFsReader<FileReader> {
-    impl_common_lfs_rddb_funcs!();
-
-    fn preferred_locations(&self, split: Box<dyn Split>) -> Vec<Ipv4Addr> {
-        let split = split.downcast_ref::<FileReader>().unwrap();
-        vec![split.host]
-    }
-
-    fn splits(&self) -> Vec<Box<dyn Split>> {
-        let mut splits = Vec::with_capacity(self.splits.len());
-        for (idx, host) in self.splits.iter().enumerate() {
-            splits.push(Box::new(FileReader {
-                idx,
-                host: *host.ip(),
-                files: Vec::new(),
-            }) as Box<dyn Split>)
-        }
-        splits
-    }
-}
-
-macro_rules! impl_common_lfs_rdd_funcs {
-    () => {
-        fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>>
-        where
-            Self: Sized,
-        {
-            Arc::new(self.clone()) as Arc<dyn Rdd<Item = Self::Item>>
-        }
-
-        fn get_rdd_base(&self) -> Arc<dyn RddBase> {
-            Arc::new(self.clone()) as Arc<dyn RddBase>
-        }
-
-        fn get_or_compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
-            let cache_tracker = Env::get().cache_tracker.clone();
-            Ok(cache_tracker.get_or_compute(Arc::new(self.clone()), split))
-        }
-        
-    };
-}
-
-impl Rdd for LocalFsReader<BytesReader> {
-    type Item = BytesReader;
-
-    impl_common_lfs_rdd_funcs!();
-
-    fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
-        let split = split.downcast_ref::<BytesReader>().unwrap();
-        let files_by_part = self.load_local_files()?;
-        let idx = split.idx;
-        let host = split.host;
-        Ok(Box::new(
-            files_by_part
-                .into_iter()
-                .map(move |files| BytesReader { files, host, idx }),
-        ) as Box<dyn Iterator<Item = Self::Item>>)
-    }
-
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
-        let split = split.downcast_ref::<BytesReader>().unwrap();
-        let files_by_part = self.load_local_files()?;
-        let idx = split.idx;
-        let host = split.host;
-        // data should be decrypted first and then decoded: Vec<Vec<u8>>
-        let data = files_by_part
-            .into_iter()
-            .map(move |files| BytesReader { files, host, idx })
-            .map(|reader| reader.into_iter())
-            .flatten()
-            .collect::<Vec<_>>();  //Vec<Vec<u8>>
+    fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let len = data.len();
+        let data_size = data.get_aprox_size() / len;
+        println!("per ItemE size = {:?}", data_size);
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cur_rdd_id = self.get_rdd_id();
-        let cur_op_id = self.get_op_id();
+        let cur_rdd_id = self.id;
+        let cur_op_id = self.op_id;
         acc_arg.insert_rdd_id(cur_rdd_id);
         acc_arg.insert_op_id(cur_op_id);
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            //TODO need to sub-partition
-            let block_len = len; //temporary 
+            let block_len = ((1 << 10+10) - 1) / data_size + 1;  //each block: 1MB
+            //let block_len = len; //temporary 
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -559,9 +419,186 @@ impl Rdd for LocalFsReader<BytesReader> {
         });
         Ok(vec![handle])
     }
+
 }
 
-impl Rdd for LocalFsReader<FileReader> {
+macro_rules! impl_common_lfs_rddb_funcs {
+    () => {
+        fn cache(&self) {
+            panic!("no cache for LocalFsReader");
+        }
+        
+        fn should_cache(&self) -> bool {
+            false
+        }
+
+        fn free_data_enc(&self, ptr: *mut u8) {
+            todo!()
+        }
+
+        fn get_rdd_id(&self) -> usize {
+            self.id
+        }
+
+        fn get_op_id(&self) -> OpId {
+            self.op_id
+        }
+
+        fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
+            op_ids.push(self.get_op_id());
+        }
+
+        fn get_context(&self) -> Arc<Context> {
+            self.context.upgrade().unwrap()
+        }
+
+        fn get_dependencies(&self) -> Vec<Dependency> {
+            vec![]
+        }
+
+        fn get_secure (&self) -> bool {
+            self.sec_decoder.is_some()
+        }
+
+        fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+            todo!()
+        }
+
+        fn is_pinned(&self) -> bool {
+            true
+        }
+
+        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+            self.secure_compute(split, acc_arg, tx)
+        }
+
+        default fn iterator_any(
+            &self,
+            split: Box<dyn Split>,
+        ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+            Ok(Box::new(
+                self.iterator(split)?
+                    .map(|x| Box::new(x) as Box<dyn AnyData>),
+            ))
+        }
+    };
+}
+
+impl<UE, F0> RddBase for LocalFsReader<BytesReader, Vec<u8>, UE, F0> 
+where 
+    F0: SerFunc(Vec<u8>) -> Vec<UE>,
+    UE: Data,
+{
+    impl_common_lfs_rddb_funcs!();
+
+    fn preferred_locations(&self, split: Box<dyn Split>) -> Vec<Ipv4Addr> {
+        // for a given split there is only one preferred location because this is pinned,
+        // the preferred location is the host at which this split will be executed;
+        let split = split.downcast_ref::<BytesReader>().unwrap();
+        vec![split.host]
+    }
+
+    fn splits(&self) -> Vec<Box<dyn Split>> {
+        let mut splits = Vec::with_capacity(self.splits.len());
+        for (idx, host) in self.splits.iter().enumerate() {
+            splits.push(Box::new(BytesReader {
+                idx,
+                host: *host.ip(),
+                files: Vec::new(),
+            }) as Box<dyn Split>)
+        }
+        splits
+    }
+}
+
+impl<UE, F0> RddBase for LocalFsReader<FileReader, PathBuf, UE, F0> 
+where
+    F0: SerFunc(PathBuf) -> Vec<UE>,
+    UE: Data,
+{
+    impl_common_lfs_rddb_funcs!();
+
+    fn preferred_locations(&self, split: Box<dyn Split>) -> Vec<Ipv4Addr> {
+        let split = split.downcast_ref::<FileReader>().unwrap();
+        vec![split.host]
+    }
+
+    fn splits(&self) -> Vec<Box<dyn Split>> {
+        let mut splits = Vec::with_capacity(self.splits.len());
+        for (idx, host) in self.splits.iter().enumerate() {
+            splits.push(Box::new(FileReader {
+                idx,
+                host: *host.ip(),
+                files: Vec::new(),
+            }) as Box<dyn Split>)
+        }
+        splits
+    }
+}
+
+macro_rules! impl_common_lfs_rdd_funcs {
+    () => {
+        fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>>
+        where
+            Self: Sized,
+        {
+            Arc::new(self.clone()) as Arc<dyn Rdd<Item = Self::Item>>
+        }
+
+        fn get_rdd_base(&self) -> Arc<dyn RddBase> {
+            Arc::new(self.clone()) as Arc<dyn RddBase>
+        }
+
+        fn get_or_compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+            let cache_tracker = Env::get().cache_tracker.clone();
+            Ok(cache_tracker.get_or_compute(Arc::new(self.clone()), split))
+        }
+        
+    };
+}
+
+impl<UE, F0> Rdd for LocalFsReader<BytesReader, Vec<u8>, UE, F0> 
+where
+    F0: SerFunc(Vec<u8>) -> Vec<UE>,
+    UE: Data,
+{
+    type Item = BytesReader;
+
+    impl_common_lfs_rdd_funcs!();
+
+    fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+        let split = split.downcast_ref::<BytesReader>().unwrap();
+        let files_by_part = self.load_local_files()?;
+        let idx = split.idx;
+        let host = split.host;
+        Ok(Box::new(
+            files_by_part
+                .into_iter()
+                .map(move |files| BytesReader { files, host, idx }),
+        ) as Box<dyn Iterator<Item = Self::Item>>)
+    }
+
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        let split = split.downcast_ref::<BytesReader>().unwrap();
+        let files_by_part = self.load_local_files()?;
+        let idx = split.idx;
+        let host = split.host;
+        let data = files_by_part
+            .into_iter()
+            .map(move |files| BytesReader { files, host, idx })
+            .map(|reader| reader.into_iter())
+            .flatten()   //Vec<Vec<u8>>, ser_enc_data
+            .flat_map(|ser| self.sec_decoder.as_ref().unwrap()(ser).into_iter())
+            .collect::<Vec<_>>(); //enc_data
+        self.secure_compute_(data, acc_arg, tx)
+    }
+}
+
+impl<UE, F0> Rdd for LocalFsReader<FileReader, PathBuf, UE, F0> 
+where 
+    F0: SerFunc(PathBuf) -> Vec<UE>,
+    UE: Data,
+{
     type Item = FileReader;
 
     impl_common_lfs_rdd_funcs!();
@@ -579,7 +616,18 @@ impl Rdd for LocalFsReader<FileReader> {
     }
 
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
-        panic!("Don't support secure computing for LocalFsReader<FileReader>")
+        let split = split.downcast_ref::<FileReader>().unwrap();
+        let files_by_part = self.load_local_files()?;
+        let idx = split.idx;
+        let host = split.host;
+        let data = files_by_part
+                .into_iter()
+                .map(move |files| FileReader { files, host, idx })
+                .map(|reader| reader.into_iter())
+                .flatten()   //Vec<Vec<u8>>, ser_enc_data
+                .flat_map(|ser| self.sec_decoder.as_ref().unwrap()(ser).into_iter())
+                .collect::<Vec<_>>(); //enc_data
+        self.secure_compute_(data, acc_arg, tx)
     }
 }
 

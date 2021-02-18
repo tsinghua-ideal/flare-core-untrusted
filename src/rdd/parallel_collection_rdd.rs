@@ -87,7 +87,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let handle = std::thread::spawn(move || {
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            let block_len = (1 << (10+10)) / data_size;  //each block: 1MB
+            let block_len = ((1 << 10+10) - 1) / data_size + 1;  //each block: 1MB
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
