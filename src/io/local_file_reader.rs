@@ -366,7 +366,6 @@ where
     fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let len = data.len();
         let data_size = data.get_aprox_size() / len;
-        println!("per ItemE size = {:?}", data_size);
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.id;
         let cur_op_id = self.op_id;
@@ -377,7 +376,6 @@ where
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
             let block_len = ((1 << 10+10) - 1) / data_size + 1;  //each block: 1MB
-            //let block_len = len; //temporary 
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {

@@ -148,8 +148,8 @@ where
 
             println!("secure_compute in co_group_rdd");
             let mut deps = split.clone().deps;
-            let mut chunk_size = 0; 
-            let mut num_sub_part = 0;
+            let mut data_size = vec![0, 0]; //kv, kw 
+            let mut num_sub_part = vec![0, 0]; //kv, kw
             let mut kv = (Vec::new(), Vec::new());
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
@@ -159,8 +159,8 @@ where
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         if result_bl.len() != 0 {
-                            chunk_size += result_bl.get_aprox_size() / result_bl.len();
-                            num_sub_part += 1;
+                            data_size[0] += result_bl.get_aprox_size() / result_bl.len();
+                            num_sub_part[0] += 1;
                         }
                         kv.0.push(*result_bl);
                     }
@@ -174,8 +174,8 @@ where
                     kv.1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
                     for sub_part in &kv.1 {
                         if sub_part.len() != 0 {
-                            chunk_size += sub_part.get_aprox_size() / sub_part.len();
-                            num_sub_part += 1;
+                            data_size[0] += sub_part.get_aprox_size() / sub_part.len();
+                            num_sub_part[0] += 1;
                         }
                     }
                 }
@@ -190,8 +190,8 @@ where
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         if result_bl.len() != 0 {
-                            chunk_size += result_bl.get_aprox_size() / result_bl.len();
-                            num_sub_part += 1;
+                            data_size[1] += result_bl.get_aprox_size() / result_bl.len();
+                            num_sub_part[1] += 1;
                         }
                         kw.0.push(*result_bl);
                     }
@@ -205,41 +205,38 @@ where
                     kw.1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
                     for sub_part in &kw.1 {
                         if sub_part.len() != 0 {
-                            chunk_size += sub_part.get_aprox_size() / sub_part.len();
-                            num_sub_part += 1;
+                            data_size[1] += sub_part.get_aprox_size() / sub_part.len();
+                            num_sub_part[1] += 1;
                         }
                     }
                 }
             }
-            chunk_size /= num_sub_part;
+
+            let sum: f64 = data_size.iter().map(|s| *s as f64).sum();
+            let (ratio, avg_iteme_size) = match data_size[0] == 0 || data_size[1] == 0 {
+                true => return Ok(Vec::new()),
+                false => (
+                    data_size.iter().map(|s| (*s as f64)/sum ).collect::<Vec<_>>(),
+                    data_size.iter()
+                        .zip(num_sub_part.iter())
+                        .map(|(s, n)| (*s as f64)/(*n as f64) )
+                        .collect::<Vec<_>>()
+                ),
+            };
 
             let acc_arg = acc_arg.clone();
             let handle = std::thread::spawn(move || {
                 let now = Instant::now();
-                let mut kv_iter = (Vec::new(), Vec::new());
-                let mut kw_iter = (Vec::new(), Vec::new());
-                let chunk_len = ((1 << 10+10) - 1) / (chunk_size * num_sub_part) + 1;  //each block: 1MB
-                init_chunks(&kv.0, &mut kv_iter.0, chunk_len);
-                init_chunks(&kv.1, &mut kv_iter.1, chunk_len);
-                init_chunks(&kw.0, &mut kw_iter.0, chunk_len);
-                init_chunks(&kw.1, &mut kw_iter.1, chunk_len);
-
-    
+                let block_len = ratio.into_iter().enumerate()
+                    .map(|(idx, p)| (((1 << 10+10) - 1) as f64 * p / (avg_iteme_size[idx] * (num_sub_part[idx] as f64))) as usize + 1)  //each block: 1MB
+                    .collect::<Vec<_>>();
+                let mut block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut remaining_in_enclave = false;
+                let mut has_block = step_forward(&mut block, &block_len, &mut kv, &mut kw);
                 let mut sub_part_id = 0;
                 let mut cache_meta = acc_arg.to_cache_meta();
-                while !(kv_iter.0.is_empty() && kv_iter.1.is_empty() && 
-                        kw_iter.0.is_empty() && kw_iter.1.is_empty() ) 
-                {
-                    let mut block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                    //get block (memory inefficient)
-                    step_forward(&mut block.0, &mut kv_iter.0);
-                    step_forward(&mut block.1, &mut kv_iter.1);
-                    step_forward(&mut block.2, &mut kw_iter.0);
-                    step_forward(&mut block.3, &mut kw_iter.1);
-
-                    let mut is_survivor = block.0.is_empty() && block.1.is_empty() 
-                        && block.2.is_empty() && block.3.is_empty(); 
-
+                while has_block || remaining_in_enclave {
+                    let mut is_survivor = !has_block; 
                     if !acc_arg.cached(&sub_part_id) {
                         let mut result_bl_ptr = wrapper_secure_execute(
                             &rdd_ids,
@@ -293,6 +290,9 @@ where
 
                     }
                     sub_part_id += 1;
+                    remaining_in_enclave = has_block;
+                    block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                    has_block = step_forward(&mut block, &block_len, &mut kv, &mut kw);
                 } 
 
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9;
@@ -637,27 +637,33 @@ where
     }
 }
 
-pub fn init_chunks<'a, T: Clone>(v: &'a Vec<Vec<T>>, iter_vec: &mut Vec<Chunks<'a, T>>, chunk_len: usize) {
-    let num_subpar = v.len();
-    //let chunk_size = MAX_ENC_BL;   //max num of entries = MAX_ENC_BL * num_subpar
-    for idx_subpar in 0..num_subpar {
-        iter_vec.push(v[idx_subpar].chunks(chunk_len));        
-    }
-}
 
-pub fn step_forward<T: Clone>(blocks: &mut Vec<Vec<T>>, iter_vec: &mut Vec<Chunks<T>>) {
-    let mut empty_idxs = Vec::new();
-    for (idx, iter) in iter_vec.iter_mut().enumerate() {
-        let nxt = iter.next();
-        if nxt.is_none() {
-            empty_idxs.push(idx);
-            continue;
+pub fn step_forward<KE, VE, WE>(
+    block: &mut (Vec<Vec<(KE, VE)>>, Vec<Vec<(KE, Vec<u8>)>>, Vec<Vec<(KE, WE)>>, Vec<Vec<(KE, Vec<u8>)>>), 
+    block_len: &Vec<usize>,
+    kv: &mut (Vec<Vec<(KE, VE)>>, Vec<Vec<(KE, Vec<u8>)>>), 
+    kw: &mut (Vec<Vec<(KE, WE)>>, Vec<Vec<(KE, Vec<u8>)>>),
+) -> bool
+where
+    KE: Data,
+    VE: Data,
+    WE: Data,
+{
+    fn fill_block<T: Data>(block: &mut Vec<Vec<T>>, source: &mut Vec<Vec<T>>, block_len: usize) {
+        for sub_part in source {
+            let remain_len = sub_part.len();
+            if remain_len == 0 {
+                continue;
+            }
+            let len = std::cmp::min(remain_len, block_len);
+            let mut remain = sub_part.split_off(len);
+            std::mem::swap(&mut remain, sub_part);
+            block.push(remain);
         }
-        let slice = nxt.unwrap();
-        blocks.push(slice.to_vec());
     }
-    empty_idxs.reverse();
-    for idx in empty_idxs {
-        iter_vec.remove(idx);
-    }
+    fill_block(&mut block.0, &mut kv.0, block_len[0]);
+    fill_block(&mut block.1, &mut kv.1, block_len[0]);
+    fill_block(&mut block.2, &mut kw.0, block_len[1]);
+    fill_block(&mut block.3, &mut kw.1, block_len[1]);
+    !(block.0.is_empty() && block.1.is_empty() && block.2.is_empty() && block.3.is_empty())
 }
