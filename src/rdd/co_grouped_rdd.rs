@@ -638,7 +638,7 @@ where
 }
 
 
-pub fn step_forward<KE, VE, WE>(
+fn step_forward<KE, VE, WE>(
     block: &mut (Vec<Vec<(KE, VE)>>, Vec<Vec<(KE, Vec<u8>)>>, Vec<Vec<(KE, WE)>>, Vec<Vec<(KE, Vec<u8>)>>), 
     block_len: &Vec<usize>,
     kv: &mut (Vec<Vec<(KE, VE)>>, Vec<Vec<(KE, Vec<u8>)>>), 

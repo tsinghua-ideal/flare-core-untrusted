@@ -103,8 +103,6 @@ where
         let secure = parent.get_secure();   //temp
         let shuffle_id = ctx.new_shuffle_id();
         let mut vals = RddVals::new(ctx, secure);
-        let cur_rdd_id = vals.id;
-        let cur_op_id = vals.op_id;
         vals.shuffle_ids.push(shuffle_id);
         let vals = Arc::new(vals);
         ShuffledRdd {
@@ -121,7 +119,20 @@ where
     fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
         let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
-        let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
+        let mut bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
+        let mut data_size = 0;
+        let mut num_sub_part = 0;
+        for sub_part in &bucket {
+            if sub_part.len() > 0 {
+                data_size += sub_part.get_aprox_size() / sub_part.len();
+                num_sub_part += 1;
+            }
+        }
+        if num_sub_part == 0 {
+            return Ok(Vec::new());
+        }
+        let avg_iteme_size = data_size / num_sub_part;
+        
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.vals.id;
         let cur_op_id = self.vals.op_id;
@@ -131,40 +142,21 @@ where
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
             let now = Instant::now();
-            let chunk_size = 1000;   //num of entries = 1000*num of sub_part
-            let mut iter_vec = Vec::new();
-            for idx_subpar in 0..bucket.len() {
-                iter_vec.push(bucket[idx_subpar].chunks(chunk_size));        
-            }
-            
+            let block_len = ((1 << 10+10) - 1) / (avg_iteme_size * num_sub_part) + 1;  //each block: 1MB
+            let mut block = Vec::new();
+            let mut remaining_in_enclave = false;
+            let mut has_block = step_forward(&mut block, block_len, &mut bucket);
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            while !iter_vec.is_empty() {
-                //get block (memory inefficient)
-                let mut blocks = Vec::new(); 
-                let mut empty_idxs = Vec::new();
-                for (idx, iter) in iter_vec.iter_mut().enumerate() {
-                    let nxt = iter.next();
-                    if nxt.is_none() {
-                        empty_idxs.push(idx);
-                        continue;
-                    }
-                    let slice = nxt.unwrap();
-                    blocks.push(slice.to_vec());
-                }
-                empty_idxs.reverse();
-                for idx in empty_idxs {
-                    iter_vec.remove(idx);
-                }
-                let mut is_survivor = blocks.is_empty();
-                
+            while has_block || remaining_in_enclave {
+                let mut is_survivor = !has_block;
                 if !acc_arg.cached(&sub_part_id) {
                     let mut result_bl_ptr = wrapper_secure_execute(
                         &rdd_ids,
                         &op_ids,
                         cache_meta,
                         DepInfo::padding_new(20),   //shuffle read
-                        Box::new(blocks), 
+                        Box::new(block), 
                         &captured_vars,
                     );
                     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
@@ -210,6 +202,9 @@ where
                     tx.send(result_bl_ptr).unwrap();
                 }
                 sub_part_id += 1;
+                remaining_in_enclave = has_block;
+                block = Vec::new();
+                has_block = step_forward(&mut block, block_len, &mut bucket);
             }  
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("in ShuffledRdd, shuffle read + narrow {:?}", dur);  
@@ -415,4 +410,29 @@ where
     fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
         Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
+}
+
+fn step_forward<KE, CE>(
+    block: &mut Vec<Vec<(KE, CE)>>, 
+    block_len: usize,
+    buckets: &mut Vec<Vec<(KE, CE)>>, 
+) -> bool
+where
+    KE: Data,
+    CE: Data,
+{
+    fn fill_block<T: Data>(block: &mut Vec<Vec<T>>, source: &mut Vec<Vec<T>>, block_len: usize) {
+        for sub_part in source {
+            let remain_len = sub_part.len();
+            if remain_len == 0 {
+                continue;
+            }
+            let len = std::cmp::min(remain_len, block_len);
+            let mut remain = sub_part.split_off(len);
+            std::mem::swap(&mut remain, sub_part);
+            block.push(remain);
+        }
+    }
+    fill_block(block, buckets, block_len);
+    !block.is_empty()
 }
