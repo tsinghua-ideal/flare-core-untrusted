@@ -76,8 +76,20 @@ type CT<T, TE> = Text<T, TE,
 pub type OText<T> = Text<T, T, Box<dyn Fn(T) -> T>, Box<dyn Fn(T) -> T> >; 
 
 pub const MAX_ENC_BL: usize = 1000;
+pub const BLOCK_SIZE: usize = 1 << 10 + 10;  
 static immediate_cout: bool = true;
 pub static EENTER_LOCK: AtomicBool = AtomicBool::new(false);
+pub static STAGE_LOCK: AtomicBool = AtomicBool::new(false);
+
+pub fn get_stage_lock() {
+    while STAGE_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+        //wait
+    }
+}
+
+pub fn free_stage_lock() {
+    assert_eq!(STAGE_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+}
 
 extern "C" {
     pub fn secure_execute(
@@ -88,7 +100,7 @@ extern "C" {
         op_ids: *const u8,
         cache_meta: CacheMeta,
         dep_info: DepInfo,
-        input: *mut u8,
+        input: Input,
         captured_vars: *const u8,
     ) -> sgx_status_t;
     pub fn exploit_spec_oppty(
@@ -104,8 +116,7 @@ extern "C" {
         retval: *mut usize,
         tid: u64, 
         spec_call_seq: usize,
-        cache_meta: CacheMeta,
-        input: *mut u8, 
+        cache_meta: CacheMeta, 
         hash_ops: *mut u64,
     ) -> sgx_status_t;
     pub fn free_res_enc(
@@ -217,21 +228,26 @@ pub fn wrapper_secure_execute<T>(
     op_ids: &Vec<OpId>,
     cache_meta: CacheMeta,
     dep_info: DepInfo, 
-    data: Box<T>,
+    data: &T,
+    lower: &mut Vec<usize>,
+    upper: &mut Vec<usize>,
+    block_size: usize,
     captured_vars: &HashMap<usize, Vec<Vec<u8>>>,
-) -> usize 
+) -> (usize, f64) 
 where
-    T: Construct,
+    T: Construct + Data,
 {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut result_bl_ptr: usize = 0;
     let tid: u64 = thread::current().id().as_u64().into();
-    println!("data size = {:?}", data.get_aprox_size());
-    let block_ptr = Box::into_raw(data);
-    
+    let input = Input::new(data, lower, upper, block_size);
+
+    let now = Instant::now();
     while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
         //wait
     }
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+
     let sgx_status = unsafe {
         secure_execute(
             eid,
@@ -241,7 +257,7 @@ where
             op_ids as *const Vec<OpId> as *const u8,
             cache_meta,
             dep_info,
-            block_ptr as *mut u8,
+            input,
             captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
         )
     };
@@ -250,9 +266,8 @@ where
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
-    };     
-    let _block = *unsafe{ Box::from_raw(block_ptr) };
-    result_bl_ptr
+    };
+    (result_bl_ptr, dur)
 }
 
 
@@ -286,7 +301,6 @@ pub fn wrapper_exploit_spec_oppty(
 pub fn wrapper_spec_execute(
     spec_call_seq: usize,
     cache_meta: CacheMeta,
-    input: *mut u8, 
 ) {
     if spec_call_seq == 0 {
         println!("no speculative execution");
@@ -305,7 +319,6 @@ pub fn wrapper_spec_execute(
             tid, 
             spec_call_seq,
             cache_meta,
-            input,
             &mut hash_ops,
         )
     };
@@ -730,6 +743,7 @@ pub fn secure_compute_cached(
         let dep_info = acc_arg.dep_info;
 
         let handle = std::thread::spawn(move || {
+            get_stage_lock();
             let tid: u64 = thread::current().id().as_u64().into();
             for (seq_id, sub_part) in cached_sub_parts.into_iter().enumerate() {
                 let mut is_survivor = cached_sub_parts_len == subpids.len() &&  cached_sub_parts_len-1 == seq_id;
@@ -744,7 +758,6 @@ pub fn secure_compute_cached(
                 cache_meta.set_sub_part_id(sub_part);
                 cache_meta.set_is_survivor(is_survivor);
                 BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                let data_ptr: usize = 0;  //invalid pointer
                 let mut result_ptr: usize = 0;
                 while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                     //wait
@@ -758,7 +771,7 @@ pub fn secure_compute_cached(
                         &op_ids as *const Vec<OpId> as *const u8, 
                         cache_meta,
                         dep_info,   
-                        data_ptr as *mut u8 ,
+                        Input::padding(), //invalid pointer
                         &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                     )
                 };
@@ -770,11 +783,11 @@ pub fn secure_compute_cached(
                 };
                 wrapper_spec_execute(
                     spec_call_seq_ptr, 
-                    cache_meta, 
-                    0 as *mut u8,
+                    cache_meta,
                 );
                 tx.send(result_ptr).unwrap();
             }
+            free_stage_lock();
         });
         handles.push(handle);
     } else {
@@ -933,6 +946,49 @@ impl CacheMeta {
             self.part_id,
             self.sub_part_id,    
         )
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Input {
+    data: usize,
+    lower: usize,
+    upper: usize,
+    block_size: usize,
+}
+
+impl Input {
+    pub fn new<T: Data>(data: &T, lower: &mut Vec<usize>, upper: &mut Vec<usize>, block_size: usize) -> Self {
+        let data = data as *const T as usize;
+        let lower = lower as *mut Vec<usize> as usize;
+        let upper = upper as *mut Vec<usize> as usize;
+        Input {
+            data,
+            lower,
+            upper,
+            block_size,
+        }
+    }
+
+    pub fn build_from_ptr(data: *const u8, lower: &mut Vec<usize>, upper: &mut Vec<usize>, block_size: usize) -> Self {
+        let lower = lower as *mut Vec<usize> as usize;
+        let upper = upper as *mut Vec<usize> as usize;
+        Input {
+            data: data as usize,
+            lower,
+            upper,
+            block_size,
+        }
+    }
+
+    pub fn padding() -> Self {
+        Input {
+            data: 0,
+            lower: 0,
+            upper: 0,
+            block_size: 0,
+        }
     }
 }
 
@@ -1327,6 +1383,7 @@ pub trait RddE: Rdd {
         for received in rx {
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
             assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+
             if caching {
                 //collect result
                 result.extend_from_slice(&result_bl);
@@ -1495,13 +1552,13 @@ pub trait RddE: Rdd {
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<Self::ItemE>>();
        
-        let data_ptr = Box::into_raw(Box::new(data));
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], BLOCK_SIZE);
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_execute(
@@ -1512,11 +1569,10 @@ pub trait RddE: Rdd {
                 &op_ids as *const Vec<OpId> as *const u8,
                 Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
-                data_ptr as *mut u8 ,
+                input,
                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             )
         };
-        let _data = unsafe{ Box::from_raw(data_ptr) };
         match sgx_status {
             sgx_status_t::SGX_SUCCESS => {},
             _ => {
@@ -1594,13 +1650,13 @@ pub trait RddE: Rdd {
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<Self::ItemE>>();
        
-        let data_ptr = Box::into_raw(Box::new(data));
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], BLOCK_SIZE);
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_execute(
@@ -1611,11 +1667,10 @@ pub trait RddE: Rdd {
                 &op_ids as *const Vec<OpId> as *const u8,
                 Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
-                data_ptr as *mut u8 ,
+                input,
                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             )
         };
-        let _data = unsafe{ Box::from_raw(data_ptr) };
         match sgx_status {
             sgx_status_t::SGX_SUCCESS => {},
             _ => {
@@ -1688,13 +1743,13 @@ pub trait RddE: Rdd {
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<_>>();
        
-        let data_ptr = Box::into_raw(Box::new(data));
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], BLOCK_SIZE);
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_execute(
@@ -1705,11 +1760,10 @@ pub trait RddE: Rdd {
                 &op_ids as *const Vec<OpId> as *const u8,
                 Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
-                data_ptr as *mut u8 ,
+                input,
                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             )
         };
-        let _data = unsafe{ Box::from_raw(data_ptr) };
         match sgx_status {
             sgx_status_t::SGX_SUCCESS => {},
             _ => {
@@ -1900,13 +1954,13 @@ pub trait RddE: Rdd {
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<_>>();
        
-        let data_ptr = Box::into_raw(Box::new(data));
         let now = Instant::now();
         let tid: u64 = thread::current().id().as_u64().into();
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], BLOCK_SIZE);
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_execute(
@@ -1917,11 +1971,10 @@ pub trait RddE: Rdd {
                 &op_ids as *const Vec<OpId> as *const u8,
                 Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
-                data_ptr as *mut u8 ,
+                input,
                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             )
         };
-        let _data = unsafe{ Box::from_raw(data_ptr) };
         match sgx_status {
             sgx_status_t::SGX_SUCCESS => {},
             _ => {

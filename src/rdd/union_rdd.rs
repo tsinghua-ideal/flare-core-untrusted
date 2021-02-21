@@ -120,6 +120,7 @@ where
                             cache_meta.set_sub_part_id(sub_part_id);
                             cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
+                            let input = Input::build_from_ptr(r.unwrap() as *const u8, &mut vec![0], &mut vec![usize::MAX], BLOCK_SIZE);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
                                 secure_execute(
@@ -130,14 +131,13 @@ where
                                     &acc_arg.op_ids as *const Vec<OpId> as *const u8,  
                                     cache_meta,
                                     acc_arg.dep_info, 
-                                    r.unwrap() as *mut u8, 
+                                    input, 
                                     &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                                 )
                             };
                             wrapper_spec_execute(
                                 spec_call_seq_ptr, 
                                 cache_meta, 
-                                0 as *mut u8,
                             );
                             tx.send(result_bl_ptr).unwrap();
                         }
@@ -194,6 +194,7 @@ where
                             cache_meta.set_sub_part_id(sub_part_id);
                             cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
+                            let input = Input::build_from_ptr(r.unwrap() as *const u8, &mut vec![0], &mut vec![usize::MAX], BLOCK_SIZE);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
                                 secure_execute(
@@ -204,14 +205,13 @@ where
                                     &acc_arg.op_ids as *const Vec<OpId> as *const u8, 
                                     cache_meta,
                                     acc_arg.dep_info, 
-                                    r.unwrap() as *mut u8, 
+                                    input, 
                                     &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                                 )
                             };
                             wrapper_spec_execute(
                                 spec_call_seq_ptr, 
-                                cache_meta, 
-                                0 as *mut u8,
+                                cache_meta,
                             );
                             tx.send(result_bl_ptr).unwrap();
                         }

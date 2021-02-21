@@ -304,9 +304,8 @@ where
                     log::debug!("split index: {}", split.get_index());
                     let (tx, rx) = mpsc::sync_channel(0);
                     let dep_info = self.get_dep_info();
-                    let mut acc_arg = AccArg::new(partition, dep_info);  
+                    let mut acc_arg = AccArg::new(partition, dep_info); 
                     let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
-                    let now = Instant::now();
                     let num_output_splits = self.partitioner.get_num_of_partitions();
                     let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
                         .map(|_| Vec::new())
@@ -328,9 +327,6 @@ where
                     for handle in handles {
                         handle.join().unwrap();
                     }
-        
-                    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                    println!("in dependency, total {:?}", dur);
                     env::Env::get().shuffle_manager.get_server_uri()  
                 },
             }

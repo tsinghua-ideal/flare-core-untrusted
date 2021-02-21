@@ -85,9 +85,12 @@ impl<T: Data> ParallelCollectionSplit<T> {
         //sub-partition
         let mut acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
+            get_stage_lock();
+            let now = Instant::now();
+            let mut wait = 0.0; 
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            let block_len = ((1 << 10+10) - 1) / data_size + 1;  //each block: 1MB
+            let block_len = (BLOCK_SIZE - 1) / data_size + 1;
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -95,7 +98,6 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     false => cur + block_len,
                 };
                 let mut is_survivor = next == len; 
-                println!("is_survivor = {:?}", is_survivor);
                 //currently, all sub_partitions are not cached as long as coming to this rdd
                 if !acc_arg.cached(&sub_part_id) {  
                     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
@@ -109,28 +111,30 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     cache_meta.set_sub_part_id(sub_part_id);
                     cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                    let now = Instant::now();
-                    let block = Box::new((&data[cur..next]).to_vec());
-                    let result_bl_ptr = wrapper_secure_execute(
+                    let (result_bl_ptr, swait) = wrapper_secure_execute(
                         &acc_arg.rdd_ids,
                         &acc_arg.op_ids,
                         cache_meta,
                         acc_arg.dep_info,
-                        block,
+                        &data,
+                        &mut vec![cur],
+                        &mut vec![next],
+                        BLOCK_SIZE,
                         &captured_vars,
                     );
+                    wait += swait;
                     wrapper_spec_execute(
                         spec_call_seq_ptr, 
                         cache_meta, 
-                        0 as *mut u8,
                     );
                     tx.send(result_bl_ptr).unwrap();
-                    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                    println!("in ParallelCollectionRdd, num of sub_partition {:?}, compute {:?}", sub_part_id, dur);
                 }
                 sub_part_id += 1;
                 cur = next;  
             }
+            free_stage_lock();
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
+            println!("***in parallel collection rdd, total {:?}***", dur);
         });
         handle 
     }

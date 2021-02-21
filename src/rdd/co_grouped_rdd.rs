@@ -145,11 +145,9 @@ where
             let cur_op_id = self.vals.op_id;
             let rdd_ids = vec![cur_rdd_id];
             let op_ids = vec![cur_op_id];
-
-            println!("secure_compute in co_group_rdd");
             let mut deps = split.clone().deps;
-            let mut data_size = vec![0, 0]; //kv, kw 
             let mut num_sub_part = vec![0, 0]; //kv, kw
+            let mut upper_bound = Vec::new();
             let mut kv = (Vec::new(), Vec::new());
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
@@ -158,11 +156,12 @@ where
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        if result_bl.len() != 0 {
-                            data_size[0] += result_bl.get_aprox_size() / result_bl.len();
+                        let result_bl_len = result_bl.len();
+                        if result_bl_len > 0 {
                             num_sub_part[0] += 1;
-                        }
-                        kv.0.push(*result_bl);
+                            upper_bound.push(result_bl_len);
+                            kv.0.push(*result_bl);
+                        } 
                     }
                     for handle in handles {
                         handle.join().unwrap();
@@ -171,11 +170,13 @@ where
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     //TODO need revision if fe & fd of group_by is passed 
                     let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
-                    kv.1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
-                    for sub_part in &kv.1 {
-                        if sub_part.len() != 0 {
-                            data_size[0] += sub_part.get_aprox_size() / sub_part.len();
+                    let kv_1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
+                    for sub_part in kv_1 {
+                        let sub_part_len = sub_part.len();
+                        if sub_part_len > 0 {
                             num_sub_part[0] += 1;
+                            upper_bound.push(sub_part_len);
+                            kv.1.push(sub_part);
                         }
                     }
                 }
@@ -189,11 +190,12 @@ where
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        if result_bl.len() != 0 {
-                            data_size[1] += result_bl.get_aprox_size() / result_bl.len();
+                        let result_bl_len = result_bl.len();
+                        if result_bl_len > 0 {
                             num_sub_part[1] += 1;
+                            upper_bound.push(result_bl_len);
+                            kw.0.push(*result_bl);
                         }
-                        kw.0.push(*result_bl);
                     }
                     for handle in handles {
                         handle.join().unwrap();
@@ -202,50 +204,53 @@ where
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     //TODO need revision if fe & fd of group_by is passed 
                     let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
-                    kw.1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
-                    for sub_part in &kw.1 {
-                        if sub_part.len() != 0 {
-                            data_size[1] += sub_part.get_aprox_size() / sub_part.len();
+                    let kw_1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
+                    for sub_part in kw_1 {
+                        let sub_part_len = sub_part.len();
+                        if sub_part_len > 0 {
                             num_sub_part[1] += 1;
+                            upper_bound.push(sub_part_len);
+                            kw.1.push(sub_part);
                         }
                     }
                 }
             }
-
-            let sum: f64 = data_size.iter().map(|s| *s as f64).sum();
-            let (ratio, avg_iteme_size) = match data_size[0] == 0 || data_size[1] == 0 {
-                true => return Ok(Vec::new()),
-                false => (
-                    data_size.iter().map(|s| (*s as f64)/sum ).collect::<Vec<_>>(),
-                    data_size.iter()
-                        .zip(num_sub_part.iter())
-                        .map(|(s, n)| (*s as f64)/(*n as f64) )
-                        .collect::<Vec<_>>()
-                ),
-            };
+            let data = (kv.0, kv.1, kw.0, kw.1);
+            if num_sub_part[0] == 0 || num_sub_part[1] == 0 {
+                return Ok(Vec::new());
+            }
 
             let acc_arg = acc_arg.clone();
             let handle = std::thread::spawn(move || {
+                get_stage_lock();
                 let now = Instant::now();
-                let block_len = ratio.into_iter().enumerate()
-                    .map(|(idx, p)| (((1 << 10+10) - 1) as f64 * p / (avg_iteme_size[idx] * (num_sub_part[idx] as f64))) as usize + 1)  //each block: 1MB
-                    .collect::<Vec<_>>();
-                let mut block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                let mut remaining_in_enclave = false;
-                let mut has_block = step_forward(&mut block, &block_len, &mut kv, &mut kw);
+                let mut wait = 0.0; 
+                let mut lower = vec![0; num_sub_part[0] + num_sub_part[1]];
+                let mut upper = vec![1; num_sub_part[0] + num_sub_part[1]];
+                
                 let mut sub_part_id = 0;
                 let mut cache_meta = acc_arg.to_cache_meta();
-                while has_block || remaining_in_enclave {
-                    let mut is_survivor = !has_block; 
-                    if !acc_arg.cached(&sub_part_id) {
-                        let mut result_bl_ptr = wrapper_secure_execute(
+
+                while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
+                    let mut is_survivor = false; //tmp 
+                    if !acc_arg.cached(&sub_part_id) {  //don't support partial cache now, for the lower and upper is not remembered
+                        //TODO: get lower of the last cached data
+                        upper = upper.iter()
+                            .zip(upper_bound.iter())
+                            .map(|(l, ub)| std::cmp::min(*l, *ub))
+                            .collect::<Vec<_>>();
+                        let (mut result_bl_ptr, swait) = wrapper_secure_execute(
                             &rdd_ids,
                             &op_ids,
                             cache_meta, //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
                             DepInfo::padding_new(20), //shuffle read and no encryption for result
-                            Box::new(block),
+                            &data,
+                            &mut lower,
+                            &mut upper,
+                            BLOCK_SIZE,
                             &captured_vars,
                         );
+                        wait += swait;
                         let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
                             &acc_arg.op_ids,
                             cache_meta, 
@@ -258,7 +263,8 @@ where
                         cache_meta.set_is_survivor(is_survivor);
                         BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                         // this block is in enclave, cannot access
-                        let block_ptr = result_bl_ptr as *mut u8;
+                        let block_ptr = result_bl_ptr as *const u8;
+                        let input = Input::build_from_ptr(block_ptr, &mut vec![0], &mut vec![usize::MAX], BLOCK_SIZE);
                         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
                         result_bl_ptr = 0;
                         let tid: u64 = thread::current().id().as_u64().into();
@@ -271,7 +277,7 @@ where
                                 &acc_arg.op_ids as *const Vec<OpId> as *const u8,
                                 cache_meta,
                                 acc_arg.dep_info,  
-                                block_ptr,
+                                input,
                                 &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                             )
                         };
@@ -283,20 +289,19 @@ where
                         };
                         wrapper_spec_execute(
                             spec_call_seq_ptr, 
-                            cache_meta, 
-                            0 as *mut u8,
+                            cache_meta,
                         );
                         tx.send(result_bl_ptr).unwrap();
-
+                        lower = lower.iter()
+                            .zip(upper_bound.iter())
+                            .map(|(l, ub)| std::cmp::min(*l, *ub))
+                            .collect::<Vec<_>>();
                     }
                     sub_part_id += 1;
-                    remaining_in_enclave = has_block;
-                    block = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                    has_block = step_forward(&mut block, &block_len, &mut kv, &mut kw);
-                } 
-
-                let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                println!("in CoGroupedRdd, shuffle read + narrow {:?}", dur);  
+                }
+                free_stage_lock();
+                let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
+                println!("***in co grouped rdd, total {:?}***", dur);  
                 
             });
             Ok(vec![handle])
@@ -635,35 +640,4 @@ where
     fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
         Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
-}
-
-
-fn step_forward<KE, VE, WE>(
-    block: &mut (Vec<Vec<(KE, VE)>>, Vec<Vec<(KE, Vec<u8>)>>, Vec<Vec<(KE, WE)>>, Vec<Vec<(KE, Vec<u8>)>>), 
-    block_len: &Vec<usize>,
-    kv: &mut (Vec<Vec<(KE, VE)>>, Vec<Vec<(KE, Vec<u8>)>>), 
-    kw: &mut (Vec<Vec<(KE, WE)>>, Vec<Vec<(KE, Vec<u8>)>>),
-) -> bool
-where
-    KE: Data,
-    VE: Data,
-    WE: Data,
-{
-    fn fill_block<T: Data>(block: &mut Vec<Vec<T>>, source: &mut Vec<Vec<T>>, block_len: usize) {
-        for sub_part in source {
-            let remain_len = sub_part.len();
-            if remain_len == 0 {
-                continue;
-            }
-            let len = std::cmp::min(remain_len, block_len);
-            let mut remain = sub_part.split_off(len);
-            std::mem::swap(&mut remain, sub_part);
-            block.push(remain);
-        }
-    }
-    fill_block(&mut block.0, &mut kv.0, block_len[0]);
-    fill_block(&mut block.1, &mut kv.1, block_len[0]);
-    fill_block(&mut block.2, &mut kw.0, block_len[1]);
-    fill_block(&mut block.3, &mut kw.1, block_len[1]);
-    !(block.0.is_empty() && block.1.is_empty() && block.2.is_empty() && block.3.is_empty())
 }

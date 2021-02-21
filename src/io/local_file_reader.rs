@@ -7,6 +7,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc::SyncSender, Weak};
 use std::thread::{JoinHandle, self};
+use std::time::Instant;
 
 use crate::context::Context;
 use crate::dependency::Dependency;
@@ -373,9 +374,12 @@ where
         acc_arg.insert_op_id(cur_op_id);
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
+            get_stage_lock();
+            let now = Instant::now();
+            let mut wait = 0.0; 
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            let block_len = ((1 << 10+10) - 1) / data_size + 1;  //each block: 1MB
+            let block_len = (BLOCK_SIZE - 1) / data_size + 1;
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -395,25 +399,30 @@ where
                     cache_meta.set_sub_part_id(sub_part_id);
                     cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                    let block = Box::new((&data[cur..next]).to_vec());
-                    let result_bl_ptr = wrapper_secure_execute(
-                        &acc_arg.rdd_ids, 
+                    let (result_bl_ptr, swait) = wrapper_secure_execute(
+                        &acc_arg.rdd_ids,
                         &acc_arg.op_ids,
                         cache_meta, 
                         acc_arg.dep_info, 
-                        block, 
+                        &data,
+                        &mut vec![cur],
+                        &mut vec![next],
+                        BLOCK_SIZE, 
                         &captured_vars
                     );
+                    wait += swait;
                     wrapper_spec_execute(
                         spec_call_seq_ptr, 
                         cache_meta, 
-                        0 as *mut u8,
                     );
                     tx.send(result_bl_ptr).unwrap();
                 }
                 sub_part_id += 1;
                 cur = next; 
-            }  
+            }
+            free_stage_lock();
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
+            println!("***in local file reader, total {:?}***", dur);   
         });
         Ok(vec![handle])
     }

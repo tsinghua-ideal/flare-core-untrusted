@@ -119,19 +119,12 @@ where
     fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
         let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
-        let mut bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().collect();  // bucket per subpartition
-        let mut data_size = 0;
-        let mut num_sub_part = 0;
-        for sub_part in &bucket {
-            if sub_part.len() > 0 {
-                data_size += sub_part.get_aprox_size() / sub_part.len();
-                num_sub_part += 1;
-            }
-        }
+        let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().filter(|sub_part| sub_part.len() > 0).collect();  // bucket per subpartition
+        let num_sub_part = bucket.len();
+        let upper_bound = bucket.iter().map(|sub_part| sub_part.len()).collect::<Vec<_>>();
         if num_sub_part == 0 {
             return Ok(Vec::new());
         }
-        let avg_iteme_size = data_size / num_sub_part;
         
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.vals.id;
@@ -141,24 +134,34 @@ where
 
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
+            get_stage_lock();
             let now = Instant::now();
-            let block_len = ((1 << 10+10) - 1) / (avg_iteme_size * num_sub_part) + 1;  //each block: 1MB
-            let mut block = Vec::new();
-            let mut remaining_in_enclave = false;
-            let mut has_block = step_forward(&mut block, block_len, &mut bucket);
+            let mut wait = 0.0;
+            let mut lower = vec![0; num_sub_part];
+            let mut upper = vec![1; num_sub_part];
+            
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            while has_block || remaining_in_enclave {
-                let mut is_survivor = !has_block;
-                if !acc_arg.cached(&sub_part_id) {
-                    let mut result_bl_ptr = wrapper_secure_execute(
+            while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
+                let mut is_survivor = false;   //temp
+                if !acc_arg.cached(&sub_part_id) {                        //don't support partial cache now, for the lower and upper is not remembered
+                    //TODO: get lower of the last cached data
+                    upper = upper.iter()
+                        .zip(upper_bound.iter())
+                        .map(|(l, ub)| std::cmp::min(*l, *ub))
+                        .collect::<Vec<_>>();
+                    let (mut result_bl_ptr, swait) = wrapper_secure_execute(
                         &rdd_ids,
                         &op_ids,
                         cache_meta,
                         DepInfo::padding_new(20),   //shuffle read
-                        Box::new(block), 
+                        &bucket,
+                        &mut lower,
+                        &mut upper,
+                        BLOCK_SIZE,
                         &captured_vars,
                     );
+                    wait += swait;
                     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
                         &acc_arg.op_ids,
                         cache_meta, 
@@ -171,7 +174,8 @@ where
                     cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                     // this block is in enclave, cannot access
-                    let block_ptr = result_bl_ptr as *mut u8;
+                    let block_ptr = result_bl_ptr as *const u8;
+                    let input = Input::build_from_ptr(block_ptr, &mut vec![0], &mut vec![usize::MAX], BLOCK_SIZE);
                     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
                     result_bl_ptr = 0;
                     let tid: u64 = thread::current().id().as_u64().into();
@@ -184,7 +188,7 @@ where
                             &acc_arg.op_ids as *const Vec<OpId> as *const u8,
                             cache_meta,
                             acc_arg.dep_info,  
-                            block_ptr,
+                            input,
                             &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                         )
                     };
@@ -197,17 +201,18 @@ where
                     wrapper_spec_execute(
                         spec_call_seq_ptr, 
                         cache_meta, 
-                        0 as *mut u8,
                     );
                     tx.send(result_bl_ptr).unwrap();
+                    lower = lower.iter()
+                        .zip(upper_bound.iter())
+                        .map(|(l, ub)| std::cmp::min(*l, *ub))
+                        .collect::<Vec<_>>();
                 }
                 sub_part_id += 1;
-                remaining_in_enclave = has_block;
-                block = Vec::new();
-                has_block = step_forward(&mut block, block_len, &mut bucket);
             }  
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("in ShuffledRdd, shuffle read + narrow {:?}", dur);  
+            free_stage_lock();
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
+            println!("***in shuffled rdd, total {:?}***", dur);  
         });
         Ok(vec![handle])
     } 
@@ -410,29 +415,4 @@ where
     fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
         Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
-}
-
-fn step_forward<KE, CE>(
-    block: &mut Vec<Vec<(KE, CE)>>, 
-    block_len: usize,
-    buckets: &mut Vec<Vec<(KE, CE)>>, 
-) -> bool
-where
-    KE: Data,
-    CE: Data,
-{
-    fn fill_block<T: Data>(block: &mut Vec<Vec<T>>, source: &mut Vec<Vec<T>>, block_len: usize) {
-        for sub_part in source {
-            let remain_len = sub_part.len();
-            if remain_len == 0 {
-                continue;
-            }
-            let len = std::cmp::min(remain_len, block_len);
-            let mut remain = sub_part.split_off(len);
-            std::mem::swap(&mut remain, sub_part);
-            block.push(remain);
-        }
-    }
-    fill_block(block, buckets, block_len);
-    !block.is_empty()
 }
