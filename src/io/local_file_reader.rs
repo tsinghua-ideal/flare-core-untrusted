@@ -379,7 +379,7 @@ where
             let mut wait = 0.0; 
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            let block_len = (BLOCK_SIZE - 1) / data_size + 1;
+            let block_len = (get_block_size() - 1) / data_size + 1;
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -407,7 +407,7 @@ where
                         &data,
                         &mut vec![cur],
                         &mut vec![next],
-                        BLOCK_SIZE, 
+                        get_block_size(), 
                         &captured_vars
                     );
                     wait += swait;

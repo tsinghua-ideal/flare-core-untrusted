@@ -14,7 +14,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::slice;
 use std::sync::{Arc, Weak,
-    atomic::{self, AtomicBool},
+    atomic::{self, AtomicBool, AtomicUsize},
     mpsc::{sync_channel, SyncSender, Receiver} 
     };
 use std::thread::{JoinHandle, self};
@@ -75,11 +75,15 @@ type CT<T, TE> = Text<T, TE,
     >;
 pub type OText<T> = Text<T, T, Box<dyn Fn(T) -> T>, Box<dyn Fn(T) -> T> >; 
 
-pub const MAX_ENC_BL: usize = 1000;
-pub const BLOCK_SIZE: usize = 1 << 10 + 10;  
 static immediate_cout: bool = true;
+pub static INPUT_: AtomicUsize = AtomicUsize::new(20);  //default 1M
 pub static EENTER_LOCK: AtomicBool = AtomicBool::new(false);
 pub static STAGE_LOCK: AtomicBool = AtomicBool::new(false);
+pub const MAX_ENC_BL: usize = 1000;
+
+pub fn get_block_size() -> usize {
+    1 << INPUT_.load(atomic::Ordering::SeqCst)
+}
 
 pub fn get_stage_lock() {
     while STAGE_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
@@ -1558,7 +1562,7 @@ pub trait RddE: Rdd {
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], BLOCK_SIZE);
+        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_execute(
@@ -1656,7 +1660,7 @@ pub trait RddE: Rdd {
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], BLOCK_SIZE);
+        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_execute(
@@ -1749,7 +1753,7 @@ pub trait RddE: Rdd {
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], BLOCK_SIZE);
+        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_execute(
@@ -1960,7 +1964,7 @@ pub trait RddE: Rdd {
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], BLOCK_SIZE);
+        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
         let mut result_ptr: usize = 0;
         let sgx_status = unsafe {
             secure_execute(

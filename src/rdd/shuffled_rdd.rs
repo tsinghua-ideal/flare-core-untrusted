@@ -158,7 +158,7 @@ where
                         &bucket,
                         &mut lower,
                         &mut upper,
-                        BLOCK_SIZE,
+                        get_block_size(),
                         &captured_vars,
                     );
                     wait += swait;
@@ -175,7 +175,7 @@ where
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                     // this block is in enclave, cannot access
                     let block_ptr = result_bl_ptr as *const u8;
-                    let input = Input::build_from_ptr(block_ptr, &mut vec![0], &mut vec![usize::MAX], BLOCK_SIZE);
+                    let input = Input::build_from_ptr(block_ptr, &mut vec![0], &mut vec![usize::MAX], get_block_size());
                     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
                     result_bl_ptr = 0;
                     let tid: u64 = thread::current().id().as_u64().into();
