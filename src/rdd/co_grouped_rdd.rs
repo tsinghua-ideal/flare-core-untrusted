@@ -234,6 +234,8 @@ where
                 while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
                     let mut is_survivor = false; //tmp 
                     if !acc_arg.cached(&sub_part_id) {  //don't support partial cache now, for the lower and upper is not remembered
+                        cache_meta.set_sub_part_id(sub_part_id);
+                        BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                         //TODO: get lower of the last cached data
                         upper = upper.iter()
                             .zip(upper_bound.iter())
@@ -259,9 +261,7 @@ where
                         if spec_call_seq_ptr != 0 {
                             is_survivor = true;
                         }
-                        cache_meta.set_sub_part_id(sub_part_id);
                         cache_meta.set_is_survivor(is_survivor);
-                        BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                         // this block is in enclave, cannot access
                         let block_ptr = result_bl_ptr as *const u8;
                         let input = Input::build_from_ptr(block_ptr, &mut vec![0], &mut vec![usize::MAX], get_block_size());
