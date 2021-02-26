@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DepInfo {
-    is_shuffle: u8,
+    pub is_shuffle: u8,
     identifier: usize,
     parent_rdd_id: usize,
     child_rdd_id: usize, 
@@ -304,7 +304,7 @@ where
                     log::debug!("split index: {}", split.get_index());
                     let (tx, rx) = mpsc::sync_channel(0);
                     let dep_info = self.get_dep_info();
-                    let mut acc_arg = AccArg::new(partition, dep_info); 
+                    let mut acc_arg = AccArg::new(partition, dep_info, Some(self.partitioner.get_num_of_partitions()));
                     let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
                     let num_output_splits = self.partitioner.get_num_of_partitions();
                     let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)

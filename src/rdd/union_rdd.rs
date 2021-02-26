@@ -93,7 +93,7 @@ where
                 let split = part.parent_partition();
                 let parent = &rdds[part.parent_rdd_index];
                 let part_id = split.get_index();
-                let mut acc_arg_un = AccArg::new(part_id,DepInfo::padding_new(00));
+                let mut acc_arg_un = AccArg::new(part_id,DepInfo::padding_new(00), None);
                 let handle_uns = parent.secure_compute(split, &mut acc_arg_un, tx_un.clone())?; 
                 
                 let acc_arg = acc_arg.clone();
@@ -128,7 +128,8 @@ where
                                     &mut result_bl_ptr,
                                     tid,
                                     &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
-                                    &acc_arg.op_ids as *const Vec<OpId> as *const u8,  
+                                    &acc_arg.op_ids as *const Vec<OpId> as *const u8, 
+                                    &acc_arg.split_nums as *const Vec<usize> as *const u8,
                                     cache_meta,
                                     acc_arg.dep_info, 
                                     input, 
@@ -167,7 +168,7 @@ where
                 let mut handle_uns = Vec::new(); 
                 for (rdd, p) in iter {
                     let part_id = p.get_index();
-                    let mut acc_arg_un = AccArg::new(part_id, DepInfo::padding_new(00));
+                    let mut acc_arg_un = AccArg::new(part_id, DepInfo::padding_new(00), None);
                     handle_uns.append(&mut rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un.clone())?);
                 }
 
@@ -203,6 +204,7 @@ where
                                     tid,
                                     &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
                                     &acc_arg.op_ids as *const Vec<OpId> as *const u8, 
+                                    &acc_arg.split_nums as *const Vec<usize> as *const u8,
                                     cache_meta,
                                     acc_arg.dep_info, 
                                     input, 
@@ -596,8 +598,10 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
+        let cur_split_num = self.number_of_splits();
         acc_arg.insert_rdd_id(cur_rdd_id);
         acc_arg.insert_op_id(cur_op_id);
+        acc_arg.insert_split_num(cur_split_num);
         
         let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();

@@ -145,6 +145,7 @@ where
             let cur_op_id = self.vals.op_id;
             let rdd_ids = vec![cur_rdd_id];
             let op_ids = vec![cur_op_id];
+            let split_nums = vec![self.part.get_num_of_partitions()];
             let mut deps = split.clone().deps;
             let mut num_sub_part = vec![0, 0]; //kv, kw
             let mut upper_bound = Vec::new();
@@ -152,7 +153,7 @@ where
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(01));
+                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(01), None);
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
@@ -186,7 +187,7 @@ where
             match deps.remove(0) {    //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(01));
+                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(01), None);
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
@@ -244,6 +245,7 @@ where
                         let (mut result_bl_ptr, swait) = wrapper_secure_execute(
                             &rdd_ids,
                             &op_ids,
+                            &split_nums,
                             cache_meta, //the cache_meta should not be used, this execution does not go to compute(), where cache-related operation is
                             DepInfo::padding_new(20), //shuffle read and no encryption for result
                             &data,
@@ -275,6 +277,7 @@ where
                                 tid,
                                 &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
                                 &acc_arg.op_ids as *const Vec<OpId> as *const u8,
+                                &acc_arg.split_nums as *const Vec<usize> as *const u8,
                                 cache_meta,
                                 acc_arg.dep_info,  
                                 input,
@@ -590,8 +593,10 @@ where
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
+        let cur_split_num = self.number_of_splits();
         acc_arg.insert_rdd_id(cur_rdd_id);
         acc_arg.insert_op_id(cur_op_id);
+        acc_arg.insert_split_num(cur_split_num);
 
         let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();

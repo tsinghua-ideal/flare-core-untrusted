@@ -71,10 +71,6 @@ impl<T: Data> ParallelCollectionSplit<T> {
     fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
-        let cur_rdd_id = self.rdd_id;
-        let cur_op_id = self.op_id;
-        acc_arg.insert_rdd_id(cur_rdd_id);
-        acc_arg.insert_op_id(cur_op_id);
         if len == 0 {
             return std::thread::spawn(|| {});
         }
@@ -114,6 +110,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     let (result_bl_ptr, swait) = wrapper_secure_execute(
                         &acc_arg.rdd_ids,
                         &acc_arg.op_ids,
+                        &acc_arg.split_nums,
                         cache_meta,
                         acc_arg.dep_info,
                         &data,
@@ -454,6 +451,12 @@ where
 
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
+            let cur_rdd_id = self.get_rdd_id();
+            let cur_op_id = self.get_op_id();
+            let cur_split_num = self.number_of_splits();
+            acc_arg.insert_rdd_id(cur_rdd_id);
+            acc_arg.insert_op_id(cur_op_id);
+            acc_arg.insert_split_num(cur_split_num);
             Ok(vec![s.secure_iterator(acc_arg, tx)])
         } else {
             Err(Error::DowncastFailure("ParallelCollectionSplit<TE>"))

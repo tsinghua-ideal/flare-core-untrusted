@@ -102,6 +102,7 @@ extern "C" {
         tid: u64,
         rdd_ids: *const u8,
         op_ids: *const u8,
+        part_nums: *const u8,
         cache_meta: CacheMeta,
         dep_info: DepInfo,
         input: Input,
@@ -230,6 +231,7 @@ pub fn default_hash<T: Hash>(t: &T) -> u64 {
 pub fn wrapper_secure_execute<T>(
     rdd_ids: &Vec<usize>, 
     op_ids: &Vec<OpId>,
+    split_nums: &Vec<usize>,
     cache_meta: CacheMeta,
     dep_info: DepInfo, 
     data: &T,
@@ -259,6 +261,7 @@ where
             tid,
             rdd_ids as *const Vec<usize> as *const u8,
             op_ids as *const Vec<OpId> as *const u8,
+            split_nums as *const Vec<usize> as *const u8,
             cache_meta,
             dep_info,
             input,
@@ -743,6 +746,7 @@ pub fn secure_compute_cached(
         // Compute based on cached values
         let rdd_ids = acc_arg.rdd_ids.clone();
         let op_ids = acc_arg.op_ids.clone();
+        let split_nums = acc_arg.split_nums.clone();
         let mut cache_meta = acc_arg.to_cache_meta();
         let dep_info = acc_arg.dep_info;
 
@@ -773,6 +777,7 @@ pub fn secure_compute_cached(
                         tid,
                         &rdd_ids as *const Vec<usize> as *const u8,
                         &op_ids as *const Vec<OpId> as *const u8, 
+                        &split_nums as *const Vec<usize> as *const u8,
                         cache_meta,
                         dep_info,   
                         Input::padding(), //invalid pointer
@@ -805,6 +810,7 @@ pub fn secure_compute_cached(
 pub struct AccArg {
     pub rdd_ids: Vec<usize>,
     pub op_ids: Vec<OpId>,
+    pub split_nums: Vec<usize>, 
     part_id: usize,
     pub dep_info: DepInfo,
     caching_rdd_id: usize,
@@ -814,10 +820,18 @@ pub struct AccArg {
 }
 
 impl AccArg {
-    pub fn new(part_id: usize, dep_info: DepInfo) -> Self {
+    pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>) -> Self {
+        let split_nums = match reduce_num {
+            Some(reduce_num) => {
+                assert!(dep_info.is_shuffle == 10 || dep_info.is_shuffle == 11);
+                vec![reduce_num]
+            },
+            None => Vec::new(),
+        };
         AccArg {
             rdd_ids: Vec::new(),
             op_ids: Vec::new(),
+            split_nums,
             part_id,
             dep_info,
             caching_rdd_id: 0,
@@ -895,6 +909,10 @@ impl AccArg {
 
     pub fn insert_op_id(&mut self, op_id: OpId) {
         self.op_ids.push(op_id);
+    }
+
+    pub fn insert_split_num(&mut self, split_num: usize) {
+        self.split_nums.push(split_num);
     }
 
     pub fn is_caching_final_rdd(&self) -> bool {
@@ -1378,7 +1396,7 @@ pub trait RddE: Rdd {
         let op_id = self.get_op_id();
         let part_id = split.get_index();
         let dep_info = DepInfo::padding_new(01);
-        let mut acc_arg = AccArg::new(part_id, dep_info);
+        let mut acc_arg = AccArg::new(part_id, dep_info, None);
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
@@ -1561,6 +1579,7 @@ pub trait RddE: Rdd {
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
+        let split_nums = vec![self.number_of_splits()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
         let mut result_ptr: usize = 0;
@@ -1571,6 +1590,7 @@ pub trait RddE: Rdd {
                 tid,
                 &rdd_ids as *const Vec<usize> as *const u8,
                 &op_ids as *const Vec<OpId> as *const u8,
+                &split_nums as *const Vec<usize> as *const u8,
                 Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
                 input,
@@ -1659,6 +1679,7 @@ pub trait RddE: Rdd {
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
+        let split_nums = vec![self.number_of_splits()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
         let mut result_ptr: usize = 0;
@@ -1669,6 +1690,7 @@ pub trait RddE: Rdd {
                 tid,
                 &rdd_ids as *const Vec<usize> as *const u8,
                 &op_ids as *const Vec<OpId> as *const u8,
+                &split_nums as *const Vec<usize> as *const u8,
                 Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
                 input,
@@ -1752,6 +1774,7 @@ pub trait RddE: Rdd {
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
+        let split_nums = vec![self.number_of_splits()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
         let mut result_ptr: usize = 0;
@@ -1762,6 +1785,7 @@ pub trait RddE: Rdd {
                 tid,
                 &rdd_ids as *const Vec<usize> as *const u8,
                 &op_ids as *const Vec<OpId> as *const u8,
+                &split_nums as *const Vec<usize> as *const u8,
                 Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
                 input,
@@ -1963,6 +1987,7 @@ pub trait RddE: Rdd {
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let rdd_ids = vec![self.get_rdd_id()];
         let op_ids = vec![self.get_op_id()];
+        let split_nums = vec![self.number_of_splits()];
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
         let mut result_ptr: usize = 0;
@@ -1973,6 +1998,7 @@ pub trait RddE: Rdd {
                 tid,
                 &rdd_ids as *const Vec<usize> as *const u8,
                 &op_ids as *const Vec<OpId> as *const u8,
+                &split_nums as *const Vec<usize> as *const u8,
                 Default::default(),  //meaningless
                 DepInfo::padding_new(31),   //3 is for reduce & fold
                 input,

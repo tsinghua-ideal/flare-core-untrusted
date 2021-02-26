@@ -370,8 +370,10 @@ where
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.id;
         let cur_op_id = self.op_id;
+        let cur_split_num = self.splits.len();
         acc_arg.insert_rdd_id(cur_rdd_id);
         acc_arg.insert_op_id(cur_op_id);
+        acc_arg.insert_split_num(cur_split_num);
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             get_stage_lock();
@@ -402,6 +404,7 @@ where
                     let (result_bl_ptr, swait) = wrapper_secure_execute(
                         &acc_arg.rdd_ids,
                         &acc_arg.op_ids,
+                        &acc_arg.split_nums,
                         cache_meta, 
                         acc_arg.dep_info, 
                         &data,

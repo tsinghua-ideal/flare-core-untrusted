@@ -131,6 +131,7 @@ where
         let cur_op_id = self.vals.op_id;
         let rdd_ids = vec![cur_rdd_id];
         let op_ids = vec![cur_op_id];
+        let split_nums = vec![self.part.get_num_of_partitions()];
 
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
@@ -155,6 +156,7 @@ where
                     let (mut result_bl_ptr, swait) = wrapper_secure_execute(
                         &rdd_ids,
                         &op_ids,
+                        &split_nums,
                         cache_meta,
                         DepInfo::padding_new(20),   //shuffle read
                         &bucket,
@@ -186,6 +188,7 @@ where
                             tid,
                             &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
                             &acc_arg.op_ids as *const Vec<OpId> as *const u8,
+                            &acc_arg.split_nums as *const Vec<usize> as *const u8,
                             cache_meta,
                             acc_arg.dep_info,  
                             input,
@@ -367,8 +370,10 @@ where
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
+        let cur_split_num = self.number_of_splits();
         acc_arg.insert_rdd_id(cur_rdd_id);
         acc_arg.insert_op_id(cur_op_id);
+        acc_arg.insert_split_num(cur_split_num);
 
         let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();
