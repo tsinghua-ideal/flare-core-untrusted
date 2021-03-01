@@ -2149,23 +2149,24 @@ pub trait RddE: Rdd {
             pt
         });
 
-        let mapped = self.map(Box::new(Fn!(|x| (Some(x), None)))
-            as Box<
-                dyn Func(Self::Item) -> (Option<Self::Item>, Option<Self::Item>),
-            >, fe_wrapper_mp0, fd_wrapper_mp0);
+        let mapped = self.map(
+            Fn!(|x| (Some(x), None)), 
+            fe_wrapper_mp0, 
+            fd_wrapper_mp0
+        );
         self.get_context().add_num(1);
-        let reduced_by_key = mapped.reduce_by_key(Box::new(Fn!(|(_x, y)| y)),
+        let reduced_by_key = mapped.reduce_by_key(Fn!(|(_x, y)| y),
             num_partitions,
             fe_wrapper_rd,
             fd_wrapper_rd);
         self.get_context().add_num(1);
-        reduced_by_key.map(Box::new(Fn!(|x: (
+        reduced_by_key.map(Fn!(|x: (
             Option<Self::Item>,
             Option<Self::Item>
         )| {
             let (x, _y) = x;
             x.unwrap()
-        })), fe_wrapper_mp1, fd_wrapper_mp1)
+        }), fe_wrapper_mp1, fd_wrapper_mp1)
     }
 
     /// Return a new RDD containing the distinct elements in this RDD.
