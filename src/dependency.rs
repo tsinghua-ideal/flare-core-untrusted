@@ -275,10 +275,10 @@ where
                 hash_ops,
                 partition,
             );
-            let res = env::SPEC_SHUFFLE_CACHE.get(&key)
-                .map(|entry| entry.clone());
+            //remove after get, otherwise it will causes the accumulation
+            let res = env::SPEC_SHUFFLE_CACHE.remove(&key);
             match res {
-                Some(item) => {
+                Some((_key, item)) => {
                     let mut ser_result = HashMap::new();
                     let mut acc_header = HashMap::new();
                     for (_sub_part_id, buckets) in item.into_iter().enumerate() {
