@@ -168,6 +168,14 @@ extern "C" {
         with_replacement: u8,
         fraction: f64,
     ) -> sgx_status_t;
+    pub fn etake(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        op_id: OpId,
+        input: *const u8,
+        should_take: usize,
+        have_take: *mut usize,
+    ) -> sgx_status_t;
     pub fn tail_compute(
         eid: sgx_enclave_id_t,
         retval: *mut usize,
@@ -349,6 +357,41 @@ pub fn wrapper_spec_execute(
     env::SPEC_SHUFFLE_CACHE.insert(key, vec![*res]);
 }
 
+pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, split_num: usize) -> usize {
+    let now = Instant::now();
+    let tid: u64 = thread::current().id().as_u64().into();
+    let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+    let rdd_ids = vec![rdd_id];
+    let op_ids = vec![op_id];
+    let split_nums = vec![split_num];
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
+    let mut result_ptr: usize = 0;
+    let sgx_status = unsafe {
+        secure_execute(
+            eid,
+            &mut result_ptr,
+            tid,
+            &rdd_ids as *const Vec<usize> as *const u8,
+            &op_ids as *const Vec<OpId> as *const u8,
+            &split_nums as *const Vec<usize> as *const u8,
+            Default::default(),  //meaningless
+            DepInfo::padding_new(31),   //3 is for reduce & fold & aggregate
+            input,
+            &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
+        )
+    };
+    match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {},
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("in aggregate, ecall {:?}s", dur);
+    result_ptr
+}
+
 //This method should only be used if the resulting array is expected to be small,
 pub fn wrapper_randomize_in_place<T>(
     op_id: OpId,
@@ -412,6 +455,30 @@ pub fn wrapper_set_sampler(op_id: OpId, with_replacement: bool, fraction: f64) {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
+}
+
+pub fn wrapper_take<T: Data>(op_id: OpId, input: &Vec<T>, should_take: usize) -> (Vec<T>, usize) {
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let mut retval: usize = 0;
+    let mut have_take: usize = 0;
+    let sgx_status = unsafe {
+        etake(
+            eid,
+            &mut retval,
+            op_id,
+            input as *const Vec<T> as *const u8,
+            should_take,
+            &mut have_take
+        )
+    };
+    let _r = match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {},
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(01), retval as *mut u8, false);
+    (*res, have_take)
 }
 
 pub fn wrapper_tail_compute(tail_info: &mut TailCompInfo) {
@@ -1573,38 +1640,7 @@ pub trait RddE: Rdd {
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<Self::ItemE>>();
-       
-        let now = Instant::now();
-        let tid: u64 = thread::current().id().as_u64().into();
-        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let rdd_ids = vec![self.get_rdd_id()];
-        let op_ids = vec![self.get_op_id()];
-        let split_nums = vec![self.number_of_splits()];
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
-        let mut result_ptr: usize = 0;
-        let sgx_status = unsafe {
-            secure_execute(
-                eid,
-                &mut result_ptr,
-                tid,
-                &rdd_ids as *const Vec<usize> as *const u8,
-                &op_ids as *const Vec<OpId> as *const u8,
-                &split_nums as *const Vec<usize> as *const u8,
-                Default::default(),  //meaningless
-                DepInfo::padding_new(31),   //3 is for reduce & fold
-                input,
-                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-            )
-        };
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            },
-        };
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in reduce, ecall {:?}s", dur);
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
         let temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
             DepInfo::padding_new(31), 
@@ -1674,37 +1710,7 @@ pub trait RddE: Rdd {
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<Self::ItemE>>();
        
-        let now = Instant::now();
-        let tid: u64 = thread::current().id().as_u64().into();
-        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let rdd_ids = vec![self.get_rdd_id()];
-        let op_ids = vec![self.get_op_id()];
-        let split_nums = vec![self.number_of_splits()];
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
-        let mut result_ptr: usize = 0;
-        let sgx_status = unsafe {
-            secure_execute(
-                eid,
-                &mut result_ptr,
-                tid,
-                &rdd_ids as *const Vec<usize> as *const u8,
-                &op_ids as *const Vec<OpId> as *const u8,
-                &split_nums as *const Vec<usize> as *const u8,
-                Default::default(),  //meaningless
-                DepInfo::padding_new(31),   //3 is for reduce & fold
-                input,
-                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-            )
-        };
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            },
-        };
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in fold, ecall {:?}s", dur);
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
         let mut temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
             DepInfo::padding_new(31), 
@@ -1769,37 +1775,7 @@ pub trait RddE: Rdd {
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<_>>();
        
-        let now = Instant::now();
-        let tid: u64 = thread::current().id().as_u64().into();
-        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let rdd_ids = vec![self.get_rdd_id()];
-        let op_ids = vec![self.get_op_id()];
-        let split_nums = vec![self.number_of_splits()];
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
-        let mut result_ptr: usize = 0;
-        let sgx_status = unsafe {
-            secure_execute(
-                eid,
-                &mut result_ptr,
-                tid,
-                &rdd_ids as *const Vec<usize> as *const u8,
-                &op_ids as *const Vec<OpId> as *const u8,
-                &split_nums as *const Vec<usize> as *const u8,
-                Default::default(),  //meaningless
-                DepInfo::padding_new(31),   //3 is for reduce & fold
-                input,
-                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-            )
-        };
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            },
-        };
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in aggregate, ecall {:?}s", dur);
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
         let mut temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
             DepInfo::padding_new(31), 
@@ -1981,38 +1957,7 @@ pub trait RddE: Rdd {
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<_>>();
-       
-        let now = Instant::now();
-        let tid: u64 = thread::current().id().as_u64().into();
-        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let rdd_ids = vec![self.get_rdd_id()];
-        let op_ids = vec![self.get_op_id()];
-        let split_nums = vec![self.number_of_splits()];
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
-        let mut result_ptr: usize = 0;
-        let sgx_status = unsafe {
-            secure_execute(
-                eid,
-                &mut result_ptr,
-                tid,
-                &rdd_ids as *const Vec<usize> as *const u8,
-                &op_ids as *const Vec<OpId> as *const u8,
-                &split_nums as *const Vec<usize> as *const u8,
-                Default::default(),  //meaningless
-                DepInfo::padding_new(31),   //3 is for reduce & fold
-                input,
-                &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-            )
-        };
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            },
-        };
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("in aggregate, ecall {:?}s", dur);
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
         /*
         let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 31, result_ptr as *mut u8);
         //temp only contains one element
@@ -2268,6 +2213,71 @@ pub trait RddE: Rdd {
         }
 
         Ok(buf)
+    }
+
+    #[track_caller]
+    fn secure_take(&self, num: usize) -> Result<CT<Vec<Self::Item>, Vec<Self::ItemE>>>
+    where
+        Self: Sized,
+    {
+        const SCALE_UP_FACTOR: f64 = 2.0;
+        let fe = self.get_fe();
+        let fd = self.get_fd();
+        let bfe = Box::new(move |data | {
+            batch_encrypt::<>(data, fe.clone())
+        });
+    
+        let bfd = Box::new(move |data_enc | {
+            batch_decrypt::<>(data_enc, fd.clone())
+        });
+        if num == 0 {
+            return Ok(Text::new(vec![], Some(bfe), Some(bfd)));
+        }
+        
+        let mut buf = vec![];
+        let mut count = 0;
+        let total_parts = self.number_of_splits() as u32;
+        let mut parts_scanned = 0_u32;
+        while count < num && parts_scanned < total_parts {
+            let mut num_parts_to_try = 1u32;
+            let left = num - count;
+            if parts_scanned > 0 {
+                let parts_scanned = f64::from(parts_scanned);
+                num_parts_to_try = if count == 0 {
+                    (parts_scanned * SCALE_UP_FACTOR).ceil() as u32
+                } else {
+                    let num_parts_to_try =
+                        (1.5 * left as f64 * parts_scanned / (count as f64)).ceil();
+                    num_parts_to_try.min(parts_scanned * SCALE_UP_FACTOR) as u32
+                };
+            }
+
+            let partitions: Vec<_> = (parts_scanned as usize
+                ..total_parts.min(parts_scanned + num_parts_to_try) as usize)
+                .collect();
+            let num_partitions = partitions.len() as u32;
+            let take_from_partition = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+                iter.collect::<Vec<Self::ItemE>>()
+            });
+
+            let res = self.get_context().run_job_with_partitions(
+                self.get_rdde(),
+                take_from_partition,
+                partitions,
+            )?;
+            res.into_iter().for_each(|r| {
+                let should_take = num - count;
+                if should_take != 0 {
+                    let (mut temp, have_take) = wrapper_take(self.get_op_id(), &r, should_take);
+                    count += have_take;
+                    buf.append(&mut temp);
+                }
+            });
+
+            parts_scanned += num_partitions;
+        }
+
+        Ok(Text::new(buf, Some(bfe), Some(bfd)))
     }
 
     /// Randomly splits this RDD with the provided weights.
