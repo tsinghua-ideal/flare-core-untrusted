@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::dependency::{Dependency, ShuffleDependencyTrait};
 use crate::env;
 use crate::error::{Error, Result};
-use crate::rdd::RddBase;
+use crate::rdd::{RddBase, STAGE_LOCK};
 use crate::scheduler::{
     CompletionEvent, FetchFailedVals, JobListener, JobTracker, ResultTask, Stage, TaskBase,
     TaskContext, TaskOption,
@@ -30,19 +30,19 @@ pub(crate) trait NativeScheduler: Send + Sync {
         L: JobListener,
     {
         if jt.final_stage.parents.is_empty() && (jt.num_output_parts == 1) {
+            STAGE_LOCK.insert_stage(jt.final_rdd.get_rdd_id(), 0);
             let split = (jt.final_rdd.splits()[jt.output_parts[0]]).clone();
             let task_context = TaskContext::new(jt.final_stage.id, jt.output_parts[0], 0);
             let now = Instant::now();
             let func = jt.func.clone();
-            let stage_id = jt.final_stage.id;
             let final_rdd = jt.final_rdd.clone();
-            tokio::task::spawn_blocking(move || {
+            let res = tokio::task::spawn_blocking(move || {
                 let res = Ok(Some(vec![(&func)((
                     task_context,
                     match final_rdd.get_secure() {
                         true => (
                             Box::new(Vec::new().into_iter()),                 
-                            match final_rdd.secure_iterator(split, stage_id) {
+                            match final_rdd.secure_iterator(split) {
                                 Ok(r) => r,
                                 Err(_) => Box::new(Vec::new().into_iter()),
                             }
@@ -61,7 +61,9 @@ pub(crate) trait NativeScheduler: Send + Sync {
                 println!("result_task(allow local) {:?}s", dur);
                 
                 res
-            }).await?
+            }).await?;
+            STAGE_LOCK.remove_stage(jt.final_rdd.get_rdd_id(), 0);
+            res
         } else {
             Ok(None)
         }

@@ -119,11 +119,7 @@ where
     fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
         let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
-        //STAGE_LOCK.free_stage_lock();
-        //println!("free stage lock in shuffled rdd for stage {:?}", acc_arg.stage_id);
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().filter(|sub_part| sub_part.len() > 0).collect();  // bucket per subpartition
-        //STAGE_LOCK.get_stage_lock(acc_arg.stage_id);
-        //println!("get stage lock in shuffled rdd for stage {:?}", acc_arg.stage_id);
         let num_sub_part = bucket.len();
         let upper_bound = bucket.iter().map(|sub_part| sub_part.len()).collect::<Vec<_>>();
         if num_sub_part == 0 {

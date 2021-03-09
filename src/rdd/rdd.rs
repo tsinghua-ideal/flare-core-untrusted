@@ -863,7 +863,6 @@ pub fn secure_compute_cached(
 
 #[derive(Clone, Debug)]
 pub struct AccArg {
-    pub stage_id: usize,
     pub rdd_ids: Vec<usize>,
     pub op_ids: Vec<OpId>,
     pub split_nums: Vec<usize>, 
@@ -876,7 +875,7 @@ pub struct AccArg {
 }
 
 impl AccArg {
-    pub fn new(stage_id: usize, part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>) -> Self {
+    pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>) -> Self {
         let split_nums = match reduce_num {
             Some(reduce_num) => {
                 assert!(dep_info.is_shuffle == 10 || dep_info.is_shuffle == 11);
@@ -885,7 +884,6 @@ impl AccArg {
             None => Vec::new(),
         };
         AccArg {
-            stage_id,
             rdd_ids: Vec::new(),
             op_ids: Vec::new(),
             split_nums,
@@ -1085,33 +1083,32 @@ impl StageLock {
         }
     }
     
-    pub fn insert_stage(&self, stage_id: usize, task_id: usize) {
+    pub fn insert_stage(&self, rdd_id: usize, task_id: usize) {
         let mut waiting_list = self.waiting_list.write().unwrap();
-        waiting_list.entry(stage_id).or_insert(vec![]).push(task_id);
-        println!("waiting list = {:?}", *waiting_list);
+        waiting_list.entry(rdd_id).or_insert(vec![]).push(task_id);
     }
 
-    pub fn remove_stage(&self, stage_id: usize, task_id: usize) {
+    pub fn remove_stage(&self, rdd_id: usize, task_id: usize) {
         let mut waiting_list = self.waiting_list.write().unwrap();
         let mut remaining = 0;
-        if let Some(task_ids) = waiting_list.get_mut(&stage_id) {
+        if let Some(task_ids) = waiting_list.get_mut(&rdd_id) {
             if let Some(pos) = task_ids.iter().position(|x| *x == task_id) {
                 task_ids.remove(pos);
             }
             remaining = task_ids.len();
         }
         if remaining == 0 {
-            waiting_list.remove(&stage_id);
+            waiting_list.remove(&rdd_id);
         }
     }
 
-    pub fn get_stage_lock(&self, cur_stage_id: usize) {
+    pub fn get_stage_lock(&self, cur_rdd_id: usize) {
         let mut flag = true;
         while flag {
             while self.slock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                 //wait
             }
-            if *self.waiting_list.read().unwrap().last_key_value().unwrap().0 > cur_stage_id {
+            if *self.waiting_list.read().unwrap().first_key_value().unwrap().0 < cur_rdd_id {
                 self.slock.store(false, atomic::Ordering::SeqCst);
             } else {
                 flag = false;
@@ -1501,15 +1498,14 @@ pub trait RddE: Rdd {
         batch_decrypt(data_enc, self.get_fd())
     }
 
-    fn secure_iterator(&self, split: Box<dyn Split>, stage_id: usize) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
+    fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let (tx, rx) = sync_channel(0);
         let rdd_id = self.get_rdd_id();
         let op_id = self.get_op_id();
         let part_id = split.get_index();
         let dep_info = DepInfo::padding_new(01);
-        let mut acc_arg = AccArg::new(stage_id, part_id, dep_info, None);
-        STAGE_LOCK.get_stage_lock(stage_id);
-        println!("get stage lock in secure_iterator");
+        let mut acc_arg = AccArg::new(part_id, dep_info, None);
+        STAGE_LOCK.get_stage_lock(rdd_id);
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
@@ -1535,7 +1531,6 @@ pub trait RddE: Rdd {
             handle.join().unwrap();
         }
         STAGE_LOCK.free_stage_lock();
-        println!("free stage lock in secure_iterator");
         Ok(Box::new(result.into_iter()))
     }
 

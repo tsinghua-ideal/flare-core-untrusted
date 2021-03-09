@@ -156,7 +156,7 @@ where
 {
     fn run(&self, id: usize) -> SerBox<dyn AnyData> {
         log::debug!("resulttask runs");
-        STAGE_LOCK.insert_stage(self.stage_id, self.task_id);
+        STAGE_LOCK.insert_stage(self.rdd.get_rdd_id(), self.task_id);
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
 
@@ -167,7 +167,7 @@ where
             match self.rdd.get_secure() {
                 true => (
                     Box::new(Vec::new().into_iter()),                 
-                    match self.rdd.secure_iterator(split, self.stage_id) {
+                    match self.rdd.secure_iterator(split) {
                         Ok(r) => r,
                         Err(_) => Box::new(Vec::new().into_iter()),
                     }
@@ -184,7 +184,7 @@ where
 
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("result_task {:?}s", dur);
-        STAGE_LOCK.remove_stage(self.stage_id, self.task_id);
+        STAGE_LOCK.remove_stage(self.rdd.get_rdd_id(), self.task_id);
         res
     }
 }

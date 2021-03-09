@@ -83,7 +83,6 @@ where
 
     fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let stage_id = acc_arg.stage_id;
         match &self.0 {
             NonUniquePartitioner { rdds, .. } => {
                 let (tx_un, rx_un) = sync_channel(0);
@@ -94,7 +93,7 @@ where
                 let split = part.parent_partition();
                 let parent = &rdds[part.parent_rdd_index];
                 let part_id = split.get_index();
-                let mut acc_arg_un = AccArg::new(stage_id, part_id,DepInfo::padding_new(00), None);
+                let mut acc_arg_un = AccArg::new(part_id,DepInfo::padding_new(00), None);
                 let handle_uns = parent.secure_compute(split, &mut acc_arg_un, tx_un.clone())?; 
                 
                 let acc_arg = acc_arg.clone();
@@ -169,7 +168,7 @@ where
                 let mut handle_uns = Vec::new(); 
                 for (rdd, p) in iter {
                     let part_id = p.get_index();
-                    let mut acc_arg_un = AccArg::new(stage_id, part_id, DepInfo::padding_new(00), None);
+                    let mut acc_arg_un = AccArg::new(part_id, DepInfo::padding_new(00), None);
                     handle_uns.append(&mut rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un.clone())?);
                 }
 

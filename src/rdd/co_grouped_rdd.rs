@@ -140,7 +140,6 @@ where
 
     fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
-            let stage_id = acc_arg.stage_id;
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let cur_rdd_id = self.vals.id;
             let cur_op_id = self.vals.op_id;
@@ -154,7 +153,7 @@ where
             match deps.remove(0) {   //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(stage_id, split.get_index(), DepInfo::padding_new(01), None);
+                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(01), None);
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
@@ -172,11 +171,7 @@ where
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     //TODO need revision if fe & fd of group_by is passed 
                     let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
-                    //STAGE_LOCK.free_stage_lock();
-                    //println!("free stage lock in cogroup rdd for stage {:?}", stage_id);
                     let kv_1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
-                    //STAGE_LOCK.get_stage_lock(stage_id);
-                    //println!("get stage lock in cogroup rdd for stage {:?}", acc_arg.stage_id);
                     for sub_part in kv_1 {
                         let sub_part_len = sub_part.len();
                         if sub_part_len > 0 {
@@ -192,7 +187,7 @@ where
             match deps.remove(0) {    //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg_cg = AccArg::new(stage_id, split.get_index(), DepInfo::padding_new(01), None);
+                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(01), None);
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     for received in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
@@ -210,11 +205,7 @@ where
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     //TODO need revision if fe & fd of group_by is passed 
                     let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
-                    //STAGE_LOCK.free_stage_lock();
-                    //println!("free stage lock in cogroup rdd for stage {:?}", stage_id);
                     let kw_1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
-                    //STAGE_LOCK.get_stage_lock(stage_id);
-                    //println!("get stage lock in cogroup rdd for stage {:?}", stage_id);
                     for sub_part in kw_1 {
                         let sub_part_len = sub_part.len();
                         if sub_part_len > 0 {

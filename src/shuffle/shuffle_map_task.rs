@@ -81,10 +81,11 @@ impl TaskBase for ShuffleMapTask {
 
 impl Task for ShuffleMapTask {
     fn run(&self, _id: usize) -> SerBox<dyn AnyData> {
-        STAGE_LOCK.insert_stage(self.stage_id, self.task_id);
-        let res = SerBox::new(self.dep.do_shuffle_task(self.dep.get_rdd_base(), self.partition, self.stage_id))
+        let dep_info = self.dep.get_dep_info();
+        STAGE_LOCK.insert_stage(dep_info.child_rdd_id, self.task_id);
+        let res = SerBox::new(self.dep.do_shuffle_task(self.dep.get_rdd_base(), self.partition))
             as SerBox<dyn AnyData>;
-        STAGE_LOCK.remove_stage(self.stage_id, self.task_id);
+        STAGE_LOCK.remove_stage(dep_info.child_rdd_id, self.task_id);
         res
     }
 }
