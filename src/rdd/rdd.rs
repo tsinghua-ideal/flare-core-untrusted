@@ -3,7 +3,7 @@ use std::any::{Any, TypeId};
 use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{BTreeMap, hash_map::DefaultHasher, HashMap, HashSet};
 use std::convert::TryInto;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::slice;
-use std::sync::{Arc, Weak,
+use std::sync::{Arc, RwLock, Weak,
     atomic::{self, AtomicBool, AtomicUsize},
     mpsc::{sync_channel, SyncSender, Receiver} 
     };
@@ -38,7 +38,7 @@ use crate::{utils, Fn, SerArc, SerBox};
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
 use fasthash::MetroHasher;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use rand::{Rng, SeedableRng};
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
@@ -78,21 +78,11 @@ pub type OText<T> = Text<T, T, Box<dyn Fn(T) -> T>, Box<dyn Fn(T) -> T> >;
 static immediate_cout: bool = true;
 pub static INPUT_: AtomicUsize = AtomicUsize::new(20);  //default 1M
 pub static EENTER_LOCK: AtomicBool = AtomicBool::new(false);
-pub static STAGE_LOCK: AtomicBool = AtomicBool::new(false);
+pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
 pub const MAX_ENC_BL: usize = 1000;
 
 pub fn get_block_size() -> usize {
     1 << INPUT_.load(atomic::Ordering::SeqCst)
-}
-
-pub fn get_stage_lock() {
-    while STAGE_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-        //wait
-    }
-}
-
-pub fn free_stage_lock() {
-    assert_eq!(STAGE_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
 }
 
 extern "C" {
@@ -818,7 +808,6 @@ pub fn secure_compute_cached(
         let dep_info = acc_arg.dep_info;
 
         let handle = std::thread::spawn(move || {
-            get_stage_lock();
             let tid: u64 = thread::current().id().as_u64().into();
             for (seq_id, sub_part) in cached_sub_parts.into_iter().enumerate() {
                 let mut is_survivor = cached_sub_parts_len == subpids.len() &&  cached_sub_parts_len-1 == seq_id;
@@ -863,7 +852,6 @@ pub fn secure_compute_cached(
                 );
                 tx.send(result_ptr).unwrap();
             }
-            free_stage_lock();
         });
         handles.push(handle);
     } else {
@@ -875,6 +863,7 @@ pub fn secure_compute_cached(
 
 #[derive(Clone, Debug)]
 pub struct AccArg {
+    pub stage_id: usize,
     pub rdd_ids: Vec<usize>,
     pub op_ids: Vec<OpId>,
     pub split_nums: Vec<usize>, 
@@ -887,7 +876,7 @@ pub struct AccArg {
 }
 
 impl AccArg {
-    pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>) -> Self {
+    pub fn new(stage_id: usize, part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>) -> Self {
         let split_nums = match reduce_num {
             Some(reduce_num) => {
                 assert!(dep_info.is_shuffle == 10 || dep_info.is_shuffle == 11);
@@ -896,6 +885,7 @@ impl AccArg {
             None => Vec::new(),
         };
         AccArg {
+            stage_id,
             rdd_ids: Vec::new(),
             op_ids: Vec::new(),
             split_nums,
@@ -1079,6 +1069,60 @@ impl Input {
             block_size: 0,
         }
     }
+}
+
+#[derive(Debug)]
+pub struct StageLock {
+    slock: AtomicBool,
+    waiting_list: RwLock<BTreeMap<usize, Vec<usize>>>,
+}
+
+impl StageLock {
+    pub fn new() -> Self {
+        StageLock {
+            slock: AtomicBool::new(false),
+            waiting_list: RwLock::new(BTreeMap::new()),
+        }
+    }
+    
+    pub fn insert_stage(&self, stage_id: usize, task_id: usize) {
+        let mut waiting_list = self.waiting_list.write().unwrap();
+        waiting_list.entry(stage_id).or_insert(vec![]).push(task_id);
+        println!("waiting list = {:?}", *waiting_list);
+    }
+
+    pub fn remove_stage(&self, stage_id: usize, task_id: usize) {
+        let mut waiting_list = self.waiting_list.write().unwrap();
+        let mut remaining = 0;
+        if let Some(task_ids) = waiting_list.get_mut(&stage_id) {
+            if let Some(pos) = task_ids.iter().position(|x| *x == task_id) {
+                task_ids.remove(pos);
+            }
+            remaining = task_ids.len();
+        }
+        if remaining == 0 {
+            waiting_list.remove(&stage_id);
+        }
+    }
+
+    pub fn get_stage_lock(&self, cur_stage_id: usize) {
+        let mut flag = true;
+        while flag {
+            while self.slock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+                //wait
+            }
+            if *self.waiting_list.read().unwrap().last_key_value().unwrap().0 > cur_stage_id {
+                self.slock.store(false, atomic::Ordering::SeqCst);
+            } else {
+                flag = false;
+            }
+        }
+    }
+    
+    pub fn free_stage_lock(&self) {
+        self.slock.compare_and_swap(true, false, atomic::Ordering::SeqCst);
+    }
+    
 }
 
 #[derive(Debug, Default)]
@@ -1457,13 +1501,15 @@ pub trait RddE: Rdd {
         batch_decrypt(data_enc, self.get_fd())
     }
 
-    fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
+    fn secure_iterator(&self, split: Box<dyn Split>, stage_id: usize) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let (tx, rx) = sync_channel(0);
         let rdd_id = self.get_rdd_id();
         let op_id = self.get_op_id();
         let part_id = split.get_index();
         let dep_info = DepInfo::padding_new(01);
-        let mut acc_arg = AccArg::new(part_id, dep_info, None);
+        let mut acc_arg = AccArg::new(stage_id, part_id, dep_info, None);
+        STAGE_LOCK.get_stage_lock(stage_id);
+        println!("get stage lock in secure_iterator");
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
@@ -1488,6 +1534,8 @@ pub trait RddE: Rdd {
         for handle in handles {
             handle.join().unwrap();
         }
+        STAGE_LOCK.free_stage_lock();
+        println!("free stage lock in secure_iterator");
         Ok(Box::new(result.into_iter()))
     }
 

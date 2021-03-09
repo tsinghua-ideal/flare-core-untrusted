@@ -1,7 +1,7 @@
 use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
-use crate::rdd::{default_hash, get_encrypted_data, AccArg, OpId, RddBase, EENTER_LOCK};
+use crate::rdd::{default_hash, get_encrypted_data, AccArg, OpId, RddBase, EENTER_LOCK, STAGE_LOCK};
 use crate::serializable_traits::Data;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
@@ -141,7 +141,7 @@ pub trait ShuffleDependencyTrait: Serialize + Deserialize + Send + Sync {
     fn get_shuffle_id(&self) -> usize;
     fn get_rdd_base(&self) -> Arc<dyn RddBase>;
     fn is_shuffle(&self) -> bool;
-    fn do_shuffle_task(&self, rdd_base: Arc<dyn RddBase>, partition: usize) -> String;
+    fn do_shuffle_task(&self, rdd_base: Arc<dyn RddBase>, partition: usize, stage_id: usize) -> String;
 }
 
 impl PartialOrd for dyn ShuffleDependencyTrait {
@@ -260,7 +260,7 @@ where
         self.rdd_base.clone()
     }
 
-    fn do_shuffle_task(&self, rdd_base: Arc<dyn RddBase>, partition: usize) -> String {
+    fn do_shuffle_task(&self, rdd_base: Arc<dyn RddBase>, partition: usize, stage_id: usize) -> String {
         log::debug!(
             "executing shuffle task #{} for partition #{}",
             self.shuffle_id,
@@ -304,7 +304,9 @@ where
                     log::debug!("split index: {}", split.get_index());
                     let (tx, rx) = mpsc::sync_channel(0);
                     let dep_info = self.get_dep_info();
-                    let mut acc_arg = AccArg::new(partition, dep_info, Some(self.partitioner.get_num_of_partitions()));
+                    let mut acc_arg = AccArg::new(stage_id, partition, dep_info, Some(self.partitioner.get_num_of_partitions()));
+                    STAGE_LOCK.get_stage_lock(stage_id);
+                    println!("get stage lock in dependency for stage {:?}", stage_id);
                     let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
                     let num_output_splits = self.partitioner.get_num_of_partitions();
                     let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
@@ -317,16 +319,17 @@ where
                         for (i, bucket) in buckets_bl.into_iter().enumerate() {
                             buckets[i].push(bucket); 
                         }
+                    }                   
+                    for handle in handles {
+                        handle.join().unwrap();
                     }
-                    
+                    STAGE_LOCK.free_stage_lock();
+                    println!("free stage lock in dependency for stage {:?}", stage_id);
                     for (i, bucket) in buckets.into_iter().enumerate() {
                         let ser_bytes = bincode::serialize(&bucket).unwrap();
                         env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
                     }
-                    
-                    for handle in handles {
-                        handle.join().unwrap();
-                    }
+
                     env::Env::get().shuffle_manager.get_server_uri()  
                 },
             }

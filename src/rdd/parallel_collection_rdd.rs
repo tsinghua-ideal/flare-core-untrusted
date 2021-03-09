@@ -81,7 +81,6 @@ impl<T: Data> ParallelCollectionSplit<T> {
         //sub-partition
         let mut acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
-            get_stage_lock();
             let now = Instant::now();
             let mut wait = 0.0; 
             let mut sub_part_id = 0;
@@ -129,7 +128,6 @@ impl<T: Data> ParallelCollectionSplit<T> {
                 sub_part_id += 1;
                 cur = next;  
             }
-            free_stage_lock();
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in parallel collection rdd, total {:?}***", dur);
         });

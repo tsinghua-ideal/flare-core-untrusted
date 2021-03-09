@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::dependency::ShuffleDependencyTrait;
 use crate::env;
-use crate::rdd::RddBase;
+use crate::rdd::{RddBase, STAGE_LOCK};
 use crate::scheduler::{Task, TaskBase};
 use crate::serializable_traits::AnyData;
 use crate::shuffle::*;
@@ -81,7 +81,10 @@ impl TaskBase for ShuffleMapTask {
 
 impl Task for ShuffleMapTask {
     fn run(&self, _id: usize) -> SerBox<dyn AnyData> {
-        SerBox::new(self.dep.do_shuffle_task(self.dep.get_rdd_base(), self.partition))
-            as SerBox<dyn AnyData>
+        STAGE_LOCK.insert_stage(self.stage_id, self.task_id);
+        let res = SerBox::new(self.dep.do_shuffle_task(self.dep.get_rdd_base(), self.partition, self.stage_id))
+            as SerBox<dyn AnyData>;
+        STAGE_LOCK.remove_stage(self.stage_id, self.task_id);
+        res
     }
 }
