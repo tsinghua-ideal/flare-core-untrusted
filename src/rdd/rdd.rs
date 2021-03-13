@@ -3,7 +3,7 @@ use std::any::{Any, TypeId};
 use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher, HashMap};
 use std::convert::TryInto;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -12,7 +12,6 @@ use std::mem::forget;
 use std::net::Ipv4Addr;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::slice;
 use std::sync::{Arc, RwLock, Weak,
     atomic::{self, AtomicBool, AtomicUsize},
     mpsc::{sync_channel, SyncSender, Receiver} 
@@ -722,7 +721,7 @@ where
 }
 
 //Return the cached or caching sub-partition number
-pub fn cached_or_caching_in_enclave(rdd_id: usize, part: usize) -> HashSet<usize> {
+pub fn cached_or_caching_in_enclave(rdd_id: usize, part: usize) -> BTreeSet<usize> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut ret_val = 0;
     let sgx_status = unsafe {
@@ -756,7 +755,7 @@ pub fn cached_or_caching_in_enclave(rdd_id: usize, part: usize) -> HashSet<usize
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    cached_sub_parts.into_iter().collect::<HashSet<_>>()
+    cached_sub_parts.into_iter().collect()
 }
 
 pub fn secure_compute_cached(
@@ -774,7 +773,7 @@ pub fn secure_compute_cached(
         .get_uncached_subpids(cur_rdd_id, part_id)
         .difference(&cached_sub_parts_in)
         .map(|x| *x)
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let mut cached_sub_parts_out = Env::get().cache_tracker
         .get_cached_subpids(cur_rdd_id, part_id)
         .difference(&cached_sub_parts_in)
@@ -786,7 +785,7 @@ pub fn secure_compute_cached(
     /*
     cached_sub_parts = cached_sub_parts.union(&Env::get().cache_tracker.get_cached_subpids(cur_rdd_id, part_id))
         .map(|x| *x)
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     */
     
     //println!("get_subpids {:?}, {:?}", cur_rdd_id, part_id);
@@ -794,7 +793,7 @@ pub fn secure_compute_cached(
     //println!("subpids = {:?}, cached = {:?}, uncached = {:?}", subpids, cached_sub_parts, uncached_sub_parts);
     assert_eq!(uncached_sub_parts.len() + cached_sub_parts.len(), subpids.len());
 
-    acc_arg.cached_sub_parts = cached_sub_parts.clone().into_iter().collect::<HashSet<_>>();
+    acc_arg.cached_sub_parts = cached_sub_parts.clone().into_iter().collect::<BTreeSet<_>>();
     acc_arg.sub_parts_len = subpids.len();
     let mut handles = Vec::new();
     let cached_sub_parts_len = cached_sub_parts.len(); 
@@ -870,7 +869,7 @@ pub struct AccArg {
     pub dep_info: DepInfo,
     caching_rdd_id: usize,
     cached_rdd_id: usize,
-    pub cached_sub_parts: HashSet<usize>,
+    pub cached_sub_parts: BTreeSet<usize>,
     pub sub_parts_len: usize,
 }
 
@@ -891,7 +890,7 @@ impl AccArg {
             dep_info,
             caching_rdd_id: 0,
             cached_rdd_id: 0,
-            cached_sub_parts: HashSet::new(),
+            cached_sub_parts: BTreeSet::new(),
             sub_parts_len: 0,
         }
     }

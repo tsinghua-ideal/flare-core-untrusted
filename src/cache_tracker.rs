@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::collections::LinkedList;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -331,11 +331,11 @@ impl CacheTracker {
         self.cache.sget(rdd_id, part_id, sub_part_id)
     }
 
-    pub fn get_subpids(&self, rdd_id: usize, part_id: usize) -> HashSet<usize> {
+    pub fn get_subpids(&self, rdd_id: usize, part_id: usize) -> BTreeSet<usize> {
         self.cache.get_subpid(rdd_id, part_id).into_iter().collect()
     }
 
-    pub fn get_cached_subpids(&self, rdd_id: usize, part_id: usize) -> HashSet<usize> {
+    pub fn get_cached_subpids(&self, rdd_id: usize, part_id: usize) -> BTreeSet<usize> {
         let cached_sub_parts = self.cache.get_subpid(rdd_id, part_id);
         cached_sub_parts.into_iter().filter(|id| {
             while self.sloading.contains(&(rdd_id, part_id, *id)) {
@@ -347,7 +347,7 @@ impl CacheTracker {
         }).collect()
     }
 
-    pub fn get_uncached_subpids(&self, rdd_id: usize, part_id: usize) -> HashSet<usize> {
+    pub fn get_uncached_subpids(&self, rdd_id: usize, part_id: usize) -> BTreeSet<usize> {
         let uncached_sub_parts = self.cache.get_subpid(rdd_id, part_id);
         uncached_sub_parts.into_iter().filter(|id| {
             while self.sloading.contains(&(rdd_id, part_id, *id)) {
