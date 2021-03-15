@@ -455,7 +455,25 @@ where
             acc_arg.insert_rdd_id(cur_rdd_id);
             acc_arg.insert_op_id(cur_op_id);
             acc_arg.insert_split_num(cur_split_num);
-            Ok(vec![s.secure_iterator(acc_arg, tx)])
+
+            let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
+            let should_cache = self.should_cache();
+            if should_cache {
+                let mut handles = secure_compute_cached(
+                    acc_arg, 
+                    cur_rdd_id, 
+                    tx.clone(),
+                    captured_vars,
+                );
+    
+                if !acc_arg.totally_cached() {
+                    acc_arg.set_caching_rdd_id(cur_rdd_id);
+                    handles.append(&mut vec![s.secure_iterator(acc_arg, tx)]);
+                }
+                Ok(handles)     
+            } else {
+                Ok(vec![s.secure_iterator(acc_arg, tx)])
+            }
         } else {
             Err(Error::DowncastFailure("ParallelCollectionSplit<TE>"))
         }
