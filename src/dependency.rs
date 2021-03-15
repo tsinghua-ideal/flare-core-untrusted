@@ -239,7 +239,7 @@ where
 {
     fn get_dep_info(&self) -> DepInfo {
         DepInfo::new(
-            11,  //10 and 11 have the same effect, always need_encryption
+            1,
             self.identifier,
             self.parent_rdd_id,
             self.child_rdd_id,

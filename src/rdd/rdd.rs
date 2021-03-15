@@ -333,7 +333,7 @@ pub fn wrapper_spec_execute(
         },
     };
     //The first two args are not used in this case actually
-    let res = get_encrypted_data::<Vec<u8>>(Default::default(), DepInfo::padding_new(11), retval as *mut u8, true);
+    let res = get_encrypted_data::<Vec<u8>>(Default::default(), DepInfo::padding_new(1), retval as *mut u8, true);
     let key = (
         hash_ops,
         cache_meta.part_id,
@@ -365,7 +365,7 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, split_n
             &op_ids as *const Vec<OpId> as *const u8,
             &split_nums as *const Vec<usize> as *const u8,
             Default::default(),  //meaningless
-            DepInfo::padding_new(31),   //3 is for reduce & fold & aggregate
+            DepInfo::padding_new(3),   //3 is for reduce & fold & aggregate
             input,
             &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
         )
@@ -420,7 +420,7 @@ where
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(01), retval as *mut u8, false);
+    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(2), retval as *mut u8, false);
     *res
 }
 
@@ -466,7 +466,7 @@ pub fn wrapper_take<T: Data>(op_id: OpId, input: &Vec<T>, should_take: usize) ->
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(01), retval as *mut u8, false);
+    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(2), retval as *mut u8, false);
     (*res, have_take)
 }
 
@@ -613,7 +613,7 @@ pub fn move_data<T: Clone>(op_id: OpId, data: *mut u8) -> Box<Vec<T>> {
         priv_free_res_enc(
             eid,
             op_id,
-            DepInfo::padding_new(01), //default to 0, for cache should not appear at the end of stage
+            DepInfo::padding_new(2), //default to 2, for cache should not appear at the end of stage
             data
         )
     };
@@ -877,7 +877,7 @@ impl AccArg {
     pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>) -> Self {
         let split_nums = match reduce_num {
             Some(reduce_num) => {
-                assert!(dep_info.is_shuffle == 10 || dep_info.is_shuffle == 11);
+                assert!(dep_info.is_shuffle == 1);
                 vec![reduce_num]
             },
             None => Vec::new(),
@@ -1502,7 +1502,7 @@ pub trait RddE: Rdd {
         let rdd_id = self.get_rdd_id();
         let op_id = self.get_op_id();
         let part_id = split.get_index();
-        let dep_info = DepInfo::padding_new(01);
+        let dep_info = DepInfo::padding_new(2);
         let mut acc_arg = AccArg::new(part_id, dep_info, None);
         STAGE_LOCK.get_stage_lock(rdd_id);
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
@@ -1685,7 +1685,7 @@ pub trait RddE: Rdd {
         let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
         let temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
-            DepInfo::padding_new(31), 
+            DepInfo::padding_new(3), 
             result_ptr as *mut u8,
             false,
         );
@@ -1755,7 +1755,7 @@ pub trait RddE: Rdd {
         let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
         let mut temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
-            DepInfo::padding_new(31), 
+            DepInfo::padding_new(3), 
             result_ptr as *mut u8,
             false,
         );
@@ -1820,7 +1820,7 @@ pub trait RddE: Rdd {
         let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
         let mut temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
-            DepInfo::padding_new(31), 
+            DepInfo::padding_new(3), 
             result_ptr as *mut u8,
             false,
         );
@@ -2001,7 +2001,7 @@ pub trait RddE: Rdd {
             .into_iter().flatten().collect::<Vec<_>>();
         let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
         /*
-        let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 31, result_ptr as *mut u8);
+        let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 3, result_ptr as *mut u8);
         //temp only contains one element
         Ok(temp.pop().unwrap())
         */

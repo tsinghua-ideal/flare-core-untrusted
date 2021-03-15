@@ -127,11 +127,6 @@ where
         }
         
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-        let cur_rdd_id = self.vals.id;
-        let cur_op_id = self.vals.op_id;
-        let rdd_ids = vec![cur_rdd_id];
-        let op_ids = vec![cur_op_id];
-        let split_nums = vec![self.part.get_num_of_partitions()];
 
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
@@ -145,26 +140,6 @@ where
             while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
                 let mut is_survivor = false;   //temp
                 if !acc_arg.cached(&sub_part_id) {                        //don't support partial cache now, for the lower and upper is not remembered
-                    cache_meta.set_sub_part_id(sub_part_id);
-                    BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                    //TODO: get lower of the last cached data
-                    upper = upper.iter()
-                        .zip(upper_bound.iter())
-                        .map(|(l, ub)| std::cmp::min(*l, *ub))
-                        .collect::<Vec<_>>();
-                    let (mut result_bl_ptr, swait) = wrapper_secure_execute(
-                        &rdd_ids,
-                        &op_ids,
-                        &split_nums,
-                        cache_meta,
-                        DepInfo::padding_new(20),   //shuffle read
-                        &bucket,
-                        &mut lower,
-                        &mut upper,
-                        get_block_size(),
-                        &captured_vars,
-                    );
-                    wait += swait;
                     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
                         &acc_arg.op_ids,
                         cache_meta, 
@@ -173,33 +148,27 @@ where
                     if spec_call_seq_ptr != 0 {
                         is_survivor = true;
                     }
+                    cache_meta.set_sub_part_id(sub_part_id);
                     cache_meta.set_is_survivor(is_survivor);
-                    // this block is in enclave, cannot access
-                    let block_ptr = result_bl_ptr as *const u8;
-                    let input = Input::build_from_ptr(block_ptr, &mut vec![0], &mut vec![usize::MAX], get_block_size());
-                    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-                    result_bl_ptr = 0;
-                    let tid: u64 = thread::current().id().as_u64().into();
-                    let sgx_status = unsafe {
-                        secure_execute(
-                            eid,
-                            &mut result_bl_ptr,
-                            tid,
-                            &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
-                            &acc_arg.op_ids as *const Vec<OpId> as *const u8,
-                            &acc_arg.split_nums as *const Vec<usize> as *const u8,
-                            cache_meta,
-                            acc_arg.dep_info,  
-                            input,
-                            &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-                        )
-                    };
-                    match sgx_status {
-                        sgx_status_t::SGX_SUCCESS => {},
-                        _ => {
-                            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                        },
-                    };
+                    BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
+                    //TODO: get lower of the last cached data
+                    upper = upper.iter()
+                        .zip(upper_bound.iter())
+                        .map(|(l, ub)| std::cmp::min(*l, *ub))
+                        .collect::<Vec<_>>();
+                    let (result_bl_ptr, swait) = wrapper_secure_execute(
+                        &acc_arg.rdd_ids,
+                        &acc_arg.op_ids,
+                        &acc_arg.split_nums,
+                        cache_meta,
+                        acc_arg.dep_info,
+                        &bucket,
+                        &mut lower,
+                        &mut upper,
+                        get_block_size(),
+                        &captured_vars,
+                    );
+                    wait += swait;
                     wrapper_spec_execute(
                         spec_call_seq_ptr, 
                         cache_meta, 
