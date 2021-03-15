@@ -1339,11 +1339,11 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn iterator_any(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>>;
+    ) -> Result<Box<dyn AnyData>>;
     fn cogroup_iterator_any(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+    ) -> Result<Box<dyn AnyData>> {
         self.iterator_any(split)
     }
     fn is_pinned(&self) -> bool {
@@ -1411,7 +1411,7 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn iterator_any(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+    ) -> Result<Box<dyn AnyData>> {
         (**self).get_rdd_base().iterator_any(split)
     }
 }

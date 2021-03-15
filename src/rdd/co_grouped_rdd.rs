@@ -479,11 +479,14 @@ where
     fn iterator_any(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
-        let res = self.iterator(split)?;
+    ) -> Result<Box<dyn AnyData>> {
+        let res = self.iterator(split)?.collect::<Vec<_>>();
+        /* 
         Ok(Box::new(res.map(|(k, v)| {
             Box::new((k, Box::new(v) as Box<dyn AnyData>)) as Box<dyn AnyData>
         })))
+        */
+        Ok(Box::new(res) as Box<dyn AnyData>)
     }
 }
 
@@ -519,16 +522,12 @@ where
             match deps.remove(0) {  //deps[0]
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     log::debug!("inside iterator CoGroupedRdd narrow dep");
-                    for i in rdd.iterator_any(split)? {
+                    for i in rdd.iterator_any(split)?.into_any().downcast::<Vec<(K, V)>>().unwrap().into_iter() {
                         log::debug!(
                             "inside iterator CoGroupedRdd narrow dep iterator any: {:?}",
                             i
                         );
-                        let b = i
-                            .into_any()
-                            .downcast::<(K, V)>()
-                            .unwrap();
-                        let (k, v) = *b;
+                        let (k, v) = i;
                         agg.entry(k)
                             .or_insert_with(|| (Vec::new(), Vec::new())).0
                             .push(v)
@@ -552,16 +551,12 @@ where
             match deps.remove(0) {  //deps[1]
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     log::debug!("inside iterator CoGroupedRdd narrow dep");
-                    for i in rdd.iterator_any(split)? {
+                    for i in rdd.iterator_any(split)?.into_any().downcast::<Vec<(K, W)>>().unwrap().into_iter() {
                         log::debug!(
                             "inside iterator CoGroupedRdd narrow dep iterator any: {:?}",
                             i
                         );
-                        let b = i
-                            .into_any()
-                            .downcast::<(K, W)>()
-                            .unwrap();
-                        let (k, v) = *b;
+                        let (k, v) = i;
                         agg.entry(k)
                             .or_insert_with(|| (Vec::new(), Vec::new())).1
                             .push(v)

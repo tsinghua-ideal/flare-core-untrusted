@@ -483,10 +483,9 @@ macro_rules! impl_common_lfs_rddb_funcs {
         default fn iterator_any(
             &self,
             split: Box<dyn Split>,
-        ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+        ) -> Result<Box<dyn AnyData>> {
             Ok(Box::new(
-                self.iterator(split)?
-                    .map(|x| Box::new(x) as Box<dyn AnyData>),
+                self.iterator(split)?.collect::<Vec<_>>()
             ))
         }
     };

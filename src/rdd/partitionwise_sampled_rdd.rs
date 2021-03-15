@@ -163,18 +163,17 @@ where
     default fn cogroup_iterator_any(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+    ) -> Result<Box<dyn AnyData>> {
         self.iterator_any(split)
     }
 
     default fn iterator_any(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+    ) -> Result<Box<dyn AnyData>> {
         log::debug!("inside PartitionwiseSampledRdd iterator_any");
         Ok(Box::new(
-            self.iterator(split)?
-                .map(|x| Box::new(x) as Box<dyn AnyData>),
+            self.iterator(split)?.collect::<Vec<_>>()
         ))
     }
 }

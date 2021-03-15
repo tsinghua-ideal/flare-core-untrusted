@@ -313,11 +313,10 @@ where
     fn iterator_any(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+    ) -> Result<Box<dyn AnyData>> {
         log::debug!("inside iterator_any shuffledrdd",);
         Ok(Box::new(
-            self.iterator(split)?
-                .map(|(k, v)| Box::new((k, v)) as Box<dyn AnyData>),
+            self.iterator(split)?.collect::<Vec<_>>()
         ))
     }
 }

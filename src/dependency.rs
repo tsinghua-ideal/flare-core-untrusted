@@ -357,9 +357,8 @@ where
                 partition
             );
 
-            for (count, i) in iter.unwrap().enumerate() {
-                let b = i.into_any().downcast::<(K, V)>().unwrap();
-                let (k, v) = *b;
+            for (count, i) in iter.unwrap().into_any().downcast::<Vec<(K, V)>>().unwrap().into_iter().enumerate() {
+                let (k, v) = i;
                 if count == 0 {
                     log::debug!(
                         "iterating inside dependency map task after downcasting: key: {:?}, value: {:?}",

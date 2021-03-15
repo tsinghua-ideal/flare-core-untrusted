@@ -545,11 +545,10 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
     fn iterator_any(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn Iterator<Item = Box<dyn AnyData>>>> {
+    ) -> Result<Box<dyn AnyData>> {
         log::debug!("inside iterator_any union_rdd",);
         Ok(Box::new(
-            self.iterator(split)?
-                .map(|x| Box::new(x) as Box<dyn AnyData>),
+            self.iterator(split)?.collect::<Vec<_>>()
         ))
     }
 
