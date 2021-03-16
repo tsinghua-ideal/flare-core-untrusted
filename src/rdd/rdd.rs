@@ -288,7 +288,7 @@ where
         } else if k <= avg_k * 1.1 {
             slopes.push(k);
             *block_len += 1;
-        } else if k <= avg_k * 1.2 {
+        } else if k <= avg_k * 1.2 && *block_len > 1 {
             *block_len -= 1;
         } else {
             *block_len = (*block_len + 1) / 2;
