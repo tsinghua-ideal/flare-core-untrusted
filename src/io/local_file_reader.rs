@@ -366,21 +366,22 @@ where
 
     fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
         let len = data.len();
-        let data_size = data.get_aprox_size() / len;
-        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
         let cur_rdd_id = self.id;
         let cur_op_id = self.op_id;
         let cur_split_num = self.splits.len();
         acc_arg.insert_rdd_id(cur_rdd_id);
         acc_arg.insert_op_id(cur_op_id);
         acc_arg.insert_split_num(cur_split_num);
+        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
-            let mut wait = 0.0; 
+            let mut wait = 0.0;
+            let mut block_len = 1; 
+            let mut slopes = Vec::new();
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            let block_len = (get_block_size() - 1) / data_size + 1;
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -409,7 +410,8 @@ where
                         &data,
                         &mut vec![cur],
                         &mut vec![next],
-                        get_block_size(), 
+                        &mut block_len, 
+                        &mut slopes,
                         &captured_vars
                     );
                     wait += swait;

@@ -134,7 +134,8 @@ where
             let mut wait = 0.0;
             let mut lower = vec![0; num_sub_part];
             let mut upper = vec![1; num_sub_part];
-            
+            let mut block_len = 1;
+            let mut slopes = Vec::new();
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
             while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
@@ -165,7 +166,8 @@ where
                         &bucket,
                         &mut lower,
                         &mut upper,
-                        get_block_size(),
+                        &mut block_len,
+                        &mut slopes,
                         &captured_vars,
                     );
                     wait += swait;

@@ -75,17 +75,17 @@ impl<T: Data> ParallelCollectionSplit<T> {
             return std::thread::spawn(|| {});
         }
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
-        let data_size = data.get_aprox_size() / len;
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
 
         //sub-partition
-        let mut acc_arg = acc_arg.clone();
+        let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
-            let mut wait = 0.0; 
+            let mut wait = 0.0;
+            let mut block_len = 1;
+            let mut slopes = Vec::new();
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
-            let block_len = (get_block_size() - 1) / data_size + 1;
             let mut cur = 0;
             while cur < len {
                 let next = match cur + block_len > len {
@@ -115,7 +115,8 @@ impl<T: Data> ParallelCollectionSplit<T> {
                         &data,
                         &mut vec![cur],
                         &mut vec![next],
-                        get_block_size(),
+                        &mut block_len,
+                        &mut slopes,
                         &captured_vars,
                     );
                     wait += swait;

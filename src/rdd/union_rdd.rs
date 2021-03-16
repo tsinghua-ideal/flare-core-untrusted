@@ -120,7 +120,9 @@ where
                             cache_meta.set_sub_part_id(sub_part_id);
                             cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                            let input = Input::build_from_ptr(r.unwrap() as *const u8, &mut vec![0], &mut vec![usize::MAX], get_block_size());
+                            let mut init_mem_usage = 0;
+                            let mut max_mem_usage = 0;
+                            let input = Input::build_from_ptr(r.unwrap() as *const u8, &mut vec![0], &mut vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut max_mem_usage);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
                                 secure_execute(
@@ -195,7 +197,9 @@ where
                             cache_meta.set_sub_part_id(sub_part_id);
                             cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                            let input = Input::build_from_ptr(r.unwrap() as *const u8, &mut vec![0], &mut vec![usize::MAX], get_block_size());
+                            let mut init_mem_usage = 0;
+                            let mut max_mem_usage = 0;
+                            let input = Input::build_from_ptr(r.unwrap() as *const u8, &mut vec![0], &mut vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut max_mem_usage);
                             let mut result_bl_ptr: usize = 0; 
                             let _sgx_status = unsafe {
                                 secure_execute(

@@ -234,7 +234,8 @@ pub fn wrapper_secure_execute<T>(
     data: &T,
     lower: &mut Vec<usize>,
     upper: &mut Vec<usize>,
-    block_size: usize,
+    block_len: &mut usize,
+    slopes: &mut Vec<f64>,
     captured_vars: &HashMap<usize, Vec<Vec<u8>>>,
 ) -> (usize, f64) 
 where
@@ -243,14 +244,16 @@ where
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut result_bl_ptr: usize = 0;
     let tid: u64 = thread::current().id().as_u64().into();
-    let input = Input::new(data, lower, upper, block_size);
+    let mut init_mem_usage = 0;
+    let mut max_mem_usage = 0;
+    let input = Input::new(data, lower, upper, *block_len, &mut init_mem_usage, &mut max_mem_usage);
 
-    let now = Instant::now();
+    let now_lock = Instant::now();
     while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
         //wait
     }
-    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-
+    let dur_lock = now_lock.elapsed().as_nanos() as f64 * 1e-9;
+    let now_comp = Instant::now();
     let sgx_status = unsafe {
         secure_execute(
             eid,
@@ -271,7 +274,28 @@ where
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    (result_bl_ptr, dur)
+    let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
+    let k = dur_comp/((max_mem_usage as f64)/((1<<30) as f64));   // s/GB
+    if slopes.is_empty() {
+        slopes.push(k);
+        *block_len += 1;
+    } else {
+        let avg_k = slopes.iter().sum::<f64>()/(slopes.len() as f64);
+        if k <= avg_k * 0.8 {
+            slopes.clear();
+            slopes.push(k);
+            *block_len += 1;
+        } else if k <= avg_k * 1.1 {
+            slopes.push(k);
+            *block_len += 1;
+        } else if k <= avg_k * 1.2 {
+            *block_len -= 1;
+        } else {
+            *block_len = (*block_len + 1) / 2;
+        }
+    }
+
+    (result_bl_ptr, dur_lock)
 }
 
 
@@ -354,7 +378,9 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, split_n
     let op_ids = vec![op_id];
     let split_nums = vec![split_num];
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], get_block_size());
+    let mut init_mem_usage = 0;
+    let mut max_mem_usage = 0;
+    let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], usize::MAX, &mut init_mem_usage, &mut max_mem_usage);
     let mut result_ptr: usize = 0;
     let sgx_status = unsafe {
         secure_execute(
@@ -821,6 +847,8 @@ pub fn secure_compute_cached(
                 cache_meta.set_sub_part_id(sub_part);
                 cache_meta.set_is_survivor(is_survivor);
                 BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
+                let mut init_mem_usage = 0;
+                let mut max_mem_usage = 0;
                 let mut result_ptr: usize = 0;
                 while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                     //wait
@@ -835,7 +863,7 @@ pub fn secure_compute_cached(
                         &split_nums as *const Vec<usize> as *const u8,
                         cache_meta,
                         dep_info,   
-                        Input::padding(), //invalid pointer
+                        Input::padding(&mut init_mem_usage, &mut max_mem_usage), //invalid pointer
                         &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                     )
                 };
@@ -1031,39 +1059,65 @@ pub struct Input {
     data: usize,
     lower: usize,
     upper: usize,
-    block_size: usize,
+    block_len: usize,
+    init_mem_usage: usize,
+    max_mem_usage: usize,
 }
 
 impl Input {
-    pub fn new<T: Data>(data: &T, lower: &mut Vec<usize>, upper: &mut Vec<usize>, block_size: usize) -> Self {
+    pub fn new<T: Data>(data: &T, 
+        lower: &mut Vec<usize>, 
+        upper: &mut Vec<usize>, 
+        block_len: usize, 
+        init_mem_usage: &mut usize, 
+        max_mem_usage: &mut usize,
+    ) -> Self {
         let data = data as *const T as usize;
         let lower = lower as *mut Vec<usize> as usize;
         let upper = upper as *mut Vec<usize> as usize;
+        let init_mem_usage = init_mem_usage as *mut usize as usize;
+        let max_mem_usage = max_mem_usage as *mut usize as usize;
         Input {
             data,
             lower,
             upper,
-            block_size,
+            block_len,
+            init_mem_usage,
+            max_mem_usage,
         }
     }
 
-    pub fn build_from_ptr(data: *const u8, lower: &mut Vec<usize>, upper: &mut Vec<usize>, block_size: usize) -> Self {
+    pub fn build_from_ptr(data: *const u8, 
+        lower: &mut Vec<usize>, 
+        upper: &mut Vec<usize>, 
+        block_len: usize, 
+        init_mem_usage: &mut usize, 
+        max_mem_usage: &mut usize,
+    ) -> Self {
         let lower = lower as *mut Vec<usize> as usize;
         let upper = upper as *mut Vec<usize> as usize;
+        let init_mem_usage = init_mem_usage as *mut usize as usize;
+        let max_mem_usage = max_mem_usage as *mut usize as usize;
         Input {
             data: data as usize,
             lower,
             upper,
-            block_size,
+            block_len,
+            init_mem_usage,
+            max_mem_usage,
         }
     }
 
-    pub fn padding() -> Self {
+    pub fn padding(init_mem_usage: &mut usize, max_mem_usage: &mut usize) -> Self {
+        let init_mem_usage = init_mem_usage as *mut usize as usize;
+        let max_mem_usage = max_mem_usage as *mut usize as usize;
         Input {
             data: 0,
             lower: 0,
             upper: 0,
-            block_size: 0,
+            block_len: 0,
+            init_mem_usage,
+            max_mem_usage,
         }
     }
 }

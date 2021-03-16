@@ -222,7 +222,8 @@ where
                 let mut wait = 0.0; 
                 let mut lower = vec![0; num_sub_part[0] + num_sub_part[1]];
                 let mut upper = vec![1; num_sub_part[0] + num_sub_part[1]];
-                
+                let mut block_len = 1;
+                let mut slopes = Vec::new();
                 let mut sub_part_id = 0;
                 let mut cache_meta = acc_arg.to_cache_meta();
 
@@ -245,7 +246,7 @@ where
                             .zip(upper_bound.iter())
                             .map(|(l, ub)| std::cmp::min(*l, *ub))
                             .collect::<Vec<_>>();
-                        let (mut result_bl_ptr, swait) = wrapper_secure_execute(
+                        let (result_bl_ptr, swait) = wrapper_secure_execute(
                             &acc_arg.rdd_ids,
                             &acc_arg.op_ids,
                             &acc_arg.split_nums,
@@ -254,7 +255,8 @@ where
                             &data,
                             &mut lower,
                             &mut upper,
-                            get_block_size(),
+                            &mut block_len,
+                            &mut slopes,
                             &captured_vars,
                         );
                         wait += swait;
