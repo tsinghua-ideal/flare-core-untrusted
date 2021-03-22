@@ -68,11 +68,8 @@ pub use zip_rdd::*;
 mod union_rdd;
 pub use union_rdd::*;
 
-type CT<T, TE> = Text<T, TE, 
-    Box<dyn Fn(T) -> TE>, 
-    Box<dyn Fn(TE) -> T>
-    >;
-pub type OText<T> = Text<T, T, Box<dyn Fn(T) -> T>, Box<dyn Fn(T) -> T> >; 
+type CT<T, TE> = Text<T, TE>;
+pub type OText<T> = Text<T, T>; 
 
 static immediate_cout: bool = true;
 pub static INPUT_: AtomicUsize = AtomicUsize::new(20);  //default 1M
@@ -1175,29 +1172,25 @@ impl StageLock {
     
 }
 
-#[derive(Debug, Default)]
-pub struct Text<T, TE, FE, FD> 
+#[derive(Default, Clone)]
+pub struct Text<T, TE> 
 where
     T: Data,
     TE: Data,
-    FE: Fn(T) -> TE, 
-    FD: Fn(TE) -> T,
 {
     data_enc: TE,
     id: u64,
-    bfe: Option<FE>,
-    bfd: Option<FD>,
+    bfe: Option<Box<dyn Func(T) -> TE>>,
+    bfd: Option<Box<dyn Func(TE) -> T>>,
 }
 
-impl<T, TE, FE, FD> Text<T, TE, FE, FD> 
+impl<T, TE> Text<T, TE> 
 where
     T: Data,
     TE: Data,
-    FE: Fn(T) -> TE, 
-    FD: Fn(TE) -> T,
 {
     #[track_caller]
-    pub fn new(data_enc: TE, bfe: Option<FE>, bfd: Option<FD>) -> Self {
+    pub fn new(data_enc: TE, bfe: Option<Box<dyn Func(T) -> TE>>, bfd: Option<Box<dyn Func(TE) -> T>>) -> Self {
         let loc = Location::caller(); 
 
         let file = loc.file();
@@ -1238,12 +1231,10 @@ where
 
 }
 
-impl<T, TE, FE, FD> Deref for Text<T, TE, FE, FD> 
+impl<T, TE> Deref for Text<T, TE> 
 where
     T: Data,
     TE: Data,
-    FE: Fn(T) -> TE, 
-    FD: Fn(TE) -> T,
 {
     type Target = TE;
 
@@ -1252,12 +1243,10 @@ where
     }
 }
 
-impl<T, TE, FE, FD> DerefMut for Text<T, TE, FE, FD> 
+impl<T, TE> DerefMut for Text<T, TE> 
 where
     T: Data,
     TE: Data,
-    FE: Fn(T) -> TE, 
-    FD: Fn(TE) -> T,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.data_enc
@@ -1277,12 +1266,10 @@ impl TailCompInfo {
         }
     }
 
-    pub fn insert<T, TE, FE, FD>(&mut self, text: &Text<T, TE, FE, FD>)
+    pub fn insert<T, TE>(&mut self, text: &Text<T, TE>)
     where
         T: Data,
         TE: Data,
-        FE: Fn(T) -> TE, 
-        FD: Fn(TE) -> T,
     {
         let ser = bincode::serialize(&text.data_enc).unwrap();
         self.m.insert(text.id, ser);
@@ -1751,13 +1738,13 @@ pub trait RddE: Rdd {
         };
         Ok(result)
         */
-        let bfe = Box::new(move |data | {
+        let bfe = Box::new(Fn!(move |data | {
             batch_encrypt::<>(data, fe.clone())
-        });
+        }));
     
-        let bfd = Box::new(move |data_enc | {
+        let bfd = Box::new(Fn!(move |data_enc | {
             batch_decrypt::<>(data_enc, fd.clone())
-        });
+        }));
         Ok(Text::new(*temp, Some(bfe), Some(bfd)))
     }
 
@@ -1818,12 +1805,12 @@ pub trait RddE: Rdd {
         //temp only contains one element
         Ok(temp.pop().unwrap())
         */
-        let bfe = Box::new(move |data| {
+        let bfe = Box::new(Fn!(move |data| {
             batch_encrypt(data, fe.clone())
-        });
-        let bfd = Box::new(move |data_enc| {
+        }));
+        let bfd = Box::new(Fn!(move |data_enc| {
             batch_decrypt(data_enc, fd.clone())
-        });
+        }));
         Ok(Text::new(*temp, Some(bfe), Some(bfd)))
     }
 
@@ -1883,12 +1870,12 @@ pub trait RddE: Rdd {
         //temp only contains one element
         Ok(temp.pop().unwrap())
         */
-        let bfe = Box::new(move |data| {
+        let bfe = Box::new(Fn!(move |data| {
             batch_encrypt(data, fe.clone())
-        });
-        let bfd = Box::new(move |data_enc| {
+        }));
+        let bfd = Box::new(Fn!(move |data_enc| {
             batch_decrypt(data_enc, fd.clone())
-        });
+        }));
         Ok(Text::new(*temp, Some(bfe), Some(bfd)))
     }
 
@@ -2028,8 +2015,8 @@ pub trait RddE: Rdd {
 
         let fe = self.get_fe();
         let fd = self.get_fd();
-        let bfe = Box::new(move |data| batch_encrypt(data, fe.clone()));
-        let bfd = Box::new(move |data_enc| batch_decrypt(data_enc, fd.clone()));
+        let bfe = Box::new(Fn!(move |data| batch_encrypt(data, fe.clone())));
+        let bfd = Box::new(Fn!(move |data_enc| batch_decrypt(data_enc, fd.clone())));
         Ok(Text::new(result, Some(bfe), Some(bfd)))
     }
 
@@ -2319,13 +2306,13 @@ pub trait RddE: Rdd {
         const SCALE_UP_FACTOR: f64 = 2.0;
         let fe = self.get_fe();
         let fd = self.get_fd();
-        let bfe = Box::new(move |data | {
+        let bfe = Box::new(Fn!(move |data | {
             batch_encrypt::<>(data, fe.clone())
-        });
+        }));
     
-        let bfd = Box::new(move |data_enc | {
+        let bfd = Box::new(Fn!(move |data_enc | {
             batch_decrypt::<>(data_enc, fd.clone())
-        });
+        }));
         if num == 0 {
             return Ok(Text::new(vec![], Some(bfe), Some(bfd)));
         }
@@ -2567,8 +2554,8 @@ pub trait RddE: Rdd {
 
         let fe = self.get_fe();
         let fd = self.get_fd();
-        let bfe = Box::new(move |data| batch_encrypt(data, fe.clone()));
-        let bfd = Box::new(move |data_enc| batch_decrypt(data_enc, fd.clone()));
+        let bfe = Box::new(Fn!(move |data| batch_encrypt(data, fe.clone())));
+        let bfd = Box::new(Fn!(move |data_enc| batch_decrypt(data_enc, fd.clone())));
 
         if num == 0 {
             return Ok(Text::new(vec![], Some(bfe.clone()), Some(bfd.clone())));
