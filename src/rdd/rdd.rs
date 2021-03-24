@@ -282,10 +282,10 @@ where
             slopes.clear();
             slopes.push(k);
             *block_len += 1;
-        } else if k <= avg_k * 1.1 {
+        } else if k <= avg_k * 1.2 {
             slopes.push(k);
             *block_len += 1;
-        } else if k <= avg_k * 1.2 && *block_len > 1 {
+        } else if k <= avg_k * 1.5 && *block_len > 1 {
             *block_len -= 1;
         } else {
             *block_len = (*block_len + 1) / 2;
