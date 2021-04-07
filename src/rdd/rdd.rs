@@ -75,7 +75,7 @@ static immediate_cout: bool = true;
 pub static INPUT_: AtomicUsize = AtomicUsize::new(20);  //default 1M
 pub static EENTER_LOCK: AtomicBool = AtomicBool::new(false);
 pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
-pub const MAX_ENC_BL: usize = 1000;
+pub const MAX_ENC_BL: usize = 1024;
 
 pub fn get_block_size() -> usize {
     1 << INPUT_.load(atomic::Ordering::SeqCst)
