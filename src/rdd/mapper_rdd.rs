@@ -162,7 +162,7 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -221,7 +221,7 @@ where
         Ok(Box::new(self.prev.iterator(split)?.map(self.f.clone())))
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_split_num = self.number_of_splits();

@@ -5,7 +5,7 @@ use std::io::{BufReader, Read};
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc::SyncSender, Weak};
+use std::sync::{atomic, Arc, mpsc::SyncSender, Weak};
 use std::thread::{JoinHandle, self};
 use std::time::Instant;
 
@@ -364,7 +364,7 @@ where
         }
     }
 
-    fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         let len = data.len();
         let cur_rdd_id = self.id;
         let cur_op_id = self.op_id;
@@ -377,31 +377,38 @@ where
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
+            wrapper_register_mem_usage(0);
             let mut wait = 0.0;
-            let mut block_len = 1; 
-            let mut slopes = Vec::new();
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
+            let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+                &acc_arg.op_ids,
+                cache_meta, 
+                acc_arg.dep_info,
+            );
+            let mut is_survivor = spec_call_seq_ptr != 0;
             let mut cur = 0;
             while cur < len {
+                let wait_now = Instant::now();
+                while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+                    //wait
+                }
+                let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
+                wait += wait_dur;
+                //update block_len
+                let block_len = acc_arg.block_len.load(atomic::Ordering::SeqCst);
+                let cur_usage = acc_arg.cur_usage.load(atomic::Ordering::SeqCst);
+                wrapper_register_mem_usage(cur_usage);
                 let next = match cur + block_len > len {
                     true => len,
                     false => cur + block_len,
                 };
-                let mut is_survivor = next == len; 
+                is_survivor = is_survivor || next == len;
                 if !acc_arg.cached(&sub_part_id) {
-                    let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                        &acc_arg.op_ids,
-                        cache_meta, 
-                        acc_arg.dep_info,
-                    );
-                    if spec_call_seq_ptr != 0 {
-                        is_survivor = true;
-                    }
                     cache_meta.set_sub_part_id(sub_part_id);
                     cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                    let (result_bl_ptr, swait) = wrapper_secure_execute(
+                    let (result_bl_ptr, (time_comp, max_mem_usage)) = wrapper_secure_execute(
                         &acc_arg.rdd_ids,
                         &acc_arg.op_ids,
                         &acc_arg.split_nums,
@@ -410,20 +417,22 @@ where
                         &data,
                         &mut vec![cur],
                         &mut vec![next],
-                        &mut block_len, 
-                        &mut slopes,
+                        block_len,
                         &captured_vars
                     );
-                    wait += swait;
                     wrapper_spec_execute(
                         spec_call_seq_ptr, 
                         cache_meta, 
                     );
-                    tx.send(result_bl_ptr).unwrap();
+                    match acc_arg.dep_info.is_shuffle == 0 {
+                        true => tx.send((result_bl_ptr, (time_comp, wrapper_revoke_mem_usage(true) as f64))).unwrap(),
+                        false => tx.send((result_bl_ptr, (time_comp, max_mem_usage))).unwrap(),
+                    };
                 }
                 sub_part_id += 1;
                 cur = next; 
             }
+            wrapper_revoke_mem_usage(false);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in local file reader, total {:?}***", dur);   
         });
@@ -478,7 +487,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             true
         }
 
-        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
             self.secure_compute(split, acc_arg, tx)
         }
 
@@ -587,7 +596,7 @@ where
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;
@@ -624,7 +633,7 @@ where
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<FileReader>().unwrap();
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;

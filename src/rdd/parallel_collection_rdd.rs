@@ -68,7 +68,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> JoinHandle<()> {
+    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
         if len == 0 {
@@ -81,32 +81,40 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
+            wrapper_register_mem_usage(0);
             let mut wait = 0.0;
-            let mut block_len = 1;
-            let mut slopes = Vec::new();
             let mut sub_part_id = 0;
             let mut cache_meta = acc_arg.to_cache_meta();
+            let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+                &acc_arg.op_ids,
+                cache_meta, 
+                acc_arg.dep_info,
+            );
+            let mut is_survivor = spec_call_seq_ptr != 0;
             let mut cur = 0;
             while cur < len {
+                let wait_now = Instant::now();
+                while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+                    //wait
+                }
+                let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
+                wait += wait_dur;
+
+                //update block_len
+                let block_len = acc_arg.block_len.load(atomic::Ordering::SeqCst);
+                let cur_usage = acc_arg.cur_usage.load(atomic::Ordering::SeqCst);
+                wrapper_register_mem_usage(cur_usage);
                 let next = match cur + block_len > len {
                     true => len,
                     false => cur + block_len,
                 };
-                let mut is_survivor = next == len; 
+                is_survivor = is_survivor || next == len;
                 //currently, all sub_partitions are not cached as long as coming to this rdd
-                if !acc_arg.cached(&sub_part_id) {  
-                    let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                        &acc_arg.op_ids,
-                        cache_meta, 
-                        acc_arg.dep_info,
-                    );
-                    if spec_call_seq_ptr != 0 {
-                        is_survivor = true;
-                    }
+                if !acc_arg.cached(&sub_part_id) {
                     cache_meta.set_sub_part_id(sub_part_id);
                     cache_meta.set_is_survivor(is_survivor);
                     BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                    let (result_bl_ptr, swait) = wrapper_secure_execute(
+                    let (result_bl_ptr, (time_comp, max_mem_usage)) = wrapper_secure_execute(
                         &acc_arg.rdd_ids,
                         &acc_arg.op_ids,
                         &acc_arg.split_nums,
@@ -115,20 +123,22 @@ impl<T: Data> ParallelCollectionSplit<T> {
                         &data,
                         &mut vec![cur],
                         &mut vec![next],
-                        &mut block_len,
-                        &mut slopes,
+                        block_len,
                         &captured_vars,
                     );
-                    wait += swait;
                     wrapper_spec_execute(
                         spec_call_seq_ptr, 
                         cache_meta, 
                     );
-                    tx.send(result_bl_ptr).unwrap();
+                    match acc_arg.dep_info.is_shuffle == 0 {
+                        true => tx.send((result_bl_ptr, (time_comp, wrapper_revoke_mem_usage(true) as f64))).unwrap(),
+                        false => tx.send((result_bl_ptr, (time_comp, max_mem_usage))).unwrap(),
+                    };
                 }
                 sub_part_id += 1;
                 cur = next;  
             }
+            wrapper_revoke_mem_usage(false);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in parallel collection rdd, total {:?}***", dur);
         });
@@ -396,7 +406,7 @@ where
         self.rdd_vals.num_slices
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -447,7 +457,7 @@ where
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
             let cur_rdd_id = self.get_rdd_id();
             let cur_op_id = self.get_op_id();

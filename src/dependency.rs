@@ -1,7 +1,7 @@
 use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
-use crate::rdd::{default_hash, get_encrypted_data, AccArg, OpId, RddBase, EENTER_LOCK, STAGE_LOCK};
+use crate::rdd::{default_hash, dynamic_subpart_meta, get_encrypted_data, AccArg, OpId, RddBase, EENTER_LOCK, STAGE_LOCK};
 use crate::serializable_traits::Data;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
@@ -304,16 +304,20 @@ where
                     log::debug!("split index: {}", split.get_index());
                     let (tx, rx) = mpsc::sync_channel(0);
                     let dep_info = self.get_dep_info();
-                    let mut acc_arg = AccArg::new(partition, dep_info, Some(self.partitioner.get_num_of_partitions()));
+                    let block_len = Arc::new(atomic::AtomicUsize::new(1));
+                    let cur_usage = Arc::new(atomic::AtomicUsize::new(0));
+                    let fresh_slope = Arc::new(atomic::AtomicBool::new(false));
+                    let mut acc_arg = AccArg::new(partition, dep_info, Some(self.partitioner.get_num_of_partitions()), block_len, cur_usage, fresh_slope);
                     STAGE_LOCK.get_stage_lock(dep_info.child_rdd_id);
                     let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
                     let num_output_splits = self.partitioner.get_num_of_partitions();
                     let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
                         .map(|_| Vec::new())
                         .collect::<Vec<_>>();
-        
-                    for block_ptr in rx { 
+                    let mut slopes = Vec::new();
+                    for (block_ptr, (time_comp, max_mem_usage)) in rx { 
                         let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8, false);
+                        dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope);
                         assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
                         for (i, bucket) in buckets_bl.into_iter().enumerate() {
                             buckets[i].push(bucket); 

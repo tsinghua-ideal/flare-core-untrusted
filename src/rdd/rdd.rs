@@ -36,6 +36,7 @@ use crate::{utils, Fn, SerArc, SerBox};
 
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
+use crossbeam::epoch::Atomic;
 use fasthash::MetroHasher;
 use once_cell::sync::Lazy;
 use rand::{Rng, SeedableRng};
@@ -181,6 +182,15 @@ extern "C" {
         eid: sgx_enclave_id_t,
         cached_sub_parts: *mut u8,
     ) -> sgx_status_t;
+    pub fn register_mem_usage(
+        eid: sgx_enclave_id_t,
+        union_usage: usize,
+    ) -> sgx_status_t;
+    pub fn revoke_mem_usage(
+        eid: sgx_enclave_id_t,
+        ret_val: *mut usize,
+        is_union: u8,
+    ) -> sgx_status_t;
 }
 
 #[no_mangle]
@@ -231,10 +241,9 @@ pub fn wrapper_secure_execute<T>(
     data: &T,
     lower: &mut Vec<usize>,
     upper: &mut Vec<usize>,
-    block_len: &mut usize,
-    slopes: &mut Vec<f64>,
+    block_len: usize,
     captured_vars: &HashMap<usize, Vec<Vec<u8>>>,
-) -> (usize, f64) 
+) -> (usize, (f64, f64))  //(result_ptr, (time_for_sub_part_computation, max_memory_usage_per_thread)) 
 where
     T: Construct + Data,
 {
@@ -243,13 +252,7 @@ where
     let tid: u64 = thread::current().id().as_u64().into();
     let mut init_mem_usage = 0;
     let mut max_mem_usage = 0;
-    let input = Input::new(data, lower, upper, *block_len, &mut init_mem_usage, &mut max_mem_usage);
-
-    let now_lock = Instant::now();
-    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-        //wait
-    }
-    let dur_lock = now_lock.elapsed().as_nanos() as f64 * 1e-9;
+    let input = Input::new(data, lower, upper, block_len, &mut init_mem_usage, &mut max_mem_usage);
     let now_comp = Instant::now();
     let sgx_status = unsafe {
         secure_execute(
@@ -265,34 +268,47 @@ where
             captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
         )
     };
-    let _r = match sgx_status {
+    match sgx_status {
         sgx_status_t::SGX_SUCCESS => {},
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
     let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-    let k = dur_comp/((max_mem_usage as f64)/((1<<30) as f64));   // s/GB
+    (result_bl_ptr, (dur_comp, max_mem_usage as f64))
+}
+
+pub fn dynamic_subpart_meta(
+    time_comp: f64,
+    max_mem_usage: f64,
+    block_len_: &Arc<AtomicUsize>,
+    slopes: &mut Vec<f64>,
+    fresh_slope: &Arc<AtomicBool>,
+) {
+    let mut block_len = block_len_.load(atomic::Ordering::SeqCst);
+    if fresh_slope.compare_and_swap(true, false, atomic::Ordering::SeqCst) {
+        slopes.clear();   //for unique-partitioner-union, it may affect other cases but does not matter
+    }
+    let k = time_comp/(max_mem_usage/((1<<30) as f64));   // s/GB
     if slopes.is_empty() {
         slopes.push(k);
-        *block_len += 1;
+        block_len += 1;
     } else {
         let avg_k = slopes.iter().sum::<f64>()/(slopes.len() as f64);
         if k <= avg_k * 0.8 {
             slopes.clear();
             slopes.push(k);
-            *block_len += 1;
+            block_len += 1;
         } else if k <= avg_k * 1.2 {
             slopes.push(k);
-            *block_len += 1;
-        } else if k <= avg_k * 1.5 && *block_len > 1 {
-            *block_len -= 1;
+            block_len += 1;
+        } else if k <= avg_k * 1.5 && block_len > 1 {
+            block_len -= 1;
         } else {
-            *block_len = (*block_len + 1) / 2;
+            block_len = (block_len + 1) / 2;
         }
     }
-
-    (result_bl_ptr, dur_lock)
+    block_len_.store(block_len, atomic::Ordering::SeqCst);
 }
 
 
@@ -528,6 +544,37 @@ pub fn wrapper_tail_compute(tail_info: &mut TailCompInfo) {
     *tail_info = *new_tail_info;
 }
 
+pub fn wrapper_register_mem_usage(union_usage: usize) {
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let sgx_status = unsafe {
+        register_mem_usage(eid, union_usage)
+    };
+    let _r = match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {},
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+}
+
+pub fn wrapper_revoke_mem_usage(is_union: bool) -> usize {
+    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let is_union = match is_union {
+        true => 1,
+        false => 0,
+    };
+    let mut left_usage: usize = 0; 
+    let sgx_status = unsafe {
+        revoke_mem_usage(eid, &mut left_usage, is_union)
+    };
+    let _r = match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {},
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+    left_usage
+}
 
 pub fn get_encrypted_data<T>(op_id: OpId, dep_info: DepInfo, p_data_enc: *mut u8, is_spec: bool) -> Box<Vec<T>> 
 where
@@ -784,7 +831,7 @@ pub fn cached_or_caching_in_enclave(rdd_id: usize, part: usize) -> BTreeSet<usiz
 pub fn secure_compute_cached(
     acc_arg: &mut AccArg,
     cur_rdd_id: usize, 
-    tx: SyncSender<usize>,
+    tx: SyncSender<(usize, (f64, f64))>,
     captured_vars: HashMap<usize, Vec<Vec<u8>>>,
 ) -> Vec<JoinHandle<()>> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
@@ -830,6 +877,7 @@ pub fn secure_compute_cached(
         let dep_info = acc_arg.dep_info;
 
         let handle = std::thread::spawn(move || {
+            wrapper_register_mem_usage(0);
             let tid: u64 = thread::current().id().as_u64().into();
             for (seq_id, sub_part) in cached_sub_parts.into_iter().enumerate() {
                 let mut is_survivor = cached_sub_parts_len == subpids.len() &&  cached_sub_parts_len-1 == seq_id;
@@ -850,6 +898,7 @@ pub fn secure_compute_cached(
                 while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                     //wait
                 }
+                let now_comp = Instant::now();
                 let sgx_status = unsafe {
                     secure_execute(
                         eid,
@@ -870,12 +919,15 @@ pub fn secure_compute_cached(
                         panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                     },
                 };
+                let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
                 wrapper_spec_execute(
                     spec_call_seq_ptr, 
                     cache_meta,
                 );
-                tx.send(result_ptr).unwrap();
+                //no need to adapt for is_union case, because cached data size is fixed
+                tx.send((result_ptr, (dur_comp, max_mem_usage as f64))).unwrap();
             }
+            wrapper_revoke_mem_usage(false);
         });
         handles.push(handle);
     } else {
@@ -896,10 +948,13 @@ pub struct AccArg {
     cached_rdd_id: usize,
     pub cached_sub_parts: BTreeSet<usize>,
     pub sub_parts_len: usize,
+    pub block_len: Arc<AtomicUsize>,
+    pub cur_usage: Arc<AtomicUsize>,  //for transfer the cur memory usage in union thread to prev thread
+    pub fresh_slope: Arc<AtomicBool>,
 }
 
 impl AccArg {
-    pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>) -> Self {
+    pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>, block_len: Arc<AtomicUsize>, cur_usage: Arc<AtomicUsize>, fresh_slope: Arc<AtomicBool>) -> Self {
         let split_nums = match reduce_num {
             Some(reduce_num) => {
                 assert!(dep_info.is_shuffle == 1);
@@ -917,6 +972,9 @@ impl AccArg {
             cached_rdd_id: 0,
             cached_sub_parts: BTreeSet::new(),
             sub_parts_len: 0,
+            block_len,
+            cur_usage,
+            fresh_slope,
         }
     }
 
@@ -1122,13 +1180,26 @@ impl Input {
 #[derive(Debug)]
 pub struct StageLock {
     slock: AtomicBool,
+    lock_holder_info: RwLock<LockHolderInfo>,
     waiting_list: RwLock<BTreeMap<usize, Vec<usize>>>,
+}
+
+#[derive(Debug)]
+pub struct LockHolderInfo {
+    cur_holder: usize,
+    num_cur_holders: usize,
+    max_cur_holders: usize,
 }
 
 impl StageLock {
     pub fn new() -> Self {
         StageLock {
             slock: AtomicBool::new(false),
+            lock_holder_info: RwLock::new(LockHolderInfo {
+                cur_holder: 0,
+                num_cur_holders: 0,
+                max_cur_holders: 32,
+            }),
             waiting_list: RwLock::new(BTreeMap::new()),
         }
     }
@@ -1153,21 +1224,37 @@ impl StageLock {
     }
 
     pub fn get_stage_lock(&self, cur_rdd_id: usize) {
+        use atomic::Ordering::SeqCst;
         let mut flag = true;
         while flag {
-            while self.slock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                //wait
+            while self.slock.compare_and_swap(false, true, SeqCst) {
+                //wait or bypass
+                let mut info = self.lock_holder_info.write().unwrap();
+                if cur_rdd_id == info.cur_holder  //The case for bypass
+                    && info.num_cur_holders < info.max_cur_holders 
+                {
+                    info.num_cur_holders += 1;
+                    return
+                }
             }
             if *self.waiting_list.read().unwrap().first_key_value().unwrap().0 < cur_rdd_id {
-                self.slock.store(false, atomic::Ordering::SeqCst);
+                self.slock.store(false, SeqCst);
             } else {
+                let mut info = self.lock_holder_info.write().unwrap();
+                info.cur_holder = cur_rdd_id;
+                info.num_cur_holders += 1;
                 flag = false;
             }
         }
     }
     
     pub fn free_stage_lock(&self) {
-        self.slock.compare_and_swap(true, false, atomic::Ordering::SeqCst);
+        use atomic::Ordering::SeqCst;
+        self.lock_holder_info.write().unwrap().num_cur_holders -= 1;
+        let num_cur_holder = self.lock_holder_info.read().unwrap().num_cur_holders;
+        if num_cur_holder == 0 {
+            self.slock.compare_and_swap(true, false, SeqCst);
+        }
     }
     
 }
@@ -1375,7 +1462,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>>;
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -1446,7 +1533,7 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         (**self).get_rdd_base().iterator_raw(split, acc_arg, tx)
     }    
     fn iterator_any(
@@ -1471,7 +1558,7 @@ impl<I: RddE + ?Sized> Rdd for SerArc<I> {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
         (**self).secure_compute(split, acc_arg, tx)
     }
 
@@ -1518,7 +1605,7 @@ pub trait Rdd: RddBase + 'static {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> Result<Vec<JoinHandle<()>>>;
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>>;
 }
 
 pub trait RddE: Rdd {
@@ -1544,17 +1631,21 @@ pub trait RddE: Rdd {
         let op_id = self.get_op_id();
         let part_id = split.get_index();
         let dep_info = DepInfo::padding_new(2);
-        let mut acc_arg = AccArg::new(part_id, dep_info, None);
+        let block_len = Arc::new(AtomicUsize::new(1));
+        let cur_usage = Arc::new(AtomicUsize::new(0));
+        let fresh_slope = Arc::new(AtomicBool::new(false));
+        let mut acc_arg = AccArg::new(part_id, dep_info, None, block_len, cur_usage, fresh_slope);
         STAGE_LOCK.get_stage_lock(rdd_id);
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
         let mut result = Vec::new();
         let mut sub_part_id = 0;
-        for received in rx {
+        let mut slopes = Vec::new();
+        for (received, (time_comp, max_mem_usage)) in rx {
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
+            dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope);
             assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
-
             if caching {
                 //collect result
                 result.extend_from_slice(&result_bl);
