@@ -68,7 +68,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> JoinHandle<()> {
+    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
         if len == 0 {
@@ -131,8 +131,8 @@ impl<T: Data> ParallelCollectionSplit<T> {
                         cache_meta, 
                     );
                     match acc_arg.dep_info.is_shuffle == 0 {
-                        true => tx.send((result_bl_ptr, (time_comp, wrapper_revoke_mem_usage(true) as f64))).unwrap(),
-                        false => tx.send((result_bl_ptr, (time_comp, max_mem_usage))).unwrap(),
+                        true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, wrapper_revoke_mem_usage(true) as f64)))).unwrap(),
+                        false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, max_mem_usage)))).unwrap(),
                     };
                 }
                 sub_part_id += 1;
@@ -406,7 +406,7 @@ where
         self.rdd_vals.num_slices
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -457,7 +457,7 @@ where
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
             let cur_rdd_id = self.get_rdd_id();
             let cur_op_id = self.get_op_id();

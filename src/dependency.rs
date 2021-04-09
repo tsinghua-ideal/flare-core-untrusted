@@ -315,7 +315,7 @@ where
                         .map(|_| Vec::new())
                         .collect::<Vec<_>>();
                     let mut slopes = Vec::new();
-                    for (block_ptr, (time_comp, max_mem_usage)) in rx { 
+                    for (_, (block_ptr, (time_comp, max_mem_usage))) in rx { 
                         let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8, false);
                         dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope);
                         assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);

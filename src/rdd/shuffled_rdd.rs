@@ -116,16 +116,35 @@ where
         }
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
         let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().filter(|sub_part| sub_part.len() > 0).collect();  // bucket per subpartition
+        //pre_merge
+        let parent_rdd_id = self.parent.get_rdd_id();
+        let parent_op_id = self.parent.get_op_id();
+        let dep_info = DepInfo::new(
+            1,
+            0,
+            parent_rdd_id,
+            self.vals.id,
+            parent_op_id,
+            self.vals.op_id,
+        );
+        println!("bucket size before pre_merge: {:?}", bucket.get_size());
+        while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+            //wait
+        }
+        let bucket = wrapper_pre_merge(parent_op_id, bucket, dep_info);
+        assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+        println!("bucket size after pre_merge: {:?}", bucket.get_size());
+        //
         let num_sub_part = bucket.len();
         let upper_bound = bucket.iter().map(|sub_part| sub_part.len()).collect::<Vec<_>>();
         if num_sub_part == 0 {
             return Ok(Vec::new());
         }
-        
+
         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
 
         let acc_arg = acc_arg.clone();
@@ -180,8 +199,8 @@ where
                         cache_meta, 
                     );
                     match acc_arg.dep_info.is_shuffle == 0 {
-                        true => tx.send((result_bl_ptr, (time_comp, wrapper_revoke_mem_usage(true) as f64))).unwrap(),
-                        false => tx.send((result_bl_ptr, (time_comp, max_mem_usage))).unwrap(),
+                        true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, wrapper_revoke_mem_usage(true) as f64)))).unwrap(),
+                        false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, max_mem_usage)))).unwrap(),
                     };
                     lower = lower.iter()
                         .zip(upper_bound.iter())
@@ -285,7 +304,7 @@ where
         Some(self.part.clone())
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -343,7 +362,7 @@ where
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_split_num = self.number_of_splits();

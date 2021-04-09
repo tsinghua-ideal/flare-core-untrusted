@@ -95,6 +95,14 @@ extern "C" {
         input: Input,
         captured_vars: *const u8,
     ) -> sgx_status_t;
+    pub fn pre_merge(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        tid: u64,
+        op_id: OpId,
+        dep_info: DepInfo,
+        input: Input,
+    ) -> sgx_status_t;
     pub fn exploit_spec_oppty(
         eid: sgx_enclave_id_t,
         retval: *mut usize,
@@ -311,6 +319,79 @@ pub fn dynamic_subpart_meta(
     block_len_.store(block_len, atomic::Ordering::SeqCst);
 }
 
+pub fn wrapper_pre_merge<T: Data>(
+    op_id: OpId,
+    mut data: Vec<Vec<T>>,
+    dep_info: DepInfo,
+) -> Vec<Vec<T>> {
+    let merge_factor = 16;
+    fn ecall_pre_merge<T: Data>(op_id: OpId, data: Vec<Vec<T>>, dep_info: DepInfo, num_sub_part: usize) -> Vec<Vec<T>> {
+        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let tid: u64 = thread::current().id().as_u64().into();
+        let mut lower = vec![0; num_sub_part];
+        let mut upper = vec![1; num_sub_part];
+        let upper_bound = data.iter().map(|sub_part| sub_part.len()).collect::<Vec<_>>();
+        let mut result = Vec::new();
+        let block_len = Arc::new(AtomicUsize::new(1));
+        let mut slopes = Vec::new();
+        let fresh_slope = Arc::new(AtomicBool::new(false));
+        while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
+            upper = upper.iter()
+                .zip(upper_bound.iter())
+                .map(|(l, ub)| std::cmp::min(*l, *ub))
+                .collect::<Vec<_>>();
+            let mut result_ptr: usize = 0;
+            let mut init_mem_usage = 0;
+            let mut max_mem_usage = 0;
+            let input = Input::new(&data, &mut lower, &mut upper, block_len.load(atomic::Ordering::SeqCst), &mut init_mem_usage, &mut max_mem_usage);
+            let now_comp = Instant::now();
+            let sgx_status = unsafe {
+                pre_merge(
+                    eid,
+                    &mut result_ptr,
+                    tid,
+                    op_id,
+                    dep_info,
+                    input,
+                )
+            };
+            match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
+            dynamic_subpart_meta(dur_comp, max_mem_usage as f64, &block_len, &mut slopes, &fresh_slope);
+            let mut result_bl = get_encrypted_data::<Vec<T>>(op_id, dep_info, result_ptr as *mut u8, false);
+            assert!(result_bl.len() == 1);
+            result.append(&mut result_bl[0]);
+            lower = lower.iter()
+                .zip(upper_bound.iter())
+                .map(|(l, ub)| std::cmp::min(*l, *ub))
+                .collect::<Vec<_>>();
+        }
+        vec![result]
+    }
+    let now = Instant::now();
+    let mut n = data.len();
+    let mut r = Vec::new();
+    while n > merge_factor {
+        let m = (n-1)/merge_factor+1;
+        for i in 0..m {
+            let start = i*merge_factor;
+            let end = std::cmp::min((i+1)*merge_factor, n);
+            r.append(&mut ecall_pre_merge(op_id, (&data[start..end]).to_vec(), dep_info, end-start));    
+        }
+        data = r;
+        n = data.len();
+        r = Vec::new();
+    
+    }
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("pre_merge took {:?}s", dur);
+    data
+}
 
 pub fn wrapper_exploit_spec_oppty(
     op_ids: &Vec<OpId>,
@@ -831,7 +912,7 @@ pub fn cached_or_caching_in_enclave(rdd_id: usize, part: usize) -> BTreeSet<usiz
 pub fn secure_compute_cached(
     acc_arg: &mut AccArg,
     cur_rdd_id: usize, 
-    tx: SyncSender<(usize, (f64, f64))>,
+    tx: SyncSender<(usize, (usize, (f64, f64)))>,
     captured_vars: HashMap<usize, Vec<Vec<u8>>>,
 ) -> Vec<JoinHandle<()>> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
@@ -925,7 +1006,7 @@ pub fn secure_compute_cached(
                     cache_meta,
                 );
                 //no need to adapt for is_union case, because cached data size is fixed
-                tx.send((result_ptr, (dur_comp, max_mem_usage as f64))).unwrap();
+                tx.send((sub_part, (result_ptr, (dur_comp, max_mem_usage as f64)))).unwrap();
             }
             wrapper_revoke_mem_usage(false);
         });
@@ -1462,7 +1543,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>>;
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -1533,7 +1614,7 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         (**self).get_rdd_base().iterator_raw(split, acc_arg, tx)
     }    
     fn iterator_any(
@@ -1558,7 +1639,7 @@ impl<I: RddE + ?Sized> Rdd for SerArc<I> {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         (**self).secure_compute(split, acc_arg, tx)
     }
 
@@ -1605,7 +1686,7 @@ pub trait Rdd: RddBase + 'static {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>>;
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>>;
 }
 
 pub trait RddE: Rdd {
@@ -1640,9 +1721,8 @@ pub trait RddE: Rdd {
         let caching = acc_arg.is_caching_final_rdd();
 
         let mut result = Vec::new();
-        let mut sub_part_id = 0;
         let mut slopes = Vec::new();
-        for (received, (time_comp, max_mem_usage)) in rx {
+        for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
             dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope);
             assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
@@ -1656,7 +1736,6 @@ pub trait RddE: Rdd {
             } else {
                 result.append(result_bl.borrow_mut());
             }
-            sub_part_id += 1;
         }
         for handle in handles {
             handle.join().unwrap();

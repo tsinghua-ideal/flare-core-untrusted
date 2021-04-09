@@ -138,31 +138,49 @@ where
         }
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let mut deps = split.clone().deps;
             let mut num_sub_part = vec![0, 0]; //kv, kw
             let mut upper_bound = Vec::new();
             let mut kv = (Vec::new(), Vec::new());
-            match deps.remove(0) {   //rdd1
+            match deps.remove(0) {   //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
                     let block_len = Arc::new(AtomicUsize::new(1));
                     let cur_usage = Arc::new(AtomicUsize::new(0));
                     let fresh_slope = Arc::new(AtomicBool::new(false));
+                    let part_id = split.get_index();
                     let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(2), None, block_len, cur_usage, fresh_slope);
+                    let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     let mut slopes = Vec::new();
-                    for (received, (time_comp, max_mem_usage)) in rx {
+                    let mut kv_0 = Vec::new();
+                    for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope);
-                        let result_bl_len = result_bl.len();
-                        if result_bl_len > 0 {
+                        assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                        if caching {
+                            //collect result
+                            kv_0.push(*result_bl.clone());
+                            //cache
+                            let size = result_bl.get_size();
+                            let data_ptr = Box::into_raw(result_bl);
+                            Env::get().cache_tracker.put_sdata((rdd.get_rdd_id(), part_id, sub_part_id), data_ptr as *mut u8, size);
+                        } else {
+                            kv_0.push(*result_bl);
+                        }
+                    }
+                    //TODO: pre_merge
+
+                    for sub_part in kv_0 {
+                        let sub_part_len = sub_part.len();
+                        if sub_part_len > 0 {
                             num_sub_part[0] += 1;
-                            upper_bound.push(result_bl_len);
-                            kv.0.push(*result_bl);
-                        } 
+                            upper_bound.push(sub_part_len);
+                            kv.0.push(sub_part);
+                        }
                     }
                     for handle in handles {
                         handle.join().unwrap();
@@ -172,6 +190,23 @@ where
                     //TODO need revision if fe & fd of group_by is passed 
                     let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
                     let kv_1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
+                    //pre_merge
+                    let parent_rdd_id = self.rdd0.get_rdd_id();
+                    let parent_op_id = self.rdd0.get_op_id();
+                    let dep_info = DepInfo::new(
+                        1,
+                        0,
+                        parent_rdd_id,
+                        self.vals.id,
+                        parent_op_id,
+                        self.vals.op_id,
+                    );
+                    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+                        //wait
+                    }
+                    let kv_1 = wrapper_pre_merge(parent_op_id, kv_1, dep_info);
+                    assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                    //
                     for sub_part in kv_1 {
                         let sub_part_len = sub_part.len();
                         if sub_part_len > 0 {
@@ -184,23 +219,41 @@ where
             };
             
             let mut kw = (Vec::new(), Vec::new());
-            match deps.remove(0) {    //rdd0
+            match deps.remove(0) {    //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
                     let block_len = Arc::new(AtomicUsize::new(1));
                     let cur_usage = Arc::new(AtomicUsize::new(0));
                     let fresh_slope = Arc::new(AtomicBool::new(false));
-                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(2), None, block_len, cur_usage, fresh_slope);
+                    let part_id = split.get_index();
+                    let mut acc_arg_cg = AccArg::new(part_id, DepInfo::padding_new(2), None, block_len, cur_usage, fresh_slope);
+                    let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     let mut slopes = Vec::new();
-                    for (received, (time_comp, max_mem_usage)) in rx {
+                    let mut kw_0 = Vec::new();
+                    for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope);
-                        let result_bl_len = result_bl.len();
-                        if result_bl_len > 0 {
+                        assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                        if caching {
+                            //collect result
+                            kw_0.push(*result_bl.clone());
+                            //cache
+                            let size = result_bl.get_size();
+                            let data_ptr = Box::into_raw(result_bl);
+                            Env::get().cache_tracker.put_sdata((rdd.get_rdd_id(), part_id, sub_part_id), data_ptr as *mut u8, size);
+                        } else {
+                            kw_0.push(*result_bl);
+                        }
+                    }
+                    //TODO: pre_merge
+
+                    for sub_part in kw_0 {
+                        let sub_part_len = sub_part.len();
+                        if sub_part_len > 0 {
                             num_sub_part[1] += 1;
-                            upper_bound.push(result_bl_len);
-                            kw.0.push(*result_bl);
+                            upper_bound.push(sub_part_len);
+                            kw.0.push(sub_part);
                         }
                     }
                     for handle in handles {
@@ -211,6 +264,23 @@ where
                     //TODO need revision if fe & fd of group_by is passed 
                     let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
                     let kw_1 = futures::executor::block_on(fut)?.into_iter().collect::<Vec<_>>();
+                    //pre_merge
+                    let parent_rdd_id = self.rdd1.get_rdd_id();
+                    let parent_op_id = self.rdd1.get_op_id();
+                    let dep_info = DepInfo::new(
+                        1,
+                        1,
+                        parent_rdd_id,
+                        self.vals.id,
+                        parent_op_id,
+                        self.vals.op_id,
+                    );
+                    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+                        //wait
+                    }
+                    let kw_1 = wrapper_pre_merge(parent_op_id, kw_1, dep_info);
+                    assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                    //
                     for sub_part in kw_1 {
                         let sub_part_len = sub_part.len();
                         if sub_part_len > 0 {
@@ -278,8 +348,8 @@ where
                             cache_meta,
                         );
                         match acc_arg.dep_info.is_shuffle == 0 {
-                            true => tx.send((result_bl_ptr, (time_comp, wrapper_revoke_mem_usage(true) as f64))).unwrap(),
-                            false => tx.send((result_bl_ptr, (time_comp, max_mem_usage))).unwrap(),
+                            true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, wrapper_revoke_mem_usage(true) as f64)))).unwrap(),
+                            false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, max_mem_usage)))).unwrap(),
                         };
                         lower = lower.iter()
                             .zip(upper_bound.iter())
@@ -460,7 +530,7 @@ where
         Some(part)
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -571,7 +641,7 @@ where
         }
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_split_num = self.number_of_splits();
