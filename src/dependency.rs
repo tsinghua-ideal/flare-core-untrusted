@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 pub struct DepInfo {
     pub is_shuffle: u8,
     identifier: usize,
-    parent_rdd_id: usize,
+    pub parent_rdd_id: usize,
     pub child_rdd_id: usize, 
     parent_op_id: OpId,
     child_op_id: OpId,
@@ -308,7 +308,7 @@ where
                     let cur_usage = Arc::new(atomic::AtomicUsize::new(0));
                     let fresh_slope = Arc::new(atomic::AtomicBool::new(false));
                     let mut acc_arg = AccArg::new(partition, dep_info, Some(self.partitioner.get_num_of_partitions()), block_len, cur_usage, fresh_slope);
-                    STAGE_LOCK.get_stage_lock(dep_info.child_rdd_id);
+                    STAGE_LOCK.get_stage_lock((dep_info.child_rdd_id, dep_info.parent_rdd_id));
                     let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
                     let num_output_splits = self.partitioner.get_num_of_partitions();
                     let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)

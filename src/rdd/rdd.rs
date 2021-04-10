@@ -1262,12 +1262,14 @@ impl Input {
 pub struct StageLock {
     slock: AtomicBool,
     lock_holder_info: RwLock<LockHolderInfo>,
-    waiting_list: RwLock<BTreeMap<usize, Vec<usize>>>,
+    //For result task, key.0 == key.1
+    //For shuffle task, key.0 > key.1, key.0 is child rdd id and key.1 is parent rdd id 
+    waiting_list: RwLock<BTreeMap<(usize, usize), Vec<usize>>>,
 }
 
 #[derive(Debug)]
 pub struct LockHolderInfo {
-    cur_holder: usize,
+    cur_holder: (usize, usize),
     num_cur_holders: usize,
     max_cur_holders: usize,
 }
@@ -1277,7 +1279,7 @@ impl StageLock {
         StageLock {
             slock: AtomicBool::new(false),
             lock_holder_info: RwLock::new(LockHolderInfo {
-                cur_holder: 0,
+                cur_holder: (0, 0),
                 num_cur_holders: 0,
                 max_cur_holders: 32,
             }),
@@ -1285,44 +1287,44 @@ impl StageLock {
         }
     }
     
-    pub fn insert_stage(&self, rdd_id: usize, task_id: usize) {
+    pub fn insert_stage(&self, rdd_id_pair: (usize, usize), task_id: usize) {
         let mut waiting_list = self.waiting_list.write().unwrap();
-        waiting_list.entry(rdd_id).or_insert(vec![]).push(task_id);
+        waiting_list.entry(rdd_id_pair).or_insert(vec![]).push(task_id);
     }
 
-    pub fn remove_stage(&self, rdd_id: usize, task_id: usize) {
+    pub fn remove_stage(&self, rdd_id_pair: (usize, usize), task_id: usize) {
         let mut waiting_list = self.waiting_list.write().unwrap();
         let mut remaining = 0;
-        if let Some(task_ids) = waiting_list.get_mut(&rdd_id) {
+        if let Some(task_ids) = waiting_list.get_mut(&rdd_id_pair) {
             if let Some(pos) = task_ids.iter().position(|x| *x == task_id) {
                 task_ids.remove(pos);
             }
             remaining = task_ids.len();
         }
         if remaining == 0 {
-            waiting_list.remove(&rdd_id);
+            waiting_list.remove(&rdd_id_pair);
         }
     }
 
-    pub fn get_stage_lock(&self, cur_rdd_id: usize) {
+    pub fn get_stage_lock(&self, cur_rdd_id_pair: (usize, usize)) {
         use atomic::Ordering::SeqCst;
         let mut flag = true;
         while flag {
             while self.slock.compare_and_swap(false, true, SeqCst) {
                 //wait or bypass
                 let mut info = self.lock_holder_info.write().unwrap();
-                if cur_rdd_id == info.cur_holder  //The case for bypass
+                if cur_rdd_id_pair == info.cur_holder  //The case for bypass
                     && info.num_cur_holders < info.max_cur_holders 
                 {
                     info.num_cur_holders += 1;
                     return
                 }
             }
-            if *self.waiting_list.read().unwrap().first_key_value().unwrap().0 < cur_rdd_id {
+            if *self.waiting_list.read().unwrap().first_key_value().unwrap().0 < cur_rdd_id_pair {
                 self.slock.store(false, SeqCst);
             } else {
                 let mut info = self.lock_holder_info.write().unwrap();
-                info.cur_holder = cur_rdd_id;
+                info.cur_holder = cur_rdd_id_pair;
                 info.num_cur_holders += 1;
                 flag = false;
             }
@@ -1716,7 +1718,7 @@ pub trait RddE: Rdd {
         let cur_usage = Arc::new(AtomicUsize::new(0));
         let fresh_slope = Arc::new(AtomicBool::new(false));
         let mut acc_arg = AccArg::new(part_id, dep_info, None, block_len, cur_usage, fresh_slope);
-        STAGE_LOCK.get_stage_lock(rdd_id);
+        STAGE_LOCK.get_stage_lock((rdd_id, rdd_id));
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
