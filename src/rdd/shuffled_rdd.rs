@@ -122,21 +122,20 @@ where
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().filter(|sub_part| sub_part.len() > 0).collect();  // bucket per subpartition
         //pre_merge
         let parent_rdd_id = self.parent.get_rdd_id();
+        let child_rdd_id = self.vals.id;
         let parent_op_id = self.parent.get_op_id();
         let dep_info = DepInfo::new(
             1,
             0,
             parent_rdd_id,
-            self.vals.id,
+            child_rdd_id,
             parent_op_id,
             self.vals.op_id,
         );
         println!("bucket size before pre_merge: {:?}", bucket.get_size());
-        while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-            //wait
-        }
+        acc_arg.get_enclave_lock();
         let bucket = wrapper_pre_merge(parent_op_id, bucket, dep_info);
-        assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+        acc_arg.free_enclave_lock();
         println!("bucket size after pre_merge: {:?}", bucket.get_size());
         //
         let num_sub_part = bucket.len();
@@ -164,9 +163,7 @@ where
             let mut is_survivor = spec_call_seq_ptr != 0;
             while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
                 let wait_now = Instant::now();
-                while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                    //wait
-                }
+                acc_arg.get_enclave_lock();
                 let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
                 wait += wait_dur;
                 //update block_len

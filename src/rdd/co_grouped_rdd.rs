@@ -148,11 +148,15 @@ where
             match deps.remove(0) {   //rdd0
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let block_len = Arc::new(AtomicUsize::new(1));
-                    let cur_usage = Arc::new(AtomicUsize::new(0));
-                    let fresh_slope = Arc::new(AtomicBool::new(false));
                     let part_id = split.get_index();
-                    let mut acc_arg_cg = AccArg::new(split.get_index(), DepInfo::padding_new(2), None, block_len, cur_usage, fresh_slope);
+                    let mut acc_arg_cg = AccArg::new(part_id,
+                        DepInfo::padding_new(2), 
+                        None,
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicUsize::new(1)), 
+                        Arc::new(AtomicUsize::new(0)), 
+                        Arc::new(AtomicBool::new(false))
+                    );
                     let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     let mut slopes = Vec::new();
@@ -160,7 +164,7 @@ where
                     for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope);
-                        assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                        acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
                             kv_0.push(*result_bl.clone());
@@ -201,11 +205,9 @@ where
                         parent_op_id,
                         self.vals.op_id,
                     );
-                    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                        //wait
-                    }
+                    acc_arg.get_enclave_lock();
                     let kv_1 = wrapper_pre_merge(parent_op_id, kv_1, dep_info);
-                    assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                    acc_arg.free_enclave_lock();
                     //
                     for sub_part in kv_1 {
                         let sub_part_len = sub_part.len();
@@ -222,11 +224,15 @@ where
             match deps.remove(0) {    //rdd1
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let block_len = Arc::new(AtomicUsize::new(1));
-                    let cur_usage = Arc::new(AtomicUsize::new(0));
-                    let fresh_slope = Arc::new(AtomicBool::new(false));
                     let part_id = split.get_index();
-                    let mut acc_arg_cg = AccArg::new(part_id, DepInfo::padding_new(2), None, block_len, cur_usage, fresh_slope);
+                    let mut acc_arg_cg = AccArg::new(part_id,
+                        DepInfo::padding_new(2), 
+                        None,
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicUsize::new(1)), 
+                        Arc::new(AtomicUsize::new(0)), 
+                        Arc::new(AtomicBool::new(false))
+                    );
                     let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     let mut slopes = Vec::new();
@@ -234,7 +240,7 @@ where
                     for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope);
-                        assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                        acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
                             kw_0.push(*result_bl.clone());
@@ -275,11 +281,9 @@ where
                         parent_op_id,
                         self.vals.op_id,
                     );
-                    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                        //wait
-                    }
+                    acc_arg.get_enclave_lock();
                     let kw_1 = wrapper_pre_merge(parent_op_id, kw_1, dep_info);
-                    assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+                    acc_arg.free_enclave_lock();
                     //
                     for sub_part in kw_1 {
                         let sub_part_len = sub_part.len();
@@ -313,9 +317,7 @@ where
                 let mut is_survivor = spec_call_seq_ptr != 0;
                 while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
                     let wait_now = Instant::now();
-                    while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                        //wait
-                    }
+                    acc_arg.get_enclave_lock();
                     let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
                     wait += wait_dur;
                     //update block_len

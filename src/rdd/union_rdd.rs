@@ -93,10 +93,14 @@ where
                 let split = part.parent_partition();
                 let parent = &rdds[part.parent_rdd_index];
                 let part_id = split.get_index();
-                let block_len = acc_arg.block_len.clone();
-                let cur_usage = acc_arg.cur_usage.clone();
-                let fresh_slope = acc_arg.fresh_slope.clone();
-                let mut acc_arg_un = AccArg::new(part_id, DepInfo::padding_new(0), None, block_len, cur_usage, fresh_slope);
+                let mut acc_arg_un = AccArg::new(part_id, 
+                    DepInfo::padding_new(0), 
+                    None, 
+                    acc_arg.eenter_lock.clone(),
+                    acc_arg.block_len.clone(),
+                    acc_arg.cur_usage.clone(),
+                    acc_arg.fresh_slope.clone(),
+                );
                 let handle_uns = parent.secure_compute(split, &mut acc_arg_un, tx_un.clone())?; 
                 
                 let acc_arg = acc_arg.clone();
@@ -202,7 +206,14 @@ where
                         block_len.store(1, atomic::Ordering::SeqCst);
                         cur_usage.store(0, atomic::Ordering::SeqCst);
                         fresh_slope.store(true, atomic::Ordering::SeqCst);
-                        let mut acc_arg_un = AccArg::new(part_id, DepInfo::padding_new(0), None, block_len, cur_usage, fresh_slope);
+                        let mut acc_arg_un = AccArg::new(part_id, 
+                            DepInfo::padding_new(0), 
+                            None,
+                            acc_arg.eenter_lock.clone(),
+                            block_len,
+                            cur_usage, 
+                            fresh_slope
+                        );
                         let handle_uns = rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un).unwrap();
                         let tid: u64 = thread::current().id().as_u64().into();
                         let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());

@@ -74,7 +74,6 @@ pub type OText<T> = Text<T, T>;
 
 static immediate_cout: bool = true;
 pub static INPUT_: AtomicUsize = AtomicUsize::new(20);  //default 1M
-pub static EENTER_LOCK: AtomicBool = AtomicBool::new(false);
 pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
 pub const MAX_ENC_BL: usize = 1024;
 
@@ -956,6 +955,7 @@ pub fn secure_compute_cached(
         let split_nums = acc_arg.split_nums.clone();
         let mut cache_meta = acc_arg.to_cache_meta();
         let dep_info = acc_arg.dep_info;
+        let eenter_lock = acc_arg.eenter_lock.clone();
 
         let handle = std::thread::spawn(move || {
             wrapper_register_mem_usage(0);
@@ -976,7 +976,7 @@ pub fn secure_compute_cached(
                 let mut init_mem_usage = 0;
                 let mut max_mem_usage = 0;
                 let mut result_ptr: usize = 0;
-                while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+                while eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                     //wait
                 }
                 let now_comp = Instant::now();
@@ -1029,13 +1029,14 @@ pub struct AccArg {
     cached_rdd_id: usize,
     pub cached_sub_parts: BTreeSet<usize>,
     pub sub_parts_len: usize,
+    pub eenter_lock: Arc<AtomicBool>,
     pub block_len: Arc<AtomicUsize>,
     pub cur_usage: Arc<AtomicUsize>,  //for transfer the cur memory usage in union thread to prev thread
     pub fresh_slope: Arc<AtomicBool>,
 }
 
 impl AccArg {
-    pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>, block_len: Arc<AtomicUsize>, cur_usage: Arc<AtomicUsize>, fresh_slope: Arc<AtomicBool>) -> Self {
+    pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>, eenter_lock: Arc<AtomicBool>, block_len: Arc<AtomicUsize>, cur_usage: Arc<AtomicUsize>, fresh_slope: Arc<AtomicBool>) -> Self {
         let split_nums = match reduce_num {
             Some(reduce_num) => {
                 assert!(dep_info.is_shuffle == 1);
@@ -1053,6 +1054,7 @@ impl AccArg {
             cached_rdd_id: 0,
             cached_sub_parts: BTreeSet::new(),
             sub_parts_len: 0,
+            eenter_lock,
             block_len,
             cur_usage,
             fresh_slope,
@@ -1135,6 +1137,16 @@ impl AccArg {
 
     pub fn is_caching_final_rdd(&self) -> bool {
         self.rdd_ids[0] == self.caching_rdd_id
+    }
+
+    pub fn get_enclave_lock(&self) {
+        while self.eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+            //wait
+        }
+    }
+
+    pub fn free_enclave_lock(&self) {
+        assert_eq!(self.eenter_lock.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
     }
 }
 
@@ -1714,10 +1726,13 @@ pub trait RddE: Rdd {
         let op_id = self.get_op_id();
         let part_id = split.get_index();
         let dep_info = DepInfo::padding_new(2);
-        let block_len = Arc::new(AtomicUsize::new(1));
-        let cur_usage = Arc::new(AtomicUsize::new(0));
-        let fresh_slope = Arc::new(AtomicBool::new(false));
-        let mut acc_arg = AccArg::new(part_id, dep_info, None, block_len, cur_usage, fresh_slope);
+        let mut acc_arg = AccArg::new(part_id, 
+            dep_info, 
+            None, 
+            Arc::new(AtomicBool::new(false)), 
+            Arc::new(AtomicUsize::new(1)), 
+            Arc::new(AtomicUsize::new(0)), 
+            Arc::new(AtomicBool::new(false)));
         STAGE_LOCK.get_stage_lock((rdd_id, rdd_id));
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
@@ -1727,7 +1742,7 @@ pub trait RddE: Rdd {
         for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
             dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope);
-            assert_eq!(EENTER_LOCK.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+            acc_arg.free_enclave_lock();
             if caching {
                 //collect result
                 result.extend_from_slice(&result_bl);

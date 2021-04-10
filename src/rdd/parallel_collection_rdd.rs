@@ -94,9 +94,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
             let mut cur = 0;
             while cur < len {
                 let wait_now = Instant::now();
-                while EENTER_LOCK.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                    //wait
-                }
+                acc_arg.get_enclave_lock();
                 let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
                 wait += wait_dur;
 
