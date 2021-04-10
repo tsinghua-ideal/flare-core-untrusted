@@ -32,6 +32,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
         if jt.final_stage.parents.is_empty() && (jt.num_output_parts == 1) {
             let final_rdd_id = jt.final_rdd.get_rdd_id();
             STAGE_LOCK.insert_stage((final_rdd_id, final_rdd_id), 0);
+            STAGE_LOCK.set_num_splits((final_rdd_id, final_rdd_id), jt.final_rdd.number_of_splits());
             let split = (jt.final_rdd.splits()[jt.output_parts[0]]).clone();
             let task_context = TaskContext::new(jt.final_stage.id, jt.output_parts[0], 0);
             let now = Instant::now();

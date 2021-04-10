@@ -158,6 +158,7 @@ where
         log::debug!("resulttask runs");
         let rdd_id = self.rdd.get_rdd_id();
         STAGE_LOCK.insert_stage((rdd_id, rdd_id), self.task_id);
+        STAGE_LOCK.set_num_splits((rdd_id, rdd_id), self.rdd.number_of_splits());
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
 

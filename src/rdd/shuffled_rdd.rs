@@ -134,7 +134,7 @@ where
         );
         println!("bucket size before pre_merge: {:?}", bucket.get_size());
         acc_arg.get_enclave_lock();
-        let bucket = wrapper_pre_merge(parent_op_id, bucket, dep_info);
+        let bucket = wrapper_pre_merge(parent_op_id, bucket, dep_info, STAGE_LOCK.get_parall_num());
         acc_arg.free_enclave_lock();
         println!("bucket size after pre_merge: {:?}", bucket.get_size());
         //

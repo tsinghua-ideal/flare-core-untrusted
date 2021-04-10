@@ -163,7 +163,7 @@ where
                     let mut kv_0 = Vec::new();
                     for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope);
+                        dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
@@ -206,7 +206,7 @@ where
                         self.vals.op_id,
                     );
                     acc_arg.get_enclave_lock();
-                    let kv_1 = wrapper_pre_merge(parent_op_id, kv_1, dep_info);
+                    let kv_1 = wrapper_pre_merge(parent_op_id, kv_1, dep_info, STAGE_LOCK.get_parall_num());
                     acc_arg.free_enclave_lock();
                     //
                     for sub_part in kv_1 {
@@ -239,7 +239,7 @@ where
                     let mut kw_0 = Vec::new();
                     for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope);
+                        dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
@@ -282,7 +282,7 @@ where
                         self.vals.op_id,
                     );
                     acc_arg.get_enclave_lock();
-                    let kw_1 = wrapper_pre_merge(parent_op_id, kw_1, dep_info);
+                    let kw_1 = wrapper_pre_merge(parent_op_id, kw_1, dep_info, STAGE_LOCK.get_parall_num());
                     acc_arg.free_enclave_lock();
                     //
                     for sub_part in kw_1 {

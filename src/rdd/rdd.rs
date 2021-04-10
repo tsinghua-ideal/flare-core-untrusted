@@ -291,7 +291,9 @@ pub fn dynamic_subpart_meta(
     block_len_: &Arc<AtomicUsize>,
     slopes: &mut Vec<f64>,
     fresh_slope: &Arc<AtomicBool>,
+    num_splits: usize,
 ) {
+    let limit_per_partition = ((80*(1<<20)) as f64)/(num_splits as f64);  //about 80MB/num_splits
     let mut block_len = block_len_.load(atomic::Ordering::SeqCst);
     if fresh_slope.compare_and_swap(true, false, atomic::Ordering::SeqCst) {
         slopes.clear();   //for unique-partitioner-union, it may affect other cases but does not matter
@@ -302,11 +304,11 @@ pub fn dynamic_subpart_meta(
         block_len += 1;
     } else {
         let avg_k = slopes.iter().sum::<f64>()/(slopes.len() as f64);
-        if k <= avg_k * 0.8 {
+        if k <= avg_k * 0.8 && max_mem_usage < limit_per_partition {
             slopes.clear();
             slopes.push(k);
             block_len += 1;
-        } else if k <= avg_k * 1.2 {
+        } else if k <= avg_k * 1.2 && max_mem_usage < limit_per_partition {
             slopes.push(k);
             block_len += 1;
         } else if k <= avg_k * 1.5 && block_len > 1 {
@@ -315,6 +317,7 @@ pub fn dynamic_subpart_meta(
             block_len = (block_len + 1) / 2;
         }
     }
+    println!("limit_per_partition {:?}B, block_len: {:?}", limit_per_partition, block_len);
     block_len_.store(block_len, atomic::Ordering::SeqCst);
 }
 
@@ -322,9 +325,10 @@ pub fn wrapper_pre_merge<T: Data>(
     op_id: OpId,
     mut data: Vec<Vec<T>>,
     dep_info: DepInfo,
+    num_splits: usize,
 ) -> Vec<Vec<T>> {
     let merge_factor = 16;
-    fn ecall_pre_merge<T: Data>(op_id: OpId, data: Vec<Vec<T>>, dep_info: DepInfo, num_sub_part: usize) -> Vec<Vec<T>> {
+    fn ecall_pre_merge<T: Data>(op_id: OpId, data: Vec<Vec<T>>, dep_info: DepInfo, num_sub_part: usize, num_splits: usize) -> Vec<Vec<T>> {
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let tid: u64 = thread::current().id().as_u64().into();
         let mut lower = vec![0; num_sub_part];
@@ -361,7 +365,7 @@ pub fn wrapper_pre_merge<T: Data>(
                 },
             };
             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-            dynamic_subpart_meta(dur_comp, max_mem_usage as f64, &block_len, &mut slopes, &fresh_slope);
+            dynamic_subpart_meta(dur_comp, max_mem_usage as f64, &block_len, &mut slopes, &fresh_slope, num_splits);
             let mut result_bl = get_encrypted_data::<Vec<T>>(op_id, dep_info, result_ptr as *mut u8, false);
             assert!(result_bl.len() == 1);
             result.append(&mut result_bl[0]);
@@ -380,7 +384,7 @@ pub fn wrapper_pre_merge<T: Data>(
         for i in 0..m {
             let start = i*merge_factor;
             let end = std::cmp::min((i+1)*merge_factor, n);
-            r.append(&mut ecall_pre_merge(op_id, (&data[start..end]).to_vec(), dep_info, end-start));    
+            r.append(&mut ecall_pre_merge(op_id, (&data[start..end]).to_vec(), dep_info, end-start, num_splits));    
         }
         data = r;
         n = data.len();
@@ -1277,6 +1281,7 @@ pub struct StageLock {
     //For result task, key.0 == key.1
     //For shuffle task, key.0 > key.1, key.0 is child rdd id and key.1 is parent rdd id 
     waiting_list: RwLock<BTreeMap<(usize, usize), Vec<usize>>>,
+    num_splits_mapping: RwLock<BTreeMap<(usize, usize), usize>>,
 }
 
 #[derive(Debug)]
@@ -1293,9 +1298,10 @@ impl StageLock {
             lock_holder_info: RwLock::new(LockHolderInfo {
                 cur_holder: (0, 0),
                 num_cur_holders: 0,
-                max_cur_holders: 32,
+                max_cur_holders: 20,
             }),
             waiting_list: RwLock::new(BTreeMap::new()),
+            num_splits_mapping: RwLock::new(BTreeMap::new()),
         }
     }
     
@@ -1315,7 +1321,22 @@ impl StageLock {
         }
         if remaining == 0 {
             waiting_list.remove(&rdd_id_pair);
+            self.num_splits_mapping.write().unwrap().remove(&rdd_id_pair);
         }
+    }
+
+    pub fn set_num_splits(&self, rdd_id_pair: (usize, usize), num_splits: usize) {
+        let mut num_splits_mapping = self.num_splits_mapping.write().unwrap();
+        num_splits_mapping.insert(rdd_id_pair, num_splits);
+    }
+
+    pub fn get_parall_num(&self) -> usize {
+        let num_splits_mapping = self.num_splits_mapping.read().unwrap();
+        let info = self.lock_holder_info.read().unwrap();
+        std::cmp::min(
+            *num_splits_mapping.get(&info.cur_holder).unwrap(),
+            info.max_cur_holders
+        )
     }
 
     pub fn get_stage_lock(&self, cur_rdd_id_pair: (usize, usize)) {
@@ -1741,7 +1762,7 @@ pub trait RddE: Rdd {
         let mut slopes = Vec::new();
         for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
-            dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope);
+            dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num());
             acc_arg.free_enclave_lock();
             if caching {
                 //collect result
