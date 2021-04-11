@@ -119,7 +119,6 @@ where
                     let mut r = rx_un.recv();
                     while r.is_ok() {
                         let (_, (ptr, (time_comp, cur_mem_usage))) = r.unwrap();
-                        wrapper_register_mem_usage(cur_mem_usage as usize);
                         //The last connected one will survive in cache
                         let r_next = rx_un.try_recv();
                         is_survivor = is_survivor || r_next == Err(TryRecvError::Disconnected);
@@ -127,9 +126,10 @@ where
                             cache_meta.set_sub_part_id(sub_part_id);
                             cache_meta.set_is_survivor(is_survivor);
                             BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                            let mut init_mem_usage = 0;
+                            let mut init_mem_usage = cur_mem_usage as usize;
+                            let mut last_mem_usage = 0;
                             let mut max_mem_usage = 0;
-                            let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut max_mem_usage);
+                            let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
                             let mut result_bl_ptr: usize = 0; 
                             let now_comp = Instant::now();
                             let sgx_status = unsafe {
@@ -157,10 +157,9 @@ where
                                 spec_call_seq_ptr, 
                                 cache_meta, 
                             );
-                            let cur_usage = wrapper_revoke_mem_usage(true);
-                            acc_arg.cur_usage.store(cur_usage, atomic::Ordering::SeqCst);
+                            acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
                             match acc_arg.dep_info.is_shuffle == 0 {
-                                true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, cur_usage as f64)))).unwrap(),
+                                true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, last_mem_usage as f64)))).unwrap(),
                                 false => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, max_mem_usage as f64)))).unwrap(),
                             };
                         }
@@ -228,7 +227,6 @@ where
                         let mut r = rx_un.recv();
                         while r.is_ok() {
                             let (_, (ptr, (time_comp, cur_mem_usage))) = r.unwrap();
-                            wrapper_register_mem_usage(cur_mem_usage as usize);
                             //The last connected one will survive in cache
                             let r_next = rx_un.try_recv();
                             is_survivor = is_survivor || (r_next == Err(TryRecvError::Disconnected) && idx == last_idx);
@@ -236,9 +234,10 @@ where
                                 cache_meta.set_sub_part_id(sub_part_id);
                                 cache_meta.set_is_survivor(is_survivor);
                                 BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                                let mut init_mem_usage = 0;
+                                let mut init_mem_usage = cur_mem_usage as usize;
+                                let mut last_mem_usage = 0;
                                 let mut max_mem_usage = 0;
-                                let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut max_mem_usage);
+                                let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
                                 let mut result_bl_ptr: usize = 0; 
                                 let now_comp = Instant::now();
                                 let sgx_status = unsafe {
@@ -266,10 +265,9 @@ where
                                     spec_call_seq_ptr, 
                                     cache_meta,
                                 );
-                                let cur_usage = wrapper_revoke_mem_usage(true);
-                                acc_arg.cur_usage.store(cur_usage, atomic::Ordering::SeqCst);
+                                acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
                                 match acc_arg.dep_info.is_shuffle == 0 {
-                                    true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, cur_usage as f64)))).unwrap(),
+                                    true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, last_mem_usage as f64)))).unwrap(),
                                     false => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, max_mem_usage as f64)))).unwrap(),
                                 };
                             }

@@ -36,7 +36,6 @@ use crate::{utils, Fn, SerArc, SerBox};
 
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
-use crossbeam::epoch::Atomic;
 use fasthash::MetroHasher;
 use once_cell::sync::Lazy;
 use rand::{Rng, SeedableRng};
@@ -73,13 +72,8 @@ type CT<T, TE> = Text<T, TE>;
 pub type OText<T> = Text<T, T>; 
 
 static immediate_cout: bool = true;
-pub static INPUT_: AtomicUsize = AtomicUsize::new(20);  //default 1M
 pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
 pub const MAX_ENC_BL: usize = 1024;
-
-pub fn get_block_size() -> usize {
-    1 << INPUT_.load(atomic::Ordering::SeqCst)
-}
 
 extern "C" {
     pub fn secure_execute(
@@ -189,15 +183,6 @@ extern "C" {
         eid: sgx_enclave_id_t,
         cached_sub_parts: *mut u8,
     ) -> sgx_status_t;
-    pub fn register_mem_usage(
-        eid: sgx_enclave_id_t,
-        union_usage: usize,
-    ) -> sgx_status_t;
-    pub fn revoke_mem_usage(
-        eid: sgx_enclave_id_t,
-        ret_val: *mut usize,
-        is_union: u8,
-    ) -> sgx_status_t;
 }
 
 #[no_mangle]
@@ -249,17 +234,19 @@ pub fn wrapper_secure_execute<T>(
     lower: &mut Vec<usize>,
     upper: &mut Vec<usize>,
     block_len: usize,
+    to_set_usage: usize,
     captured_vars: &HashMap<usize, Vec<Vec<u8>>>,
-) -> (usize, (f64, f64))  //(result_ptr, (time_for_sub_part_computation, max_memory_usage_per_thread)) 
+) -> (usize, (f64, (f64, f64)))  //(result_ptr, (time_for_sub_part_computation, last_memory_usage_per_thread, max_memory_usage_per_thread)) 
 where
     T: Construct + Data,
 {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut result_bl_ptr: usize = 0;
     let tid: u64 = thread::current().id().as_u64().into();
-    let mut init_mem_usage = 0;
+    let mut init_mem_usage = to_set_usage;
+    let mut last_mem_usage = 0;
     let mut max_mem_usage = 0;
-    let input = Input::new(data, lower, upper, block_len, &mut init_mem_usage, &mut max_mem_usage);
+    let input = Input::new(data, lower, upper, block_len, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
     let now_comp = Instant::now();
     let sgx_status = unsafe {
         secure_execute(
@@ -282,7 +269,7 @@ where
         },
     };
     let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-    (result_bl_ptr, (dur_comp, max_mem_usage as f64))
+    (result_bl_ptr, (dur_comp, (last_mem_usage as f64, max_mem_usage as f64)))
 }
 
 pub fn dynamic_subpart_meta(
@@ -338,15 +325,17 @@ pub fn wrapper_pre_merge<T: Data>(
         let block_len = Arc::new(AtomicUsize::new(1));
         let mut slopes = Vec::new();
         let fresh_slope = Arc::new(AtomicBool::new(false));
+        let mut to_set_usage = 0;
         while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
             upper = upper.iter()
                 .zip(upper_bound.iter())
                 .map(|(l, ub)| std::cmp::min(*l, *ub))
                 .collect::<Vec<_>>();
             let mut result_ptr: usize = 0;
-            let mut init_mem_usage = 0;
+            let mut init_mem_usage = to_set_usage;
+            let mut last_mem_usage = 0;
             let mut max_mem_usage = 0;
-            let input = Input::new(&data, &mut lower, &mut upper, block_len.load(atomic::Ordering::SeqCst), &mut init_mem_usage, &mut max_mem_usage);
+            let input = Input::new(&data, &mut lower, &mut upper, block_len.load(atomic::Ordering::SeqCst), &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
             let now_comp = Instant::now();
             let sgx_status = unsafe {
                 pre_merge(
@@ -373,6 +362,7 @@ pub fn wrapper_pre_merge<T: Data>(
                 .zip(upper_bound.iter())
                 .map(|(l, ub)| std::cmp::min(*l, *ub))
                 .collect::<Vec<_>>();
+            to_set_usage = last_mem_usage;
         }
         vec![result]
     }
@@ -476,8 +466,9 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, split_n
     let split_nums = vec![split_num];
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut init_mem_usage = 0;
+    let mut last_mem_usage = 0;
     let mut max_mem_usage = 0;
-    let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], usize::MAX, &mut init_mem_usage, &mut max_mem_usage);
+    let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
     let mut result_ptr: usize = 0;
     let sgx_status = unsafe {
         secure_execute(
@@ -626,38 +617,6 @@ pub fn wrapper_tail_compute(tail_info: &mut TailCompInfo) {
         },
     };
     *tail_info = *new_tail_info;
-}
-
-pub fn wrapper_register_mem_usage(union_usage: usize) {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let sgx_status = unsafe {
-        register_mem_usage(eid, union_usage)
-    };
-    let _r = match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
-        _ => {
-            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
-    };
-}
-
-pub fn wrapper_revoke_mem_usage(is_union: bool) -> usize {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let is_union = match is_union {
-        true => 1,
-        false => 0,
-    };
-    let mut left_usage: usize = 0; 
-    let sgx_status = unsafe {
-        revoke_mem_usage(eid, &mut left_usage, is_union)
-    };
-    let _r = match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
-        _ => {
-            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
-    };
-    left_usage
 }
 
 pub fn get_encrypted_data<T>(op_id: OpId, dep_info: DepInfo, p_data_enc: *mut u8, is_spec: bool) -> Box<Vec<T>> 
@@ -848,7 +807,7 @@ where
     FE: Func(Vec<T>)->TE
 {
     let mut len = data.len();
-    let mut data_enc = Vec::with_capacity(len);
+    let mut data_enc = Vec::with_capacity(len/MAX_ENC_BL+1);
     while len >= MAX_ENC_BL {
         len -= MAX_ENC_BL;
         let remain = data.split_off(MAX_ENC_BL);
@@ -962,10 +921,10 @@ pub fn secure_compute_cached(
         let eenter_lock = acc_arg.eenter_lock.clone();
 
         let handle = std::thread::spawn(move || {
-            wrapper_register_mem_usage(0);
             let tid: u64 = thread::current().id().as_u64().into();
             for (seq_id, sub_part) in cached_sub_parts.into_iter().enumerate() {
                 let mut is_survivor = cached_sub_parts_len == subpids.len() &&  cached_sub_parts_len-1 == seq_id;
+                //No need to get memory usage, for the sub-partition is fixed when using cached data
                 let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
                     &op_ids, 
                     cache_meta, 
@@ -978,6 +937,7 @@ pub fn secure_compute_cached(
                 cache_meta.set_is_survivor(is_survivor);
                 BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
                 let mut init_mem_usage = 0;
+                let mut last_mem_usage = 0;
                 let mut max_mem_usage = 0;
                 let mut result_ptr: usize = 0;
                 while eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
@@ -994,7 +954,7 @@ pub fn secure_compute_cached(
                         &split_nums as *const Vec<usize> as *const u8,
                         cache_meta,
                         dep_info,   
-                        Input::padding(&mut init_mem_usage, &mut max_mem_usage), //invalid pointer
+                        Input::padding(&mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage), //invalid pointer
                         &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                     )
                 };
@@ -1009,10 +969,8 @@ pub fn secure_compute_cached(
                     spec_call_seq_ptr, 
                     cache_meta,
                 );
-                //no need to adapt for is_union case, because cached data size is fixed
                 tx.send((sub_part, (result_ptr, (dur_comp, max_mem_usage as f64)))).unwrap();
             }
-            wrapper_revoke_mem_usage(false);
         });
         handles.push(handle);
     } else {
@@ -1213,6 +1171,7 @@ pub struct Input {
     upper: usize,
     block_len: usize,
     init_mem_usage: usize,
+    last_mem_usage: usize,
     max_mem_usage: usize,
 }
 
@@ -1222,12 +1181,14 @@ impl Input {
         upper: &mut Vec<usize>, 
         block_len: usize, 
         init_mem_usage: &mut usize, 
+        last_mem_usage: &mut usize,
         max_mem_usage: &mut usize,
     ) -> Self {
         let data = data as *const T as usize;
         let lower = lower as *mut Vec<usize> as usize;
         let upper = upper as *mut Vec<usize> as usize;
         let init_mem_usage = init_mem_usage as *mut usize as usize;
+        let last_mem_usage = last_mem_usage as *mut usize as usize;
         let max_mem_usage = max_mem_usage as *mut usize as usize;
         Input {
             data,
@@ -1235,6 +1196,7 @@ impl Input {
             upper,
             block_len,
             init_mem_usage,
+            last_mem_usage,
             max_mem_usage,
         }
     }
@@ -1243,12 +1205,14 @@ impl Input {
         lower: &mut Vec<usize>, 
         upper: &mut Vec<usize>, 
         block_len: usize, 
-        init_mem_usage: &mut usize, 
+        init_mem_usage: &mut usize,
+        last_mem_usage: &mut usize,
         max_mem_usage: &mut usize,
     ) -> Self {
         let lower = lower as *mut Vec<usize> as usize;
         let upper = upper as *mut Vec<usize> as usize;
         let init_mem_usage = init_mem_usage as *mut usize as usize;
+        let last_mem_usage = last_mem_usage as *mut usize as usize;
         let max_mem_usage = max_mem_usage as *mut usize as usize;
         Input {
             data: data as usize,
@@ -1256,12 +1220,14 @@ impl Input {
             upper,
             block_len,
             init_mem_usage,
+            last_mem_usage,
             max_mem_usage,
         }
     }
 
-    pub fn padding(init_mem_usage: &mut usize, max_mem_usage: &mut usize) -> Self {
+    pub fn padding(init_mem_usage: &mut usize, last_mem_usage: &mut usize, max_mem_usage: &mut usize) -> Self {
         let init_mem_usage = init_mem_usage as *mut usize as usize;
+        let last_mem_usage = last_mem_usage as *mut usize as usize;
         let max_mem_usage = max_mem_usage as *mut usize as usize;
         Input {
             data: 0,
@@ -1269,6 +1235,7 @@ impl Input {
             upper: 0,
             block_len: 0,
             init_mem_usage,
+            last_mem_usage,
             max_mem_usage,
         }
     }
