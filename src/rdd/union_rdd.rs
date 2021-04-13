@@ -129,7 +129,7 @@ where
                             let mut init_mem_usage = cur_mem_usage as usize;
                             let mut last_mem_usage = 0;
                             let mut max_mem_usage = 0;
-                            let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
+                            let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], &vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
                             let mut result_bl_ptr: usize = 0; 
                             let now_comp = Instant::now();
                             let sgx_status = unsafe {
@@ -237,7 +237,7 @@ where
                                 let mut init_mem_usage = cur_mem_usage as usize;
                                 let mut last_mem_usage = 0;
                                 let mut max_mem_usage = 0;
-                                let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
+                                let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], &vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
                                 let mut result_bl_ptr: usize = 0; 
                                 let now_comp = Instant::now();
                                 let sgx_status = unsafe {

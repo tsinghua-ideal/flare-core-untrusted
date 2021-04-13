@@ -123,6 +123,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                         &data,
                         &mut vec![cur],
                         &mut vec![next],
+                        &vec![len],
                         block_len,
                         to_set_usage,
                         &captured_vars,

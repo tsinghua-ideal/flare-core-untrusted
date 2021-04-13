@@ -237,6 +237,7 @@ pub fn wrapper_secure_execute<T>(
     data: &T,
     lower: &mut Vec<usize>,
     upper: &mut Vec<usize>,
+    upper_bound: &Vec<usize>,
     block_len: usize,
     to_set_usage: usize,
     captured_vars: &HashMap<usize, Vec<Vec<u8>>>,
@@ -250,7 +251,7 @@ where
     let mut init_mem_usage = to_set_usage;
     let mut last_mem_usage = 0;
     let mut max_mem_usage = 0;
-    let input = Input::new(data, lower, upper, block_len, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
+    let input = Input::new(data, lower, upper, upper_bound, block_len, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
     let now_comp = Instant::now();
     let sgx_status = unsafe {
         secure_execute(
@@ -284,6 +285,7 @@ pub fn dynamic_subpart_meta(
     fresh_slope: &Arc<AtomicBool>,
     num_splits: usize,
 ) {
+    let tid: u64 = thread::current().id().as_u64().into();
     let limit_per_partition = ((80*(1<<20)) as f64)/(num_splits as f64);  //about 80MB/num_splits
     let mut block_len = block_len_.load(atomic::Ordering::SeqCst);
     if fresh_slope.compare_and_swap(true, false, atomic::Ordering::SeqCst) {
@@ -308,7 +310,7 @@ pub fn dynamic_subpart_meta(
             block_len = (block_len + 1) / 2;
         }
     }
-    println!("limit_per_partition {:?}B, block_len: {:?}", limit_per_partition, block_len);
+    println!("tid: {:?}, limit_per_partition {:?}B, block_len: {:?}", tid, limit_per_partition, block_len);
     block_len_.store(block_len, atomic::Ordering::SeqCst);
 }
 
@@ -339,7 +341,7 @@ pub fn wrapper_pre_merge<T: Data>(
             let mut init_mem_usage = to_set_usage;
             let mut last_mem_usage = 0;
             let mut max_mem_usage = 0;
-            let input = Input::new(&data, &mut lower, &mut upper, block_len.load(atomic::Ordering::SeqCst), &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
+            let input = Input::new(&data, &mut lower, &mut upper, &upper_bound, block_len.load(atomic::Ordering::SeqCst), &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
             let now_comp = Instant::now();
             let sgx_status = unsafe {
                 pre_merge(
@@ -492,7 +494,7 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, split_n
     let mut init_mem_usage = 0;
     let mut last_mem_usage = 0;
     let mut max_mem_usage = 0;
-    let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
+    let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], &vec![data.len()], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
     let mut result_ptr: usize = 0;
     let sgx_status = unsafe {
         secure_execute(
@@ -1193,6 +1195,7 @@ pub struct Input {
     data: usize,
     lower: usize,
     upper: usize,
+    upper_bound: usize,
     block_len: usize,
     init_mem_usage: usize,
     last_mem_usage: usize,
@@ -1202,7 +1205,8 @@ pub struct Input {
 impl Input {
     pub fn new<T: Data>(data: &T, 
         lower: &mut Vec<usize>, 
-        upper: &mut Vec<usize>, 
+        upper: &mut Vec<usize>,
+        upper_bound: &Vec<usize>,
         block_len: usize, 
         init_mem_usage: &mut usize, 
         last_mem_usage: &mut usize,
@@ -1211,6 +1215,7 @@ impl Input {
         let data = data as *const T as usize;
         let lower = lower as *mut Vec<usize> as usize;
         let upper = upper as *mut Vec<usize> as usize;
+        let upper_bound = upper_bound as *const Vec<usize> as usize;
         let init_mem_usage = init_mem_usage as *mut usize as usize;
         let last_mem_usage = last_mem_usage as *mut usize as usize;
         let max_mem_usage = max_mem_usage as *mut usize as usize;
@@ -1218,6 +1223,7 @@ impl Input {
             data,
             lower,
             upper,
+            upper_bound,
             block_len,
             init_mem_usage,
             last_mem_usage,
@@ -1227,7 +1233,8 @@ impl Input {
 
     pub fn build_from_ptr(data: *const u8, 
         lower: &mut Vec<usize>, 
-        upper: &mut Vec<usize>, 
+        upper: &mut Vec<usize>,
+        upper_bound: &Vec<usize>, 
         block_len: usize, 
         init_mem_usage: &mut usize,
         last_mem_usage: &mut usize,
@@ -1235,6 +1242,7 @@ impl Input {
     ) -> Self {
         let lower = lower as *mut Vec<usize> as usize;
         let upper = upper as *mut Vec<usize> as usize;
+        let upper_bound = upper_bound as *const Vec<usize> as usize;
         let init_mem_usage = init_mem_usage as *mut usize as usize;
         let last_mem_usage = last_mem_usage as *mut usize as usize;
         let max_mem_usage = max_mem_usage as *mut usize as usize;
@@ -1242,6 +1250,7 @@ impl Input {
             data: data as usize,
             lower,
             upper,
+            upper_bound,
             block_len,
             init_mem_usage,
             last_mem_usage,
@@ -1257,6 +1266,7 @@ impl Input {
             data: 0,
             lower: 0,
             upper: 0,
+            upper_bound: 0,
             block_len: 0,
             init_mem_usage,
             last_mem_usage,

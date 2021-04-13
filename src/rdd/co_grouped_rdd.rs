@@ -344,6 +344,7 @@ where
                             &data,
                             &mut lower,
                             &mut upper,
+                            &upper_bound,
                             block_len,
                             to_set_usage,
                             &captured_vars,
