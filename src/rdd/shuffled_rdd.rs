@@ -159,7 +159,7 @@ where
                 cache_meta,
                 acc_arg.dep_info,
             );
-            let mut is_survivor = spec_call_seq_ptr != 0;
+            let mut is_survivor = spec_call_seq_ptr.is_some();
             let mut to_set_usage = 0;
             while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
                 let wait_now = Instant::now();
@@ -195,7 +195,7 @@ where
                         &captured_vars,
                     );
                     wrapper_spec_execute(
-                        spec_call_seq_ptr, 
+                        &spec_call_seq_ptr, 
                         cache_meta, 
                     );
                     match acc_arg.dep_info.is_shuffle == 0 {
@@ -206,7 +206,7 @@ where
                         .zip(upper_bound.iter())
                         .map(|(l, ub)| std::cmp::min(*l, *ub))
                         .collect::<Vec<_>>();
-                    to_set_usage = match spec_call_seq_ptr == 0 {
+                    to_set_usage = match spec_call_seq_ptr.is_none() {
                         true => mem_usage.0 as usize,
                         false => 0,
                     }

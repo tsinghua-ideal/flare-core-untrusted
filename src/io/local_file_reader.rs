@@ -385,7 +385,7 @@ where
                 cache_meta, 
                 acc_arg.dep_info,
             );
-            let mut is_survivor = spec_call_seq_ptr != 0;
+            let mut is_survivor = spec_call_seq_ptr.is_some();
             let mut cur = 0;
             let mut to_set_usage = 0;
             while cur < len {
@@ -422,14 +422,14 @@ where
                         &captured_vars
                     );
                     wrapper_spec_execute(
-                        spec_call_seq_ptr, 
+                        &spec_call_seq_ptr, 
                         cache_meta, 
                     );
                     match acc_arg.dep_info.is_shuffle == 0 {
                         true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0)))).unwrap(),
                         false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1)))).unwrap(),
                     };
-                    to_set_usage = match spec_call_seq_ptr == 0 {
+                    to_set_usage = match spec_call_seq_ptr.is_none() {
                         true => mem_usage.0 as usize,
                         false => 0,
                     }

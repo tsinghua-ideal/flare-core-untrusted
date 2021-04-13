@@ -104,6 +104,10 @@ extern "C" {
         cache_meta: CacheMeta,
         dep_info: DepInfo,  
     ) -> sgx_status_t;
+    pub fn free_spec_seq(
+        eid: sgx_enclave_id_t,
+        input: *mut u8,
+    ) -> sgx_status_t;
     pub fn spec_execute(
         eid: sgx_enclave_id_t,
         retval: *mut usize,
@@ -390,7 +394,7 @@ pub fn wrapper_exploit_spec_oppty(
     op_ids: &Vec<OpId>,
     cache_meta: CacheMeta,
     dep_info: DepInfo
-) -> usize {
+) -> Option<(Vec<usize>, Vec<OpId>)> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut retval: usize = 0;
     let tid: u64 = thread::current().id().as_u64().into();
@@ -404,20 +408,40 @@ pub fn wrapper_exploit_spec_oppty(
             dep_info,  
         )
     };
-    let _r = match sgx_status {
+    match sgx_status {
         sgx_status_t::SGX_SUCCESS => {},
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    retval   
+    if retval != 0 {
+        let res_ = unsafe{ Box::from_raw(retval as *mut (Vec<usize>, Vec<OpId>)) };
+        let res = res_.clone();
+        forget(res_);
+        let sgx_status = unsafe {
+            free_spec_seq(
+                eid,
+                retval as *mut u8,
+            )
+        };
+        match sgx_status {
+            sgx_status_t::SGX_SUCCESS => {},
+            _ => {
+                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+            },
+        };
+        Some(*res)
+    } else {
+        None
+    }
+
 }
 
 pub fn wrapper_spec_execute(
-    spec_call_seq: usize,
+    spec_call_seq: &Option<(Vec<usize>, Vec<OpId>)>,
     cache_meta: CacheMeta,
 ) {
-    if spec_call_seq == 0 {
+    if spec_call_seq.is_none() {
         println!("no speculative execution");
         return;
     }
@@ -432,7 +456,7 @@ pub fn wrapper_spec_execute(
             eid,
             &mut retval,
             tid, 
-            spec_call_seq,
+            spec_call_seq.as_ref().unwrap() as *const (Vec<usize>, Vec<OpId>) as usize,
             cache_meta,
             &mut hash_ops,
         )
@@ -930,7 +954,7 @@ pub fn secure_compute_cached(
                     cache_meta, 
                     dep_info,
                 );
-                if spec_call_seq_ptr != 0 {
+                if spec_call_seq_ptr.is_some() {
                     is_survivor = true;
                 }
                 cache_meta.set_sub_part_id(sub_part);
@@ -966,7 +990,7 @@ pub fn secure_compute_cached(
                 };
                 let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
                 wrapper_spec_execute(
-                    spec_call_seq_ptr, 
+                    &spec_call_seq_ptr, 
                     cache_meta,
                 );
                 tx.send((sub_part, (result_ptr, (dur_comp, max_mem_usage as f64)))).unwrap();

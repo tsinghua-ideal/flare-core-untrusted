@@ -115,7 +115,7 @@ where
                         cache_meta, 
                         acc_arg.dep_info,
                     );
-                    let mut is_survivor = spec_call_seq_ptr != 0;
+                    let mut is_survivor = spec_call_seq_ptr.is_some();
                     let mut r = rx_un.recv();
                     while r.is_ok() {
                         let (_, (ptr, (time_comp, cur_mem_usage))) = r.unwrap();
@@ -154,7 +154,7 @@ where
                             };
                             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
                             wrapper_spec_execute(
-                                spec_call_seq_ptr, 
+                                &spec_call_seq_ptr, 
                                 cache_meta, 
                             );
                             acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
@@ -223,7 +223,7 @@ where
                             cache_meta, 
                             acc_arg.dep_info,
                         );
-                        let mut is_survivor = spec_call_seq_ptr != 0;
+                        let mut is_survivor = spec_call_seq_ptr.is_some();
                         let mut r = rx_un.recv();
                         while r.is_ok() {
                             let (_, (ptr, (time_comp, cur_mem_usage))) = r.unwrap();
@@ -262,7 +262,7 @@ where
                                 };
                                 let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
                                 wrapper_spec_execute(
-                                    spec_call_seq_ptr, 
+                                    &spec_call_seq_ptr, 
                                     cache_meta,
                                 );
                                 acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
