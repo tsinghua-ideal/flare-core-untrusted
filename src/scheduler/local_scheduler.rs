@@ -274,7 +274,10 @@ impl LocalScheduler {
     ) where
         F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
     {
+        let now = Instant::now();
         let des_task: TaskOption = bincode::deserialize(&task).unwrap();
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("local_scheduler deserialize task time: {:?} s", dur);
         let result = des_task.run(attempt_id);
         match des_task {
             TaskOption::ResultTask(tsk) => {
@@ -345,7 +348,10 @@ impl NativeScheduler for LocalScheduler {
         log::debug!("inside submit task");
         let my_attempt_id = self.attempt_id.fetch_add(1, Ordering::SeqCst);
         let event_queues = self.event_queues.clone();
+        let now = Instant::now();
         let task = bincode::serialize(&task).unwrap();
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("local_scheduler serialize task time: {:?} s", dur);
 
         tokio::task::spawn_blocking(move || {
             LocalScheduler::run_task::<T, TE, U, F>(event_queues, task, id_in_job, my_attempt_id)

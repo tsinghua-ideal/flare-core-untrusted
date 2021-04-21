@@ -603,6 +603,7 @@ where
 
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
+        let now = Instant::now();
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;
         let host = split.host;
@@ -613,6 +614,8 @@ where
             .flatten()   //Vec<Vec<u8>>, ser_enc_data
             .flat_map(|ser| self.sec_decoder.as_ref().unwrap()(ser).into_iter())
             .collect::<Vec<_>>(); //enc_data
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("io time: {:?} s", dur);
         self.secure_compute_(data, acc_arg, tx)
     }
 }

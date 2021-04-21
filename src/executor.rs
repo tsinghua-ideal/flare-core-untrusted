@@ -155,6 +155,8 @@ impl Executor {
             );
             let start = Instant::now();
             let result = bincode::serialize(&result)?;
+            let dur = start.elapsed().as_nanos() as f64 * 1e-9;
+            println!("executore serialize task result time: {:?} s", dur);
             log::debug!(
                 "time taken @{} executor serializing task #{} result of size {} bytes: {}ms",
                 self.port,
@@ -366,12 +368,13 @@ mod tests {
                         capnp::serialize::read_message(&mut stream, CAPNP_BUF_READ_OPTS)
                     {
                         let task_data = res.get_root::<serialized_data::Reader>().unwrap();
-
+                        let now = Instant::now();
                         match bincode::deserialize::<TaskResult>(&*task_data.get_msg().unwrap())? {
                             TaskResult::ResultTask(_) => {}
                             _ => return Err(Error::DowncastFailure("incorrect task result")),
                         }
-
+                        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                        println!("executor deserialize task result time: {:?} s", dur);
                         let mut signal_handler = connect_to_executor(port, true)?;
                         send_shutdown_signal_msg(&mut signal_handler)?;
                         return Ok(());

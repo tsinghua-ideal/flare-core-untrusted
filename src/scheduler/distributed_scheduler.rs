@@ -316,7 +316,11 @@ impl DistributedScheduler {
                 task_data.get_msg().unwrap().len(),
                 target_port
             );
-            bincode::deserialize(&task_data.get_msg().unwrap()).unwrap()
+            let now = Instant::now();
+            let res = bincode::deserialize(&task_data.get_msg().unwrap()).unwrap();
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("distributed_scheduler deserialize task time: {:?} s", dur);
+            res
         };
 
         match task {
@@ -400,7 +404,10 @@ impl NativeScheduler for DistributedScheduler {
                         let (reader, writer) = stream.split();
                         let reader = reader.compat();
                         let writer = writer.compat_write();
+                        let now = Instant::now();
                         let task_bytes = bincode::serialize(&task).unwrap();
+                        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                        println!("distributed_scheduler serialize task time: {:?} s", dur);
                         log::debug!(
                             "sending task #{} of {} bytes to exec @{},",
                             task.get_task_id(),
