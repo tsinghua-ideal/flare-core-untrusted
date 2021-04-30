@@ -311,6 +311,7 @@ where
                         Arc::new(atomic::AtomicUsize::new(1)),
                         Arc::new(atomic::AtomicUsize::new(0)),
                         Arc::new(atomic::AtomicBool::new(false)),
+                        0,
                     );
                     STAGE_LOCK.get_stage_lock((dep_info.child_rdd_id, dep_info.parent_rdd_id));
                     let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
@@ -319,9 +320,9 @@ where
                         .map(|_| Vec::new())
                         .collect::<Vec<_>>();
                     let mut slopes = Vec::new();
-                    for (_, (block_ptr, (time_comp, max_mem_usage))) in rx { 
+                    for (_, (block_ptr, (time_comp, max_mem_usage, acc_captured_size))) in rx { 
                         let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num());
+                        dynamic_subpart_meta(time_comp, max_mem_usage - acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num());
                         acc_arg.free_enclave_lock();
                         for (i, bucket) in buckets_bl.into_iter().enumerate() {
                             buckets[i].push(bucket); 

@@ -364,7 +364,7 @@ where
         }
     }
 
-    fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let len = data.len();
         let cur_rdd_id = self.id;
         let cur_op_id = self.op_id;
@@ -427,8 +427,8 @@ where
                         cache_meta, 
                     );
                     match acc_arg.dep_info.is_shuffle == 0 {
-                        true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0)))).unwrap(),
-                        false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1)))).unwrap(),
+                        true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0, acc_arg.acc_captured_size)))).unwrap(),
+                        false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1, acc_arg.acc_captured_size)))).unwrap(),
                     };
                     to_set_usage = match spec_call_seq_ptr.is_none() {
                         true => mem_usage.0 as usize,
@@ -492,7 +492,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             true
         }
 
-        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
             self.secure_compute(split, acc_arg, tx)
         }
 
@@ -601,7 +601,7 @@ where
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let now = Instant::now();
         let files_by_part = self.load_local_files()?;
@@ -641,7 +641,7 @@ where
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<FileReader>().unwrap();
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;

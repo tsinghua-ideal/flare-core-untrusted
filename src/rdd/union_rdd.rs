@@ -81,7 +81,7 @@ where
         UnionRdd(UnionVariants::new(rdds))
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         match &self.0 {
             NonUniquePartitioner { rdds, .. } => {
@@ -100,6 +100,7 @@ where
                     acc_arg.block_len.clone(),
                     acc_arg.cur_usage.clone(),
                     acc_arg.fresh_slope.clone(),
+                    acc_arg.acc_captured_size,
                 );
                 let handle_uns = parent.secure_compute(split, &mut acc_arg_un, tx_un.clone())?; 
                 
@@ -119,7 +120,7 @@ where
                     let mut is_survivor = spec_call_seq_ptr.is_some();
                     let mut r = rx_un.recv();
                     while r.is_ok() {
-                        let (_, (ptr, (time_comp, cur_mem_usage))) = r.unwrap();
+                        let (_, (ptr, (time_comp, cur_mem_usage, acc_captured_size))) = r.unwrap();
                         //The last connected one will survive in cache
                         let r_next = rx_un.try_recv();
                         is_survivor = is_survivor || r_next == Err(TryRecvError::Disconnected);
@@ -159,8 +160,8 @@ where
                             );
                             acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
                             match acc_arg.dep_info.is_shuffle == 0 {
-                                true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, last_mem_usage as f64)))).unwrap(),
-                                false => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, max_mem_usage as f64)))).unwrap(),
+                                true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, last_mem_usage as f64, acc_captured_size)))).unwrap(),
+                                false => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, max_mem_usage as f64, acc_captured_size)))).unwrap(),
                             };
                         }
                         sub_part_id += 1;
@@ -211,7 +212,8 @@ where
                             acc_arg.eenter_lock.clone(),
                             block_len,
                             cur_usage, 
-                            fresh_slope
+                            fresh_slope,
+                            acc_arg.acc_captured_size,
                         );
                         let handle_uns = rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un).unwrap();
                         let tid: u64 = thread::current().id().as_u64().into();
@@ -227,7 +229,7 @@ where
                         let mut is_survivor = spec_call_seq_ptr.is_some();
                         let mut r = rx_un.recv();
                         while r.is_ok() {
-                            let (_, (ptr, (time_comp, cur_mem_usage))) = r.unwrap();
+                            let (_, (ptr, (time_comp, cur_mem_usage, acc_captured_size))) = r.unwrap();
                             //The last connected one will survive in cache
                             let r_next = rx_un.try_recv();
                             is_survivor = is_survivor || (r_next == Err(TryRecvError::Disconnected) && idx == last_idx);
@@ -267,8 +269,8 @@ where
                                 );
                                 acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
                                 match acc_arg.dep_info.is_shuffle == 0 {
-                                    true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, last_mem_usage as f64)))).unwrap(),
-                                    false => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, max_mem_usage as f64)))).unwrap(),
+                                    true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, last_mem_usage as f64, acc_captured_size)))).unwrap(),
+                                    false => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, max_mem_usage as f64, acc_captured_size)))).unwrap(),
                                 };
                             }
                             sub_part_id += 1;
@@ -594,7 +596,7 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -650,7 +652,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_split_num = self.number_of_splits();

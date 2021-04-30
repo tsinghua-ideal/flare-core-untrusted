@@ -116,7 +116,7 @@ where
         }
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
         let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
         let bucket: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?.into_iter().filter(|sub_part| sub_part.len() > 0).collect();  // bucket per subpartition
@@ -200,8 +200,8 @@ where
                         cache_meta, 
                     );
                     match acc_arg.dep_info.is_shuffle == 0 {
-                        true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0)))).unwrap(),
-                        false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1)))).unwrap(),
+                        true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0, acc_arg.acc_captured_size)))).unwrap(),
+                        false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1, acc_arg.acc_captured_size)))).unwrap(),
                     };
                     lower = lower.iter()
                         .zip(upper_bound.iter())
@@ -308,7 +308,7 @@ where
         Some(self.part.clone())
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -366,7 +366,7 @@ where
             combiners.into_iter().map(|(k, v)| (k, v.unwrap())),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_split_num = self.number_of_splits();

@@ -138,7 +138,7 @@ where
         }
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
             let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let mut deps = split.clone().deps;
@@ -155,15 +155,16 @@ where
                         Arc::new(AtomicBool::new(false)),
                         Arc::new(AtomicUsize::new(1)), 
                         Arc::new(AtomicUsize::new(0)), 
-                        Arc::new(AtomicBool::new(false))
+                        Arc::new(AtomicBool::new(false)),
+                        0,
                     );
                     let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     let mut slopes = Vec::new();
                     let mut kv_0 = Vec::new();
-                    for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
+                    for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
+                        dynamic_subpart_meta(time_comp, max_mem_usage - acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
@@ -231,15 +232,16 @@ where
                         Arc::new(AtomicBool::new(false)),
                         Arc::new(AtomicUsize::new(1)), 
                         Arc::new(AtomicUsize::new(0)), 
-                        Arc::new(AtomicBool::new(false))
+                        Arc::new(AtomicBool::new(false)),
+                        0,
                     );
                     let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     let mut slopes = Vec::new();
                     let mut kw_0 = Vec::new();
-                    for (sub_part_id, (received, (time_comp, max_mem_usage))) in rx {
+                    for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
+                        dynamic_subpart_meta(time_comp, max_mem_usage - acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
@@ -354,8 +356,8 @@ where
                             cache_meta,
                         );
                         match acc_arg.dep_info.is_shuffle == 0 {
-                            true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0)))).unwrap(),
-                            false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1)))).unwrap(),
+                            true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0, acc_arg.acc_captured_size)))).unwrap(),
+                            false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1, acc_arg.acc_captured_size)))).unwrap(),
                         };
                         lower = lower.iter()
                             .zip(upper_bound.iter())
@@ -539,7 +541,7 @@ where
         Some(part)
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -650,7 +652,7 @@ where
         }
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_split_num = self.number_of_splits();
