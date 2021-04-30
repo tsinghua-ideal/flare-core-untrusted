@@ -111,7 +111,8 @@ where
                     let mut sub_part_id = 0;
                     let mut cache_meta = acc_arg.to_cache_meta();
                     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                        &acc_arg.op_ids, 
+                        &acc_arg.op_ids,
+                        &acc_arg.split_nums,
                         cache_meta, 
                         acc_arg.dep_info,
                     );
@@ -138,8 +139,7 @@ where
                                     &mut result_bl_ptr,
                                     tid,
                                     &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
-                                    &acc_arg.op_ids as *const Vec<OpId> as *const u8, 
-                                    &acc_arg.split_nums as *const Vec<usize> as *const u8,
+                                    &acc_arg.op_ids as *const Vec<OpId> as *const u8,
                                     cache_meta,
                                     acc_arg.dep_info, 
                                     input, 
@@ -219,7 +219,8 @@ where
                         let mut sub_part_id = 0;
                         let mut cache_meta = acc_arg.to_cache_meta();
                         let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                            &acc_arg.op_ids, 
+                            &acc_arg.op_ids,
+                            &acc_arg.split_nums,
                             cache_meta, 
                             acc_arg.dep_info,
                         );
@@ -247,7 +248,6 @@ where
                                         tid,
                                         &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
                                         &acc_arg.op_ids as *const Vec<OpId> as *const u8, 
-                                        &acc_arg.split_nums as *const Vec<usize> as *const u8,
                                         cache_meta,
                                         acc_arg.dep_info, 
                                         input, 

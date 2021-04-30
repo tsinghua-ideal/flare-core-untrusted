@@ -82,7 +82,6 @@ extern "C" {
         tid: u64,
         rdd_ids: *const u8,
         op_ids: *const u8,
-        part_nums: *const u8,
         cache_meta: CacheMeta,
         dep_info: DepInfo,
         input: Input,
@@ -101,6 +100,7 @@ extern "C" {
         retval: *mut usize,
         tid: u64, 
         op_ids: *const u8,
+        part_nums: *const u8,
         cache_meta: CacheMeta,
         dep_info: DepInfo,  
     ) -> sgx_status_t;
@@ -231,7 +231,6 @@ pub fn default_hash<T: Hash>(t: &T) -> u64 {
 pub fn wrapper_secure_execute<T>(
     rdd_ids: &Vec<usize>, 
     op_ids: &Vec<OpId>,
-    split_nums: &Vec<usize>,
     cache_meta: CacheMeta,
     dep_info: DepInfo, 
     data: &T,
@@ -260,7 +259,6 @@ where
             tid,
             rdd_ids as *const Vec<usize> as *const u8,
             op_ids as *const Vec<OpId> as *const u8,
-            split_nums as *const Vec<usize> as *const u8,
             cache_meta,
             dep_info,
             input,
@@ -394,6 +392,7 @@ pub fn wrapper_pre_merge<T: Data>(
 
 pub fn wrapper_exploit_spec_oppty(
     op_ids: &Vec<OpId>,
+    split_nums: &Vec<usize>,
     cache_meta: CacheMeta,
     dep_info: DepInfo
 ) -> Option<(Vec<usize>, Vec<OpId>)> {
@@ -406,6 +405,7 @@ pub fn wrapper_exploit_spec_oppty(
             &mut retval,
             tid,
             op_ids as *const Vec<OpId> as *const u8,
+            split_nums as *const Vec<usize> as *const u8,
             cache_meta,
             dep_info,  
         )
@@ -483,13 +483,12 @@ pub fn wrapper_spec_execute(
     env::SPEC_SHUFFLE_CACHE.insert(key, vec![*res]);
 }
 
-pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, split_num: usize) -> usize {
+pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId) -> usize {
     let now = Instant::now();
     let tid: u64 = thread::current().id().as_u64().into();
     let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
     let rdd_ids = vec![rdd_id];
     let op_ids = vec![op_id];
-    let split_nums = vec![split_num];
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut init_mem_usage = 0;
     let mut last_mem_usage = 0;
@@ -503,7 +502,6 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, split_n
             tid,
             &rdd_ids as *const Vec<usize> as *const u8,
             &op_ids as *const Vec<OpId> as *const u8,
-            &split_nums as *const Vec<usize> as *const u8,
             Default::default(),  //meaningless
             DepInfo::padding_new(3),   //3 is for reduce & fold & aggregate
             input,
@@ -953,6 +951,7 @@ pub fn secure_compute_cached(
                 //No need to get memory usage, for the sub-partition is fixed when using cached data
                 let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
                     &op_ids, 
+                    &split_nums,
                     cache_meta, 
                     dep_info,
                 );
@@ -976,8 +975,7 @@ pub fn secure_compute_cached(
                         &mut result_ptr,
                         tid,
                         &rdd_ids as *const Vec<usize> as *const u8,
-                        &op_ids as *const Vec<OpId> as *const u8, 
-                        &split_nums as *const Vec<usize> as *const u8,
+                        &op_ids as *const Vec<OpId> as *const u8,
                         cache_meta,
                         dep_info,   
                         Input::padding(&mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage), //invalid pointer
@@ -1932,7 +1930,7 @@ pub trait RddE: Rdd {
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<Self::ItemE>>();
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id());
         let temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
             DepInfo::padding_new(3), 
@@ -2002,7 +2000,7 @@ pub trait RddE: Rdd {
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<Self::ItemE>>();
        
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id());
         let mut temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
             DepInfo::padding_new(3), 
@@ -2067,7 +2065,7 @@ pub trait RddE: Rdd {
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<_>>();
        
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id());
         let mut temp = get_encrypted_data::<UE>(
             self.get_op_id(), 
             DepInfo::padding_new(3), 
@@ -2249,7 +2247,7 @@ pub trait RddE: Rdd {
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
         let data = self.get_context().run_job(self.get_rdde(), cl)?
             .into_iter().flatten().collect::<Vec<_>>();
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id(), self.number_of_splits());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id());
         /*
         let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 3, result_ptr as *mut u8);
         //temp only contains one element

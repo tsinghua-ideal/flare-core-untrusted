@@ -86,6 +86,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
             let mut cache_meta = acc_arg.to_cache_meta();
             let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
                 &acc_arg.op_ids,
+                &acc_arg.split_nums,
                 cache_meta, 
                 acc_arg.dep_info,
             );
@@ -117,7 +118,6 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
                         &acc_arg.rdd_ids,
                         &acc_arg.op_ids,
-                        &acc_arg.split_nums,
                         cache_meta,
                         acc_arg.dep_info,
                         &data,
