@@ -301,6 +301,7 @@ where
                 },
                 None => {
                     let split = rdd_base.splits()[partition].clone();
+                    let now = Instant::now();
                     log::debug!("split index: {}", split.get_index());
                     let (tx, rx) = mpsc::sync_channel(0);
                     let dep_info = self.get_dep_info();
@@ -331,6 +332,8 @@ where
                     for handle in handles {
                         handle.join().unwrap();
                     }
+                    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+                    log::info!("in dependency, shuffle write {:?}", dur);
                     STAGE_LOCK.free_stage_lock();
                     for (i, bucket) in buckets.into_iter().enumerate() {
                         let ser_bytes = bincode::serialize(&bucket).unwrap();

@@ -370,6 +370,7 @@ pub fn wrapper_pre_merge<T: Data>(
         }
         vec![result]
     }
+    /*
     let now = Instant::now();
     let mut n = data.len();
     let mut r = Vec::new();
@@ -387,6 +388,7 @@ pub fn wrapper_pre_merge<T: Data>(
     }
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("pre_merge took {:?}s", dur);
+    */
     data
 }
 
