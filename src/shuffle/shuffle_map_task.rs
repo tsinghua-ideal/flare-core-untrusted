@@ -83,7 +83,7 @@ impl Task for ShuffleMapTask {
     fn run(&self, _id: usize) -> SerBox<dyn AnyData> {
         let dep_info = self.dep.get_dep_info();
         let rdd_base = self.dep.get_rdd_base();
-        let rdd_id_pair = (dep_info.child_rdd_id, dep_info.parent_rdd_id);
+        let rdd_id_pair = (dep_info.child_rdd_id, dep_info.parent_rdd_id, dep_info.identifier);
         STAGE_LOCK.insert_stage(rdd_id_pair, self.task_id);
         STAGE_LOCK.set_num_splits(rdd_id_pair, rdd_base.number_of_splits());
         let res = SerBox::new(self.dep.do_shuffle_task(rdd_base, self.partition))

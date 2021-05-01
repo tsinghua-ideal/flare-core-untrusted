@@ -156,7 +156,7 @@ where
                             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
                             wrapper_spec_execute(
                                 &spec_call_seq_ptr, 
-                                cache_meta, 
+                                cache_meta,
                             );
                             acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
                             match acc_arg.dep_info.is_shuffle == 0 {

@@ -24,8 +24,8 @@ use sgx_urts::SgxEnclave;
 
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
 type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
-/// The key is: {parent_rdd_id}/{parent_op_id}/{child_rdd_id}/{child_op_id}/{input_id(part_id)}
-type SpecShuffleCache =  Arc<DashMap<(u64, usize), Vec<Vec<Vec<u8>>> >>;
+/// The key is: {op_ids}/{input_id(part_id)}/{identifier}
+type SpecShuffleCache =  Arc<DashMap<(u64, usize, usize), Vec<Vec<Vec<u8>>> >>;
 
 
 const ENV_VAR_PREFIX: &str = "VEGA_";

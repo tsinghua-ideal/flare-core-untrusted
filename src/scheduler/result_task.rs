@@ -157,8 +157,8 @@ where
     fn run(&self, id: usize) -> SerBox<dyn AnyData> {
         log::debug!("resulttask runs");
         let rdd_id = self.rdd.get_rdd_id();
-        STAGE_LOCK.insert_stage((rdd_id, rdd_id), self.task_id);
-        STAGE_LOCK.set_num_splits((rdd_id, rdd_id), self.rdd.number_of_splits());
+        STAGE_LOCK.insert_stage((rdd_id, rdd_id, 0), self.task_id);
+        STAGE_LOCK.set_num_splits((rdd_id, rdd_id, 0), self.rdd.number_of_splits());
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
 
@@ -186,7 +186,7 @@ where
 
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("result_task {:?}s", dur);
-        STAGE_LOCK.remove_stage((rdd_id, rdd_id), self.task_id);
+        STAGE_LOCK.remove_stage((rdd_id, rdd_id, 0), self.task_id);
         res
     }
 }

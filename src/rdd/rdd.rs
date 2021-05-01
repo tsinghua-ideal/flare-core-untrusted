@@ -102,7 +102,8 @@ extern "C" {
         op_ids: *const u8,
         part_nums: *const u8,
         cache_meta: CacheMeta,
-        dep_info: DepInfo,  
+        dep_info: DepInfo,
+        spec_identifier: *mut usize,  
     ) -> sgx_status_t;
     pub fn free_spec_seq(
         eid: sgx_enclave_id_t,
@@ -397,9 +398,10 @@ pub fn wrapper_exploit_spec_oppty(
     split_nums: &Vec<usize>,
     cache_meta: CacheMeta,
     dep_info: DepInfo
-) -> Option<(Vec<usize>, Vec<OpId>)> {
+) -> Option<((Vec<usize>, Vec<OpId>), usize)> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut retval: usize = 0;
+    let mut spec_identifier = 0;
     let tid: u64 = thread::current().id().as_u64().into();
     let sgx_status = unsafe {
         exploit_spec_oppty(
@@ -409,7 +411,8 @@ pub fn wrapper_exploit_spec_oppty(
             op_ids as *const Vec<OpId> as *const u8,
             split_nums as *const Vec<usize> as *const u8,
             cache_meta,
-            dep_info,  
+            dep_info,
+            &mut spec_identifier
         )
     };
     match sgx_status {
@@ -434,7 +437,7 @@ pub fn wrapper_exploit_spec_oppty(
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
             },
         };
-        Some(*res)
+        Some((*res, spec_identifier))
     } else {
         None
     }
@@ -442,7 +445,7 @@ pub fn wrapper_exploit_spec_oppty(
 }
 
 pub fn wrapper_spec_execute(
-    spec_call_seq: &Option<(Vec<usize>, Vec<OpId>)>,
+    spec_call_seq: &Option<((Vec<usize>, Vec<OpId>), usize)>,
     cache_meta: CacheMeta,
 ) {
     if spec_call_seq.is_none() {
@@ -460,7 +463,7 @@ pub fn wrapper_spec_execute(
             eid,
             &mut retval,
             tid, 
-            spec_call_seq.as_ref().unwrap() as *const (Vec<usize>, Vec<OpId>) as usize,
+            &spec_call_seq.as_ref().unwrap().0 as *const (Vec<usize>, Vec<OpId>) as usize,
             cache_meta,
             &mut hash_ops,
         )
@@ -476,6 +479,7 @@ pub fn wrapper_spec_execute(
     let key = (
         hash_ops,
         cache_meta.part_id,
+        spec_call_seq.as_ref().unwrap().1,
     );
 
     if let Some(mut value) = env::SPEC_SHUFFLE_CACHE.get_mut(&key) {
@@ -995,6 +999,7 @@ pub fn secure_compute_cached(
                 wrapper_spec_execute(
                     &spec_call_seq_ptr, 
                     cache_meta,
+                    
                 );
                 tx.send((sub_part, (result_ptr, (dur_comp, max_mem_usage as f64, acc_captured_size)))).unwrap();
             }
@@ -1283,14 +1288,14 @@ pub struct StageLock {
     slock: AtomicBool,
     lock_holder_info: RwLock<LockHolderInfo>,
     //For result task, key.0 == key.1
-    //For shuffle task, key.0 > key.1, key.0 is child rdd id and key.1 is parent rdd id 
-    waiting_list: RwLock<BTreeMap<(usize, usize), Vec<usize>>>,
-    num_splits_mapping: RwLock<BTreeMap<(usize, usize), usize>>,
+    //For shuffle task, key.0 > key.1, key.0 is child rdd id and key.1 is parent rdd id, key.2 is identifier
+    waiting_list: RwLock<BTreeMap<(usize, usize, usize), Vec<usize>>>,
+    num_splits_mapping: RwLock<BTreeMap<(usize, usize, usize), usize>>,
 }
 
 #[derive(Debug)]
 pub struct LockHolderInfo {
-    cur_holder: (usize, usize),
+    cur_holder: (usize, usize, usize),
     num_cur_holders: usize,
     max_cur_holders: usize,
 }
@@ -1300,7 +1305,7 @@ impl StageLock {
         StageLock {
             slock: AtomicBool::new(false),
             lock_holder_info: RwLock::new(LockHolderInfo {
-                cur_holder: (0, 0),
+                cur_holder: (0, 0, 0),
                 num_cur_holders: 0,
                 max_cur_holders: 20,
             }),
@@ -1309,12 +1314,12 @@ impl StageLock {
         }
     }
     
-    pub fn insert_stage(&self, rdd_id_pair: (usize, usize), task_id: usize) {
+    pub fn insert_stage(&self, rdd_id_pair: (usize, usize, usize), task_id: usize) {
         let mut waiting_list = self.waiting_list.write().unwrap();
         waiting_list.entry(rdd_id_pair).or_insert(vec![]).push(task_id);
     }
 
-    pub fn remove_stage(&self, rdd_id_pair: (usize, usize), task_id: usize) {
+    pub fn remove_stage(&self, rdd_id_pair: (usize, usize, usize), task_id: usize) {
         let mut waiting_list = self.waiting_list.write().unwrap();
         let mut remaining = 0;
         if let Some(task_ids) = waiting_list.get_mut(&rdd_id_pair) {
@@ -1329,7 +1334,7 @@ impl StageLock {
         }
     }
 
-    pub fn set_num_splits(&self, rdd_id_pair: (usize, usize), num_splits: usize) {
+    pub fn set_num_splits(&self, rdd_id_pair: (usize, usize, usize), num_splits: usize) {
         let mut num_splits_mapping = self.num_splits_mapping.write().unwrap();
         num_splits_mapping.insert(rdd_id_pair, num_splits);
     }
@@ -1343,7 +1348,7 @@ impl StageLock {
         )
     }
 
-    pub fn get_stage_lock(&self, cur_rdd_id_pair: (usize, usize)) {
+    pub fn get_stage_lock(&self, cur_rdd_id_pair: (usize, usize, usize)) {
         use atomic::Ordering::SeqCst;
         let mut flag = true;
         while flag {
@@ -1759,7 +1764,7 @@ pub trait RddE: Rdd {
             Arc::new(AtomicUsize::new(0)), 
             Arc::new(AtomicBool::new(false)),
             0);
-        STAGE_LOCK.get_stage_lock((rdd_id, rdd_id));
+        STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
@@ -3274,33 +3279,33 @@ pub trait RddE: Rdd {
 
     /// Creates tuples of the elements in this RDD by applying `f`.
     #[track_caller]
-    fn key_by<T, F>(&self, func: F) -> SerArc<dyn RddE<Item = (Self::Item, T), ItemE = (Self::ItemE, Vec<u8>)>>
+    fn key_by<T, F>(&self, func: F) -> SerArc<dyn RddE<Item = (T, Self::Item), ItemE = (Vec<u8>, Self::ItemE)>>
     where
         Self: Sized,
         T: Data,
         F: SerFunc(&Self::Item) -> T,
     {
         let fe = self.get_fe();
-        let fe_wrapper_mp = Fn!(move |v: Vec<(Self::Item, T)>| {
+        let fe_wrapper_mp = Fn!(move |v: Vec<(T, Self::Item)>| {
             let len = v.len();
-            let (vx, vy): (Vec<Self::Item>, Vec<T>) = v.into_iter().unzip();
-            let ct_x = (fe)(vx);
-            let ct_y = ser_encrypt(vy);
+            let (vx, vy): (Vec<T>, Vec<Self::Item>) = v.into_iter().unzip();
+            let ct_x = ser_encrypt(vx);
+            let ct_y = (fe)(vy);
             (ct_x, ct_y)
         });
 
         let fd = self.get_fd();
-        let fd_wrapper_mp = Fn!(move |v: (Self::ItemE, Vec<u8>)| {
+        let fd_wrapper_mp = Fn!(move |v: (Vec<u8>, Self::ItemE)| {
             let (vx, vy) = v;
-            let pt_x = (fd)(vx);
-            let pt_y: Vec<T> = ser_decrypt(vy);
+            let pt_x: Vec<T> = ser_decrypt(vx);
+            let pt_y = (fd)(vy);
             assert_eq!(pt_x.len(), pt_y.len());
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
        
-        self.map(Fn!(move |k: Self::Item| -> (Self::Item, T) {
+        self.map(Fn!(move |k: Self::Item| -> (T, Self::Item) {
             let t = (func)(&k);
-            (k, t)
+            (t, k)
         }), fe_wrapper_mp, fd_wrapper_mp)
     }
 

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DepInfo {
     pub is_shuffle: u8,
-    identifier: usize,
+    pub identifier: usize,
     pub parent_rdd_id: usize,
     pub child_rdd_id: usize, 
     parent_op_id: OpId,
@@ -271,14 +271,18 @@ where
             let mut op_ids = vec![self.child_op_id]; 
             rdd_base.get_op_ids(&mut op_ids);
             let hash_ops = default_hash(&op_ids);
+            let dep_info = self.get_dep_info();
             let key = (
                 hash_ops,
                 partition,
+                dep_info.identifier
             );
+            STAGE_LOCK.get_stage_lock((dep_info.child_rdd_id, dep_info.parent_rdd_id, dep_info.identifier));
             //remove after get, otherwise it will causes the accumulation
             let res = env::SPEC_SHUFFLE_CACHE.remove(&key);
             match res {
                 Some((_key, item)) => {
+                    STAGE_LOCK.free_stage_lock();
                     let mut ser_result = HashMap::new();
                     let mut acc_header = HashMap::new();
                     for (_sub_part_id, buckets) in item.into_iter().enumerate() {
@@ -304,7 +308,6 @@ where
                     let now = Instant::now();
                     log::debug!("split index: {}", split.get_index());
                     let (tx, rx) = mpsc::sync_channel(0);
-                    let dep_info = self.get_dep_info();
                     let mut acc_arg = AccArg::new(partition, 
                         dep_info, 
                         Some(self.partitioner.get_num_of_partitions()), 
@@ -314,7 +317,6 @@ where
                         Arc::new(atomic::AtomicBool::new(false)),
                         0,
                     );
-                    STAGE_LOCK.get_stage_lock((dep_info.child_rdd_id, dep_info.parent_rdd_id));
                     let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
                     let num_output_splits = self.partitioner.get_num_of_partitions();
                     let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)

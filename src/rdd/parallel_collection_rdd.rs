@@ -130,7 +130,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     );
                     wrapper_spec_execute(
                         &spec_call_seq_ptr, 
-                        cache_meta, 
+                        cache_meta,
                     );
                     match acc_arg.dep_info.is_shuffle == 0 {
                         true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0, acc_arg.acc_captured_size)))).unwrap(),
