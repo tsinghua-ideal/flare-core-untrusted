@@ -309,6 +309,7 @@ pub fn dynamic_subpart_meta(
             block_len = (block_len + 1) / 2;
         }
     }
+    //block_len = 1; //mark
     println!("tid: {:?}, limit_per_partition {:?}B, block_len: {:?}", tid, limit_per_partition, block_len);
     block_len_.store(block_len, atomic::Ordering::SeqCst);
 }
@@ -437,6 +438,7 @@ pub fn wrapper_exploit_spec_oppty(
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
             },
         };
+        //return None;   //test non-spec case
         Some((*res, spec_identifier))
     } else {
         None
