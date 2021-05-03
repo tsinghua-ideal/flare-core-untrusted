@@ -34,7 +34,6 @@ static CONF: OnceCell<Configuration> = OnceCell::new();
 static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);
 
-pub(crate) static ADDR_MAP_LEN: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
 pub(crate) static SHUFFLE_CACHE: Lazy<ShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
 pub(crate) static SPEC_SHUFFLE_CACHE: Lazy<SpecShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
 pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(BoundedMemoryCache::new);
@@ -68,7 +67,6 @@ pub(crate) struct Env {
     pub cache_tracker: Arc<CacheTracker>,
     pub enclave: Arc<Mutex<Option<SgxEnclave>>>,
     pub enclave_path: PathBuf,
-    pub captured_vars: Arc<Mutex<HashMap<usize, Vec<Vec<u8>>>>>,
 }
 
 impl Env {
@@ -114,7 +112,6 @@ impl Env {
             let hosts = Hosts::get()
                 .expect("fatal error: failed loading host file");
             let master_addr = hosts.master;
-            ADDR_MAP_LEN.store(hosts.slaves.len(), Ordering::SeqCst);
             let map_output_tracker = MapOutputTracker::new(conf.is_driver, master_addr);
             let shuffle_manager =
                 ShuffleManager::new().expect("fatal error: failed creating shuffle manager");
@@ -150,7 +147,6 @@ impl Env {
                 .expect("fatal error: failed creating cache tracker"),
                 enclave,
                 enclave_path,
-                captured_vars: Arc::new(Mutex::new(HashMap::new()))
             }
         })
     }

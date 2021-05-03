@@ -474,14 +474,12 @@ where
         acc_arg.insert_rdd_id(cur_rdd_id);
         acc_arg.insert_op_id(cur_op_id);
         acc_arg.insert_split_num(cur_split_num);
-        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
                 cur_rdd_id, 
                 tx.clone(),
-                captured_vars,
             );
 
             if !acc_arg.totally_cached() {
@@ -703,19 +701,14 @@ where
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             acc_arg.acc_captured_size += captured_vars.get_size();
-            Env::get().captured_vars
-                .lock()
-                .unwrap()
-                .insert(cur_rdd_id, captured_vars);
+            acc_arg.captured_vars.insert(cur_rdd_id, captured_vars);
         }
-        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
                 cur_rdd_id, 
                 tx.clone(),
-                captured_vars,
             );
 
             if !acc_arg.totally_cached() {
@@ -940,19 +933,14 @@ where
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             acc_arg.acc_captured_size += captured_vars.get_size();
-            Env::get().captured_vars
-                .lock()
-                .unwrap()
-                .insert(cur_rdd_id, captured_vars);
+            acc_arg.captured_vars.insert(cur_rdd_id, captured_vars);
         }
-        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
                 cur_rdd_id, 
                 tx.clone(),
-                captured_vars,
             );
 
             if !acc_arg.totally_cached() {

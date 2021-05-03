@@ -107,7 +107,6 @@ where
                 let acc_arg = acc_arg.clone();
                 let handle = std::thread::spawn(move || {
                     let tid: u64 = thread::current().id().as_u64().into();
-                    let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
                     
                     let mut sub_part_id = 0;
                     let mut cache_meta = acc_arg.to_cache_meta();
@@ -144,7 +143,7 @@ where
                                     cache_meta,
                                     acc_arg.dep_info, 
                                     input, 
-                                    &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
+                                    &acc_arg.captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                                 )
                             };
                             match sgx_status {
@@ -217,7 +216,6 @@ where
                         );
                         let handle_uns = rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un).unwrap();
                         let tid: u64 = thread::current().id().as_u64().into();
-                        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
                         let mut sub_part_id = 0;
                         let mut cache_meta = acc_arg.to_cache_meta();
                         let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
@@ -253,7 +251,7 @@ where
                                         cache_meta,
                                         acc_arg.dep_info, 
                                         input, 
-                                        &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
+                                        &acc_arg.captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                                     )
                                 };
                                 match sgx_status {
@@ -660,14 +658,12 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
         acc_arg.insert_op_id(cur_op_id);
         acc_arg.insert_split_num(cur_split_num);
         
-        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
                 cur_rdd_id, 
                 tx.clone(),
-                captured_vars,
             );
 
             if !acc_arg.totally_cached() {

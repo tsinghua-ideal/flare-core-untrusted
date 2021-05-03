@@ -140,7 +140,6 @@ where
 
     fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
-            let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
             let mut deps = split.clone().deps;
             let mut num_sub_part = vec![0, 0]; //kv, kw
             let mut upper_bound = Vec::new();
@@ -349,7 +348,7 @@ where
                             &upper_bound,
                             block_len,
                             to_set_usage,
-                            &captured_vars,
+                            &acc_arg.captured_vars,
                         );
                         wrapper_spec_execute(
                             &spec_call_seq_ptr, 
@@ -660,14 +659,12 @@ where
         acc_arg.insert_op_id(cur_op_id);
         acc_arg.insert_split_num(cur_split_num);
 
-        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
                 cur_rdd_id, 
                 tx.clone(),
-                captured_vars,
             );
 
             if !acc_arg.totally_cached() {

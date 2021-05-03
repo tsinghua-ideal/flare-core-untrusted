@@ -218,11 +218,6 @@ pub unsafe extern "C" fn ocall_cache_from_outside(rdd_id: usize,
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ocall_get_addr_map_len() -> usize {
-    env::ADDR_MAP_LEN.load(atomic::Ordering::SeqCst)
-}
-
 pub fn default_hash<T: Hash>(t: &T) -> u64 {
     let mut s = DefaultHasher::new();
     t.hash(&mut s);
@@ -492,7 +487,7 @@ pub fn wrapper_spec_execute(
 pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId) -> usize {
     let now = Instant::now();
     let tid: u64 = thread::current().id().as_u64().into();
-    let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
+    let captured_vars = HashMap::new();
     let rdd_ids = vec![rdd_id];
     let op_ids = vec![op_id];
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
@@ -905,7 +900,6 @@ pub fn secure_compute_cached(
     acc_arg: &mut AccArg,
     cur_rdd_id: usize, 
     tx: SyncSender<(usize, (usize, (f64, f64, usize)))>,
-    captured_vars: HashMap<usize, Vec<Vec<u8>>>,
 ) -> Vec<JoinHandle<()>> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let part_id = acc_arg.part_id;
@@ -950,6 +944,7 @@ pub fn secure_compute_cached(
         let dep_info = acc_arg.dep_info;
         let eenter_lock = acc_arg.eenter_lock.clone();
         let acc_captured_size = acc_arg.acc_captured_size;
+        let captured_vars = acc_arg.captured_vars.clone();
 
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
@@ -1028,6 +1023,7 @@ pub struct AccArg {
     pub cur_usage: Arc<AtomicUsize>,  //for transfer the cur memory usage in union thread to prev thread
     pub fresh_slope: Arc<AtomicBool>,
     pub acc_captured_size: usize,
+    pub captured_vars: HashMap<usize, Vec<Vec<u8>>>,
 }
 
 impl AccArg {
@@ -1054,6 +1050,7 @@ impl AccArg {
             cur_usage,
             fresh_slope,
             acc_captured_size,
+            captured_vars: HashMap::new(),
         }
     }
 

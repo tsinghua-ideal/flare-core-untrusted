@@ -74,10 +74,14 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
         FD: SerFunc(UE) -> Vec<U>,
     {
         let reader = LocalFsReader::<BytesReader, _, _, _>::new(self, context, sec_decoder.clone());
-        let read_files = Fn!(
-            |_part: usize, readers: Box<dyn Iterator<Item = BytesReader>>| {
-                Box::new(readers.into_iter().map(|file| file.into_iter()).flatten())    //Vec<Vec<Vec<u8>>> -> Vec<Vec<u8>>
-                    as Box<dyn Iterator<Item = _>>
+        let local_num_splits = reader.get_executor_partitions() as usize;
+        let read_files = Fn!(move
+            |part: usize, readers: Box<dyn Iterator<Item = BytesReader>>| {
+                let readers = readers.collect::<Vec<_>>();
+                match readers.get(part % local_num_splits) {
+                    Some(reader) => Box::new((*reader).clone().into_iter()) as Box<dyn Iterator<Item = _>>,
+                    None => Box::new(Vec::new().into_iter()) as Box<dyn Iterator<Item = _>>,
+                }
             }
         );
 
@@ -117,10 +121,14 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
         FD: SerFunc(UE) -> Vec<U>,
     {
         let reader = LocalFsReader::<FileReader, _, _, _>::new(self, context, sec_decoder.clone());
-        let read_files = Fn!(
-            |_part: usize, readers: Box<dyn Iterator<Item = FileReader>>| {
-                Box::new(readers.map(|reader| reader.into_iter()).flatten())
-                    as Box<dyn Iterator<Item = _>>
+        let local_num_splits = reader.get_executor_partitions() as usize;
+        let read_files = Fn!(move
+            |part: usize, readers: Box<dyn Iterator<Item = FileReader>>| {
+                let readers = readers.collect::<Vec<_>>();
+                match readers.get(part % local_num_splits) {
+                    Some(reader) => Box::new((*reader).clone().into_iter()) as Box<dyn Iterator<Item = _>>,
+                    None => Box::new(Vec::new().into_iter()) as Box<dyn Iterator<Item = _>>,
+                }
             }
         );
         
@@ -364,15 +372,13 @@ where
         }
     }
 
-    fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_(&self, cur_split_num: usize, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
         let len = data.len();
         let cur_rdd_id = self.id;
         let cur_op_id = self.op_id;
-        let cur_split_num = self.splits.len();
         acc_arg.insert_rdd_id(cur_rdd_id);
         acc_arg.insert_op_id(cur_op_id);
         acc_arg.insert_split_num(cur_split_num);
-        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
 
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
@@ -420,7 +426,7 @@ where
                         &vec![len],
                         block_len,
                         to_set_usage,
-                        &captured_vars
+                        &acc_arg.captured_vars
                     );
                     wrapper_spec_execute(
                         &spec_call_seq_ptr, 
@@ -522,13 +528,16 @@ where
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
-        let mut splits = Vec::with_capacity(self.splits.len());
-        for (idx, host) in self.splits.iter().enumerate() {
-            splits.push(Box::new(BytesReader {
-                idx,
-                host: *host.ip(),
-                files: Vec::new(),
-            }) as Box<dyn Split>)
+        let local_num_splits = self.get_executor_partitions() as usize;
+        let mut splits = Vec::with_capacity(self.splits.len() * local_num_splits);
+        for (global_idx, host) in self.splits.iter().enumerate() {
+            for local_idx in 0..local_num_splits {
+                splits.push(Box::new(BytesReader {
+                    idx: global_idx * local_num_splits + local_idx,
+                    host: *host.ip(),
+                    files: Vec::new(),
+                }) as Box<dyn Split>)
+            }
         }
         splits
     }
@@ -547,13 +556,16 @@ where
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
-        let mut splits = Vec::with_capacity(self.splits.len());
-        for (idx, host) in self.splits.iter().enumerate() {
-            splits.push(Box::new(FileReader {
-                idx,
-                host: *host.ip(),
-                files: Vec::new(),
-            }) as Box<dyn Split>)
+        let local_num_splits = self.get_executor_partitions() as usize;
+        let mut splits = Vec::with_capacity(self.splits.len() * local_num_splits);
+        for (global_idx, host) in self.splits.iter().enumerate() {
+            for local_idx in 0..local_num_splits {
+                splits.push(Box::new(FileReader {
+                    idx: global_idx * local_num_splits + local_idx,
+                    host: *host.ip(),
+                    files: Vec::new(),
+                }) as Box<dyn Split>)
+            }
         }
         splits
     }
@@ -607,16 +619,23 @@ where
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;
         let host = split.host;
-        let data = files_by_part
+        let readers = files_by_part
             .into_iter()
             .map(move |files| BytesReader { files, host, idx })
-            .map(|reader| reader.into_iter())
-            .flatten()   //Vec<Vec<u8>>, ser_enc_data
-            .flat_map(|ser| self.sec_decoder.as_ref().unwrap()(ser).into_iter())
-            .collect::<Vec<_>>(); //enc_data
+            .collect::<Vec<_>>();
+        let data = match readers.get(idx % (self.get_executor_partitions() as usize)) {
+            Some(reader) => (*reader).clone()
+                .into_iter() //Vec<Vec<u8>>, ser_enc_data
+                .flat_map(|ser| self.sec_decoder.as_ref().unwrap()(ser).into_iter())
+                .collect::<Vec<_>>(), //enc_data
+            None => Vec::new(),
+        };
+        if data.is_empty() {
+            return Ok(Vec::new())
+        }
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("io time: {:?} s", dur);
-        self.secure_compute_(data, acc_arg, tx)
+        self.secure_compute_(self.number_of_splits(), data, acc_arg, tx)
     }
 }
 
@@ -646,14 +665,22 @@ where
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;
         let host = split.host;
-        let data = files_by_part
+        let readers = files_by_part
                 .into_iter()
                 .map(move |files| FileReader { files, host, idx })
-                .map(|reader| reader.into_iter())
-                .flatten()   //Vec<Vec<u8>>, ser_enc_data
+                .collect::<Vec<_>>();
+        let data =  match readers.get(idx % (self.get_executor_partitions() as usize)) {
+            Some(reader) => (*reader).clone()
+                .into_iter() //Vec<Vec<u8>>, ser_enc_data
                 .flat_map(|ser| self.sec_decoder.as_ref().unwrap()(ser).into_iter())
-                .collect::<Vec<_>>(); //enc_data
-        self.secure_compute_(data, acc_arg, tx)
+                .collect::<Vec<_>>(), //enc_data
+            None => Vec::new(),
+        };
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.secure_compute_(self.number_of_splits(), data, acc_arg, tx)
     }
 }
 

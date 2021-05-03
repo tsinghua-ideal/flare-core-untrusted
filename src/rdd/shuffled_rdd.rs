@@ -144,8 +144,6 @@ where
             return Ok(Vec::new());
         }
 
-        let captured_vars = std::mem::replace(&mut *Env::get().captured_vars.lock().unwrap(), HashMap::new());
-
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
             let now = Instant::now();
@@ -193,7 +191,7 @@ where
                         &upper_bound,
                         block_len,
                         to_set_usage,
-                        &captured_vars,
+                        &acc_arg.captured_vars,
                     );
                     wrapper_spec_execute(
                         &spec_call_seq_ptr, 
@@ -374,14 +372,12 @@ where
         acc_arg.insert_op_id(cur_op_id);
         acc_arg.insert_split_num(cur_split_num);
 
-        let captured_vars = Env::get().captured_vars.lock().unwrap().clone();
         let should_cache = self.should_cache();
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
                 cur_rdd_id, 
                 tx.clone(),
-                captured_vars,
             );
 
             if !acc_arg.totally_cached() {
