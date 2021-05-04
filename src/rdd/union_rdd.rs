@@ -122,7 +122,7 @@ where
                         let (_, (ptr, (time_comp, cur_mem_usage, acc_captured_size))) = r.unwrap();
                         //The last connected one will survive in cache
                         let r_next = rx_un.try_recv();
-                        is_survivor = is_survivor || r_next == Err(TryRecvError::Disconnected);
+                        is_survivor = is_survivor || (r_next == Err(TryRecvError::Disconnected) && acc_arg.part_id == acc_arg.split_nums.last().unwrap() - 1);
                         if !acc_arg.cached(&sub_part_id) {
                             cache_meta.set_sub_part_id(sub_part_id);
                             cache_meta.set_is_survivor(is_survivor);
@@ -230,7 +230,7 @@ where
                             let (_, (ptr, (time_comp, cur_mem_usage, acc_captured_size))) = r.unwrap();
                             //The last connected one will survive in cache
                             let r_next = rx_un.try_recv();
-                            is_survivor = is_survivor || (r_next == Err(TryRecvError::Disconnected) && idx == last_idx);
+                            is_survivor = is_survivor || (r_next == Err(TryRecvError::Disconnected) && idx == last_idx && acc_arg.part_id == acc_arg.split_nums.last().unwrap() - 1);
                             if !acc_arg.cached(&sub_part_id) {
                                 cache_meta.set_sub_part_id(sub_part_id);
                                 cache_meta.set_is_survivor(is_survivor);

@@ -410,7 +410,7 @@ where
                     true => len,
                     false => cur + block_len,
                 };
-                is_survivor = is_survivor || next == len;
+                is_survivor = is_survivor || (next == len && acc_arg.part_id == cur_split_num - 1);
                 if !acc_arg.cached(&sub_part_id) {
                     cache_meta.set_sub_part_id(sub_part_id);
                     cache_meta.set_is_survivor(is_survivor);

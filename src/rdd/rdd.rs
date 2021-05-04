@@ -949,7 +949,7 @@ pub fn secure_compute_cached(
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
             for (seq_id, sub_part) in cached_sub_parts.into_iter().enumerate() {
-                let mut is_survivor = cached_sub_parts_len == subpids.len() &&  cached_sub_parts_len-1 == seq_id;
+                let mut is_survivor = cached_sub_parts_len == subpids.len() &&  cached_sub_parts_len-1 == seq_id && cache_meta.part_id == split_nums.last().unwrap() - 1;
                 //No need to get memory usage, for the sub-partition is fixed when using cached data
                 let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
                     &op_ids, 
@@ -1012,7 +1012,7 @@ pub struct AccArg {
     pub rdd_ids: Vec<usize>,
     pub op_ids: Vec<OpId>,
     pub split_nums: Vec<usize>, 
-    part_id: usize,
+    pub part_id: usize,
     pub dep_info: DepInfo,
     caching_rdd_id: usize,
     cached_rdd_id: usize,

@@ -108,7 +108,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
                     true => len,
                     false => cur + block_len,
                 };
-                is_survivor = is_survivor || next == len;
+                is_survivor = is_survivor || (next == len && acc_arg.part_id == acc_arg.split_nums.last().unwrap() - 1);
                 //currently, all sub_partitions are not cached as long as coming to this rdd
                 if !acc_arg.cached(&sub_part_id) {
                     cache_meta.set_sub_part_id(sub_part_id);
