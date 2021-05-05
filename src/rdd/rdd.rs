@@ -274,6 +274,7 @@ where
 pub fn dynamic_subpart_meta(
     time_comp: f64,
     max_mem_usage: f64,
+    acc_captured_size: f64,
     block_len_: &Arc<AtomicUsize>,
     slopes: &mut Vec<f64>,
     fresh_slope: &Arc<AtomicBool>,
@@ -285,7 +286,7 @@ pub fn dynamic_subpart_meta(
     if fresh_slope.compare_and_swap(true, false, atomic::Ordering::SeqCst) {
         slopes.clear();   //for unique-partitioner-union, it may affect other cases but does not matter
     }
-    let k = time_comp/(max_mem_usage/((1<<30) as f64));   // s/GB
+    let k = time_comp/((max_mem_usage+acc_captured_size*(block_len-1) as f64)/((1<<30) as f64));   // s/GB
     if slopes.is_empty() {
         slopes.push(k);
         block_len += 1;
@@ -355,7 +356,7 @@ pub fn wrapper_pre_merge<T: Data>(
                 },
             };
             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-            dynamic_subpart_meta(dur_comp, max_mem_usage as f64, &block_len, &mut slopes, &fresh_slope, num_splits);
+            dynamic_subpart_meta(dur_comp, max_mem_usage as f64, 0 as f64, &block_len, &mut slopes, &fresh_slope, num_splits);
             let mut result_bl = get_encrypted_data::<Vec<T>>(op_id, dep_info, result_ptr as *mut u8, false);
             assert!(result_bl.len() == 1);
             result.append(&mut result_bl[0]);
@@ -1769,7 +1770,7 @@ pub trait RddE: Rdd {
         let mut slopes = Vec::new();
         for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
-            dynamic_subpart_meta(time_comp, max_mem_usage - acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num());
+            dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num());
             acc_arg.free_enclave_lock();
             if caching {
                 //collect result

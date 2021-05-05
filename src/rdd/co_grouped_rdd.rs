@@ -163,7 +163,7 @@ where
                     let mut kv_0 = Vec::new();
                     for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage - acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
+                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
@@ -240,7 +240,7 @@ where
                     let mut kw_0 = Vec::new();
                     for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage - acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
+                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
