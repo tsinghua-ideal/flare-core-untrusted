@@ -37,6 +37,7 @@ use crate::{utils, Fn, SerArc, SerBox};
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
 use fasthash::MetroHasher;
+use ordered_float::OrderedFloat;
 use once_cell::sync::Lazy;
 use rand::{Rng, SeedableRng};
 use serde_derive::{Deserialize, Serialize};
@@ -347,30 +348,60 @@ pub fn dynamic_subpart_meta(
     slopes: &mut Vec<f64>,
     fresh_slope: &Arc<AtomicBool>,
     num_splits: usize,
+    aggresive: &mut bool,
 ) {
     let tid: u64 = thread::current().id().as_u64().into();
+    let cache_size = 12*(1<<20); //L3 Cache Size
+    let threshold = 0.25 * cache_size as f64;  //threshold for aggresive strategy
     let limit_per_partition = ((80*(1<<20)) as f64)/(num_splits as f64);  //about 80MB/num_splits
     let mut block_len = block_len_.load(atomic::Ordering::SeqCst);
     if fresh_slope.compare_and_swap(true, false, atomic::Ordering::SeqCst) {
-        slopes.clear();   //for unique-partitioner-union, it may affect other cases but does not matter
+        //for unique-partitioner-union, it may affect other cases but does not matter
+        slopes.clear();
     }
-    let k = time_comp/((max_mem_usage+acc_captured_size*(block_len-1) as f64)/((1<<30) as f64));   // s/GB
-    if slopes.is_empty() {
-        slopes.push(k);
-        block_len += 1;
-    } else {
-        let avg_k = slopes.iter().sum::<f64>()/(slopes.len() as f64);
-        if k <= avg_k * 0.8 && max_mem_usage < limit_per_partition {
-            slopes.clear();
+    let cur_mem_usage = max_mem_usage+acc_captured_size*(block_len-1) as f64;
+    if *aggresive {
+        println!("aggresive!");
+        let k = time_comp/(cur_mem_usage/((1<<30) as f64));   // s/GB
+        if slopes.is_empty() {
             slopes.push(k);
-            block_len += 1;
-        } else if k <= avg_k * 1.2 && max_mem_usage < limit_per_partition {
-            slopes.push(k);
-            block_len += 1;
-        } else if k <= avg_k * 1.5 && block_len > 1 {
-            block_len -= 1;
+            block_len *= 2;
         } else {
-            block_len = (block_len + 1) / 2;
+            let limit = std::cmp::min(OrderedFloat(limit_per_partition), OrderedFloat(threshold));
+            let avg_k = slopes.iter().sum::<f64>()/(slopes.len() as f64);
+            if k <= avg_k * 0.8 && max_mem_usage < *limit {
+                slopes.clear();
+                slopes.push(k);
+                block_len *= 2;
+            } else if k <= avg_k * 1.2 && max_mem_usage < *limit {
+                slopes.push(k);
+                block_len *= 2;
+            } else {
+                *aggresive = false;
+                println!("disable aggresive strategy!");
+                block_len = (block_len + 1) / 2;
+            }
+        }
+    } else {
+        println!("non-aggresive!");
+        let k = time_comp/(cur_mem_usage/((1<<30) as f64));   // s/GB
+        if slopes.is_empty() {
+            slopes.push(k);
+            block_len += 1;
+        } else {
+            let avg_k = slopes.iter().sum::<f64>()/(slopes.len() as f64);
+            if k <= avg_k * 0.8 && max_mem_usage < limit_per_partition {
+                slopes.clear();
+                slopes.push(k);
+                block_len += 1;
+            } else if k <= avg_k * 1.2 && max_mem_usage < limit_per_partition {
+                slopes.push(k);
+                block_len += 1;
+            } else if k <= avg_k * 1.5 && block_len > 1 {
+                block_len -= 1;
+            } else {
+                block_len = (block_len + 1) / 2;
+            }
         }
     }
     //block_len = 1; //mark
@@ -395,6 +426,7 @@ pub fn wrapper_pre_merge<T: Data>(
         let block_len = Arc::new(AtomicUsize::new(1));
         let mut slopes = Vec::new();
         let fresh_slope = Arc::new(AtomicBool::new(false));
+        let mut aggresive = false;
         let mut to_set_usage = 0;
         while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
             upper = upper.iter()
@@ -424,7 +456,7 @@ pub fn wrapper_pre_merge<T: Data>(
                 },
             };
             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-            dynamic_subpart_meta(dur_comp, max_mem_usage as f64, 0 as f64, &block_len, &mut slopes, &fresh_slope, num_splits);
+            dynamic_subpart_meta(dur_comp, max_mem_usage as f64, 0 as f64, &block_len, &mut slopes, &fresh_slope, num_splits, &mut aggresive);
             let mut result_bl = get_encrypted_data::<Vec<T>>(op_id, dep_info, result_ptr as *mut u8, false);
             assert!(result_bl.len() == 1);
             result.append(&mut result_bl[0]);
@@ -1836,9 +1868,10 @@ pub trait RddE: Rdd {
 
         let mut result = Vec::new();
         let mut slopes = Vec::new();
+        let mut aggresive = true;
         for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
-            dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num());
+            dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
             acc_arg.free_enclave_lock();
             if caching {
                 //collect result

@@ -156,6 +156,7 @@ where
             let block_len = Arc::new(AtomicUsize::new(1));
             let mut slopes = Vec::new();
             let fresh_slope = Arc::new(AtomicBool::new(false));
+            let mut aggresive = false;
             let mut to_set_usage = 0;
             while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
                 upper = upper.iter()
@@ -177,7 +178,7 @@ where
                     &acc_arg.captured_vars,
                 );
                 let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-                dynamic_subpart_meta(dur_comp, mem_usage.1, 0 as f64, &block_len, &mut slopes, &fresh_slope, STAGE_LOCK.get_parall_num());
+                dynamic_subpart_meta(dur_comp, mem_usage.1, 0 as f64, &block_len, &mut slopes, &fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
                 let mut result_bl = get_encrypted_data::<(KE, CE)>(cur_op_ids[0], dep_info, result_bl_ptr as *mut u8, false);
                 result.append(&mut result_bl);
                 lower = lower.iter()

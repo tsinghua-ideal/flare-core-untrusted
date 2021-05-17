@@ -322,9 +322,10 @@ where
                         .map(|_| Vec::new())
                         .collect::<Vec<_>>();
                     let mut slopes = Vec::new();
+                    let mut aggresive = true;
                     for (_, (block_ptr, (time_comp, max_mem_usage, acc_captured_size))) in rx { 
                         let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num());
+                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
                         acc_arg.free_enclave_lock();
                         for (i, bucket) in buckets_bl.into_iter().enumerate() {
                             buckets[i].push(bucket); 

@@ -160,10 +160,11 @@ where
                     let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     let mut slopes = Vec::new();
+                    let mut aggresive = true;
                     let mut kv_0 = Vec::new();
                     for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
+                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1, &mut aggresive);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
@@ -237,10 +238,11 @@ where
                     let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?;  //TODO need sorted
                     let mut slopes = Vec::new();
+                    let mut aggresive = true;
                     let mut kw_0 = Vec::new();
                     for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1);
+                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1, &mut aggresive);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
                             //collect result
@@ -312,6 +314,7 @@ where
                 let block_len = Arc::new(AtomicUsize::new(1));
                 let mut slopes = Vec::new();
                 let fresh_slope = Arc::new(AtomicBool::new(false));
+                let mut aggresive = false;
                 let mut to_set_usage = 0;
                 while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
                     upper = upper.iter()
@@ -333,7 +336,7 @@ where
                         &acc_arg.captured_vars,
                     );
                     let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-                    dynamic_subpart_meta(dur_comp, mem_usage.1, 0 as f64, &block_len, &mut slopes, &fresh_slope, STAGE_LOCK.get_parall_num());
+                    dynamic_subpart_meta(dur_comp, mem_usage.1, 0 as f64, &block_len, &mut slopes, &fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
                     let mut result_bl = get_encrypted_data::<(KE, (CE, DE))>(cur_op_ids[0], dep_info, result_bl_ptr as *mut u8, false);
                     result.append(&mut result_bl);
                     lower = lower.iter()
