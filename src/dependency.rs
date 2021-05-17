@@ -33,7 +33,6 @@ impl DepInfo {
         parent_op_id: OpId,
         child_op_id: OpId,
     ) -> Self {
-        // The last three items is useful only when is_shuffle == 1x, x == 0 or x == 1
         DepInfo {
             is_shuffle,
             identifier,

@@ -300,78 +300,58 @@ where
             if num_sub_part[0] == 0 || num_sub_part[1] == 0 {
                 return Ok(Vec::new());
             }
+            //shuffle read
+            let data = {
+                acc_arg.get_enclave_lock();
+                let cur_rdd_ids = vec![self.vals.id];
+                let cur_op_ids = vec![self.vals.op_id];
+                let dep_info = DepInfo::padding_new(3);
+                let mut lower = vec![0; num_sub_part[0] + num_sub_part[1]];
+                let mut upper = vec![1; num_sub_part[0] + num_sub_part[1]];
+                let mut result = Vec::new();
+                let block_len = Arc::new(AtomicUsize::new(1));
+                let mut slopes = Vec::new();
+                let fresh_slope = Arc::new(AtomicBool::new(false));
+                let mut to_set_usage = 0;
+                while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
+                    upper = upper.iter()
+                        .zip(upper_bound.iter())
+                        .map(|(l, ub)| std::cmp::min(*l, *ub))
+                        .collect::<Vec<_>>();
+                    let now_comp = Instant::now();
+                    let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
+                        &cur_rdd_ids,
+                        &cur_op_ids,
+                        Default::default(),
+                        dep_info,
+                        &data,
+                        &mut lower,
+                        &mut upper,
+                        &upper_bound,
+                        block_len.load(atomic::Ordering::SeqCst),
+                        to_set_usage,
+                        &acc_arg.captured_vars,
+                    );
+                    let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
+                    dynamic_subpart_meta(dur_comp, mem_usage.1, 0 as f64, &block_len, &mut slopes, &fresh_slope, STAGE_LOCK.get_parall_num());
+                    let mut result_bl = get_encrypted_data::<(KE, (CE, DE))>(cur_op_ids[0], dep_info, result_bl_ptr as *mut u8, false);
+                    result.append(&mut result_bl);
+                    lower = lower.iter()
+                        .zip(upper_bound.iter())
+                        .map(|(l, ub)| std::cmp::min(*l, *ub))
+                        .collect::<Vec<_>>();
+                    to_set_usage = mem_usage.0 as usize;
+                }
+                acc_arg.free_enclave_lock();
+                result
+            };
 
             let acc_arg = acc_arg.clone();
             let handle = std::thread::spawn(move || {
                 let now = Instant::now();
-                let mut wait = 0.0; 
-                let mut lower = vec![0; num_sub_part[0] + num_sub_part[1]];
-                let mut upper = vec![1; num_sub_part[0] + num_sub_part[1]];
-                let mut sub_part_id = 0;
-                let mut cache_meta = acc_arg.to_cache_meta();
-                let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                    &acc_arg.op_ids,
-                    &acc_arg.split_nums,
-                    cache_meta, 
-                    acc_arg.dep_info,
-                );
-                let mut is_survivor = spec_call_seq_ptr.is_some();
-                let mut to_set_usage = 0;
-                while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
-                    let wait_now = Instant::now();
-                    acc_arg.get_enclave_lock();
-                    let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
-                    wait += wait_dur;
-                    //update block_len
-                    let block_len = acc_arg.block_len.load(atomic::Ordering::SeqCst);
-                    let cur_usage = acc_arg.cur_usage.load(atomic::Ordering::SeqCst);
-                    if cur_usage != 0 {
-                        to_set_usage = cur_usage;
-                    }
-                    if !acc_arg.cached(&sub_part_id) {  //don't support partial cache now, for the lower and upper is not remembered
-                        cache_meta.set_is_survivor(is_survivor);
-                        cache_meta.set_sub_part_id(sub_part_id);
-                        BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                        //TODO: get lower of the last cached data
-                        upper = upper.iter()
-                            .zip(upper_bound.iter())
-                            .map(|(l, ub)| std::cmp::min(*l, *ub))
-                            .collect::<Vec<_>>();
-                        let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
-                            &acc_arg.rdd_ids,
-                            &acc_arg.op_ids,
-                            cache_meta,
-                            acc_arg.dep_info,
-                            &data,
-                            &mut lower,
-                            &mut upper,
-                            &upper_bound,
-                            block_len,
-                            to_set_usage,
-                            &acc_arg.captured_vars,
-                        );
-                        wrapper_spec_execute(
-                            &spec_call_seq_ptr, 
-                            cache_meta,
-                        );
-                        match acc_arg.dep_info.is_shuffle == 0 {
-                            true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0, acc_arg.acc_captured_size)))).unwrap(),
-                            false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1, acc_arg.acc_captured_size)))).unwrap(),
-                        };
-                        lower = lower.iter()
-                            .zip(upper_bound.iter())
-                            .map(|(l, ub)| std::cmp::min(*l, *ub))
-                            .collect::<Vec<_>>();
-                        to_set_usage = match spec_call_seq_ptr.is_none() {
-                            true => mem_usage.0 as usize,
-                            false => 0,
-                        }
-                    }
-                    sub_part_id += 1;
-                }
+                let wait = start_execute(acc_arg, data, tx);
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
                 println!("***in co grouped rdd, total {:?}***", dur);  
-                
             });
             Ok(vec![handle])
 
