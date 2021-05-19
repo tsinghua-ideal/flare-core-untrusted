@@ -1081,7 +1081,7 @@ pub fn secure_compute_cached(
                         &op_ids as *const Vec<OpId> as *const u8,
                         cache_meta,
                         dep_info,   
-                        Input::padding(&mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage), //invalid pointer
+                        Input::padding(&mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage), //invalid pointer  TODO: send valid pointer
                         &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
                     )
                 };

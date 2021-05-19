@@ -145,6 +145,7 @@ where
             return Ok(Vec::new());
         }
         //shuffle read
+        let now = Instant::now();
         let data = {
             acc_arg.get_enclave_lock();
             let cur_rdd_ids = vec![child_rdd_id];
@@ -190,13 +191,15 @@ where
             acc_arg.free_enclave_lock();
             result
         };
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("***in shuffled rdd, shuffle read, total {:?}***", dur);  
 
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
             let now = Instant::now();
             let wait = start_execute(acc_arg, data, tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
-            println!("***in shuffled rdd, total {:?}***", dur);  
+            println!("***in shuffled rdd, compute, total {:?}***", dur);  
         });
         Ok(vec![handle])
     } 
