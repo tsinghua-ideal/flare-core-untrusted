@@ -304,51 +304,11 @@ where
             }
             //shuffle read
             let now = Instant::now();
-            let data = {
-                acc_arg.get_enclave_lock();
-                let cur_rdd_ids = vec![self.vals.id];
-                let cur_op_ids = vec![self.vals.op_id];
-                let dep_info = DepInfo::padding_new(3);
-                let mut lower = vec![0; num_sub_part[0] + num_sub_part[1]];
-                let mut upper = vec![1; num_sub_part[0] + num_sub_part[1]];
-                let mut result = Vec::new();
-                let block_len = Arc::new(AtomicUsize::new(1));
-                let mut slopes = Vec::new();
-                let fresh_slope = Arc::new(AtomicBool::new(false));
-                let mut aggresive = false;
-                let mut to_set_usage = 0;
-                while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
-                    upper = upper.iter()
-                        .zip(upper_bound.iter())
-                        .map(|(l, ub)| std::cmp::min(*l, *ub))
-                        .collect::<Vec<_>>();
-                    let now_comp = Instant::now();
-                    let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
-                        &cur_rdd_ids,
-                        &cur_op_ids,
-                        Default::default(),
-                        dep_info,
-                        &data,
-                        &mut lower,
-                        &mut upper,
-                        &upper_bound,
-                        block_len.load(atomic::Ordering::SeqCst),
-                        to_set_usage,
-                        &acc_arg.captured_vars,
-                    );
-                    let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-                    dynamic_subpart_meta(dur_comp, mem_usage.1, 0 as f64, &block_len, &mut slopes, &fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
-                    let mut result_bl = get_encrypted_data::<(KE, (CE, DE))>(cur_op_ids[0], dep_info, result_bl_ptr as *mut u8, false);
-                    result.append(&mut result_bl);
-                    lower = lower.iter()
-                        .zip(upper_bound.iter())
-                        .map(|(l, ub)| std::cmp::min(*l, *ub))
-                        .collect::<Vec<_>>();
-                    to_set_usage = mem_usage.0 as usize;
-                }
-                acc_arg.free_enclave_lock();
-                result
-            };
+            let data = self.secure_shuffle_read(data, 
+                acc_arg, 
+                num_sub_part[0] + num_sub_part[1], 
+                upper_bound
+            );
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("***in co grouped rdd, shuffle read, total {:?}***", dur);  
 
@@ -364,6 +324,57 @@ where
         } else {
             Err(Error::DowncastFailure("Got split object from different concrete type other than CoGroupSplit"))
         }
+    }
+
+    fn secure_shuffle_read(&self, 
+        buckets: (Vec<Vec<(KE, VE)>>, Vec<Vec<(KE, Vec<u8>)>>, Vec<Vec<(KE, WE)>>, Vec<Vec<(KE, Vec<u8>)>>),
+        acc_arg: &mut AccArg,
+        num_sub_part: usize,
+        upper_bound: Vec<usize>,
+    ) -> Vec<(KE, (CE, DE))> {
+        acc_arg.get_enclave_lock();
+        let cur_rdd_ids = vec![self.vals.id];
+        let cur_op_ids = vec![self.vals.op_id];
+        let dep_info = DepInfo::padding_new(3);
+        let mut lower = vec![0; num_sub_part];
+        let mut upper = vec![1; num_sub_part];
+        let mut result = Vec::new();
+        let block_len = Arc::new(AtomicUsize::new(1));
+        let mut slopes = Vec::new();
+        let fresh_slope = Arc::new(AtomicBool::new(false));
+        let mut aggresive = false;
+        let mut to_set_usage = 0;
+        while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
+            upper = upper.iter()
+                .zip(upper_bound.iter())
+                .map(|(l, ub)| std::cmp::min(*l, *ub))
+                .collect::<Vec<_>>();
+            let now_comp = Instant::now();
+            let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
+                &cur_rdd_ids,
+                &cur_op_ids,
+                Default::default(),
+                dep_info,
+                &buckets,
+                &mut lower,
+                &mut upper,
+                &upper_bound,
+                block_len.load(atomic::Ordering::SeqCst),
+                to_set_usage,
+                &acc_arg.captured_vars,
+            );
+            let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
+            dynamic_subpart_meta(dur_comp, mem_usage.1, 0 as f64, &block_len, &mut slopes, &fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
+            let mut result_bl = get_encrypted_data::<(KE, (CE, DE))>(cur_op_ids[0], dep_info, result_bl_ptr as *mut u8, false);
+            result.append(&mut result_bl);
+            lower = lower.iter()
+                .zip(upper_bound.iter())
+                .map(|(l, ub)| std::cmp::min(*l, *ub))
+                .collect::<Vec<_>>();
+            to_set_usage = mem_usage.0 as usize;
+        }
+        acc_arg.free_enclave_lock();
+        result
     }
 
 }
@@ -527,7 +538,12 @@ where
     }
 
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
-        self.secure_compute(split, acc_arg, tx)
+        if acc_arg.dep_info.dep_type() == 1 {
+            let res = self.secure_iterator(split).unwrap();
+            self.secure_shuffle_write(res, acc_arg, tx)
+        } else {
+            self.secure_compute(split, acc_arg, tx)
+        }
     }
 
     fn iterator_any(

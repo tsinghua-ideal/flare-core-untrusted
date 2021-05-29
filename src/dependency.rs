@@ -54,6 +54,10 @@ impl DepInfo {
             child_op_id: Default::default(),
         }
     }
+
+    pub fn dep_type(&self) -> u8 {
+        self.is_shuffle
+    }
 }
 
 // Revise if enum is good choice. Considering enum since down casting one trait object to another trait object is difficult.
@@ -280,6 +284,7 @@ where
             //remove after get, otherwise it will causes the accumulation
             let res = env::SPEC_SHUFFLE_CACHE.remove(&key);
             match res {
+                //TODO: adjust speculative execution，且原先的实现有bug，因为spec的加密类型
                 Some((_key, item)) => {
                     STAGE_LOCK.free_stage_lock();
                     let mut ser_result = HashMap::new();

@@ -532,7 +532,7 @@ pub fn wrapper_exploit_spec_oppty(
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
             },
         };
-        //return None;   //test non-spec case
+        return None;   //test non-spec case
         Some((*res, spec_identifier))
     } else {
         None
@@ -1862,7 +1862,6 @@ pub trait RddE: Rdd {
             Arc::new(AtomicUsize::new(0)), 
             Arc::new(AtomicBool::new(false)),
             0);
-        STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
@@ -1887,8 +1886,26 @@ pub trait RddE: Rdd {
         for handle in handles {
             handle.join().unwrap();
         }
-        STAGE_LOCK.free_stage_lock();
         Ok(Box::new(result.into_iter()))
+    }
+
+    fn secure_shuffle_write(&self, data: Box<dyn Iterator<Item = Self::ItemE>>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+        let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
+        let cur_split_num = self.number_of_splits();
+        acc_arg.insert_rdd_id(cur_rdd_id);
+        acc_arg.insert_op_id(cur_op_id);
+        acc_arg.insert_split_num(cur_split_num);
+        
+        let data = data.collect::<Vec<_>>();
+        let acc_arg = acc_arg.clone();
+        let handle = std::thread::spawn(move || {
+            let now = Instant::now();
+            let wait = start_execute(acc_arg, data, tx);
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
+            println!("***shuffle write, total {:?}***", dur);
+        });
+        Ok(vec![handle])         
     }
 
     /// Return a new RDD containing only the elements that satisfy a predicate.

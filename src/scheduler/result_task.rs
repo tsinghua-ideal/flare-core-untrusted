@@ -168,10 +168,15 @@ where
             context, 
             match self.rdd.get_secure() {
                 true => (
-                    Box::new(Vec::new().into_iter()),                 
-                    match self.rdd.secure_iterator(split) {
-                        Ok(r) => r,
-                        Err(_) => Box::new(Vec::new().into_iter()),
+                    Box::new(Vec::new().into_iter()),             
+                    {
+                        STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
+                        let res = match self.rdd.secure_iterator(split) {
+                            Ok(r) => r,
+                            Err(_) => Box::new(Vec::new().into_iter()),
+                        };
+                        STAGE_LOCK.free_stage_lock();
+                        res
                     }
                 ),
                 false => (

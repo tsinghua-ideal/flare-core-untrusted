@@ -43,10 +43,15 @@ pub(crate) trait NativeScheduler: Send + Sync {
                     task_context,
                     match final_rdd.get_secure() {
                         true => (
-                            Box::new(Vec::new().into_iter()),                 
-                            match final_rdd.secure_iterator(split) {
-                                Ok(r) => r,
-                                Err(_) => Box::new(Vec::new().into_iter()),
+                            Box::new(Vec::new().into_iter()),
+                            {    
+                                STAGE_LOCK.get_stage_lock((final_rdd_id, final_rdd_id, 0));           
+                                let res = match final_rdd.secure_iterator(split) {
+                                    Ok(r) => r,
+                                    Err(_) => Box::new(Vec::new().into_iter()),
+                                };
+                                STAGE_LOCK.free_stage_lock();
+                                res
                             }
                         ),
                         false => (
