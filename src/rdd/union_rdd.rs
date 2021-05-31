@@ -81,100 +81,18 @@ where
         UnionRdd(UnionVariants::new(rdds))
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         match &self.0 {
             NonUniquePartitioner { rdds, .. } => {
-                let (tx_un, rx_un) = sync_channel(0);
                 let tx = tx.clone();
                 let part = &*split
                     .downcast::<UnionSplit<T, TE>>()
                     .or(Err(Error::DowncastFailure("UnionSplit")))?;
                 let split = part.parent_partition();
                 let parent = &rdds[part.parent_rdd_index];
-                let part_id = split.get_index();
-                let mut acc_arg_un = AccArg::new(part_id, 
-                    DepInfo::padding_new(0), 
-                    None, 
-                    acc_arg.eenter_lock.clone(),
-                    acc_arg.block_len.clone(),
-                    acc_arg.cur_usage.clone(),
-                    acc_arg.fresh_slope.clone(),
-                    acc_arg.acc_captured_size,
-                );
-                let handle_uns = parent.secure_compute(split, &mut acc_arg_un, tx_un.clone())?; 
-                
-                let acc_arg = acc_arg.clone();
-                let handle = std::thread::spawn(move || {
-                    let tid: u64 = thread::current().id().as_u64().into();
-                    
-                    let mut sub_part_id = 0;
-                    let mut cache_meta = acc_arg.to_cache_meta();
-                    let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                        &acc_arg.op_ids,
-                        &acc_arg.split_nums,
-                        cache_meta, 
-                        acc_arg.dep_info,
-                    );
-                    let mut is_survivor = spec_call_seq_ptr.is_some();
-                    let mut r = rx_un.recv();
-                    while r.is_ok() {
-                        let (_, (ptr, (time_comp, cur_mem_usage, acc_captured_size))) = r.unwrap();
-                        //The last connected one will survive in cache
-                        let r_next = rx_un.try_recv();
-                        is_survivor = is_survivor || (r_next == Err(TryRecvError::Disconnected) && acc_arg.part_id == acc_arg.split_nums.last().unwrap() - 1);
-                        if !acc_arg.cached(&sub_part_id) {
-                            cache_meta.set_sub_part_id(sub_part_id);
-                            cache_meta.set_is_survivor(is_survivor);
-                            BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                            let mut init_mem_usage = cur_mem_usage as usize;
-                            let mut last_mem_usage = 0;
-                            let mut max_mem_usage = 0;
-                            let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], &vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
-                            let mut result_bl_ptr: usize = 0; 
-                            let now_comp = Instant::now();
-                            let sgx_status = unsafe {
-                                secure_execute(
-                                    eid,
-                                    &mut result_bl_ptr,
-                                    tid,
-                                    &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
-                                    &acc_arg.op_ids as *const Vec<OpId> as *const u8,
-                                    cache_meta,
-                                    acc_arg.dep_info, 
-                                    input, 
-                                    &acc_arg.captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-                                )
-                            };
-                            match sgx_status {
-                                sgx_status_t::SGX_SUCCESS => {},
-                                _ => {
-                                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                                },
-                            };
-                            let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-                            wrapper_spec_execute(
-                                &spec_call_seq_ptr, 
-                                cache_meta,
-                            );
-                            acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
-                            match acc_arg.dep_info.is_shuffle == 0 {
-                                true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, last_mem_usage as f64, acc_captured_size)))).unwrap(),
-                                false => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, max_mem_usage as f64, acc_captured_size)))).unwrap(),
-                            };
-                        }
-                        sub_part_id += 1;
-                        if r_next.is_ok() {  // this branch is unreachable actually
-                            r = Ok(r_next.unwrap());
-                        } else {
-                            r = rx_un.recv();
-                        }
-                    }
-                    for handle_un in handle_uns {
-                        handle_un.join().unwrap();
-                    }
-                });
-                Ok(vec![handle])
+                let handles = parent.secure_compute(split, acc_arg, tx)?; 
+                Ok(handles)
             },
             PartitionerAware { rdds, .. } => {
                 let split = split
@@ -184,106 +102,20 @@ where
                     .iter()
                     .zip(split.parents(&rdds))
                     .collect::<Vec<_>>();
-                let last_idx = iter.len() - 1;
                 let mut handles = Vec::new();
-                let union_lock = Arc::new(AtomicBool::new(false));
-                for (idx, (rdd, p)) in iter.into_iter().enumerate() {
-                    let part_id = p.get_index();
+                for (rdd, p) in iter.into_iter() {
                     let rdd = rdd.clone();
-                    let acc_arg = acc_arg.clone();
-                    let tx = tx.clone();
-                    let union_lock = union_lock.clone();
-                    let handle = std::thread::spawn(move || {
-                        while union_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                            //wait
-                        }
-                        //refresh block_len, because parent rdds may have different lineage
-                        let (tx_un, rx_un) = sync_channel(0);
-                        let block_len = acc_arg.block_len.clone();
-                        let cur_usage = acc_arg.cur_usage.clone();
-                        let fresh_slope = acc_arg.fresh_slope.clone();
-                        block_len.store(1, atomic::Ordering::SeqCst);
-                        cur_usage.store(0, atomic::Ordering::SeqCst);
-                        fresh_slope.store(true, atomic::Ordering::SeqCst);
-                        let mut acc_arg_un = AccArg::new(part_id, 
-                            DepInfo::padding_new(0), 
-                            None,
-                            acc_arg.eenter_lock.clone(),
-                            block_len,
-                            cur_usage, 
-                            fresh_slope,
-                            acc_arg.acc_captured_size,
-                        );
-                        let handle_uns = rdd.secure_compute(p.clone(), &mut acc_arg_un, tx_un).unwrap();
-                        let tid: u64 = thread::current().id().as_u64().into();
-                        let mut sub_part_id = 0;
-                        let mut cache_meta = acc_arg.to_cache_meta();
-                        let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                            &acc_arg.op_ids,
-                            &acc_arg.split_nums,
-                            cache_meta, 
-                            acc_arg.dep_info,
-                        );
-                        let mut is_survivor = spec_call_seq_ptr.is_some();
-                        let mut r = rx_un.recv();
-                        while r.is_ok() {
-                            let (_, (ptr, (time_comp, cur_mem_usage, acc_captured_size))) = r.unwrap();
-                            //The last connected one will survive in cache
-                            let r_next = rx_un.try_recv();
-                            is_survivor = is_survivor || (r_next == Err(TryRecvError::Disconnected) && idx == last_idx && acc_arg.part_id == acc_arg.split_nums.last().unwrap() - 1);
-                            if !acc_arg.cached(&sub_part_id) {
-                                cache_meta.set_sub_part_id(sub_part_id);
-                                cache_meta.set_is_survivor(is_survivor);
-                                BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                                let mut init_mem_usage = cur_mem_usage as usize;
-                                let mut last_mem_usage = 0;
-                                let mut max_mem_usage = 0;
-                                let input = Input::build_from_ptr(ptr as *const u8, &mut vec![0], &mut vec![usize::MAX], &vec![usize::MAX], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
-                                let mut result_bl_ptr: usize = 0; 
-                                let now_comp = Instant::now();
-                                let sgx_status = unsafe {
-                                    secure_execute(
-                                        eid,
-                                        &mut result_bl_ptr,
-                                        tid,
-                                        &acc_arg.rdd_ids as *const Vec<usize> as *const u8,
-                                        &acc_arg.op_ids as *const Vec<OpId> as *const u8, 
-                                        cache_meta,
-                                        acc_arg.dep_info, 
-                                        input, 
-                                        &acc_arg.captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-                                    )
-                                };
-                                match sgx_status {
-                                    sgx_status_t::SGX_SUCCESS => {},
-                                    _ => {
-                                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                                    },
-                                };
-                                let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-                                wrapper_spec_execute(
-                                    &spec_call_seq_ptr, 
-                                    cache_meta,
-                                );
-                                acc_arg.cur_usage.store(last_mem_usage, atomic::Ordering::SeqCst);
-                                match acc_arg.dep_info.is_shuffle == 0 {
-                                    true => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, last_mem_usage as f64, acc_captured_size)))).unwrap(),
-                                    false => tx.send((sub_part_id, (result_bl_ptr, (time_comp + dur_comp, max_mem_usage as f64, acc_captured_size)))).unwrap(),
-                                };
-                            }
-                            sub_part_id += 1;
-                            if r_next.is_ok() {  // this branch is unreachable actually
-                                r = Ok(r_next.unwrap());
-                            } else {
-                                r = rx_un.recv();
-                            }
-                        }
-                        for handle_un in handle_uns {
-                            handle_un.join().unwrap();
-                        }
-                        assert_eq!(union_lock.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
-                    });
-                    handles.push(handle)
+                    let mut acc_arg = acc_arg.clone();
+                    //refresh block_len, because parent rdds may have different lineage
+                    let (tx_un, rx_un) = sync_channel(0);
+                    acc_arg.block_len.store(1, atomic::Ordering::SeqCst);
+                    acc_arg.cur_usage.store(0, atomic::Ordering::SeqCst);
+                    acc_arg.fresh_slope.store(true, atomic::Ordering::SeqCst);
+                    let mut handle = rdd.secure_compute(p.clone(), &mut acc_arg, tx_un).unwrap();
+                    for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx_un {
+                        tx.send((received, (time_comp, max_mem_usage, acc_captured_size))).unwrap();
+                    }
+                    handles.append(&mut handle)
                 }
                 Ok(handles)
             }
@@ -594,10 +426,11 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let part_id = split.get_index();
         if acc_arg.dep_info.dep_type() == 1 {
             let res = self.secure_iterator(split).unwrap();
-            self.secure_shuffle_write(res, acc_arg, tx)
+            self.secure_shuffle_write(res, part_id, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)
         }
@@ -655,23 +488,23 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
+        let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
-        acc_arg.insert_rdd_id(cur_rdd_id);
-        acc_arg.insert_op_id(cur_op_id);
-        acc_arg.insert_split_num(cur_split_num);
+        acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
         
         let should_cache = self.should_cache();
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
-                cur_rdd_id, 
+                cur_rdd_id,
+                cur_part_id,
                 tx.clone(),
             );
 
-            if !acc_arg.totally_cached() {
+            if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
             }

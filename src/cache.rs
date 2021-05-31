@@ -11,12 +11,11 @@ use crate::rdd::CacheMeta;
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum CachePutResponse {
     CachePutSuccess(usize),
-    CachePutPartial,
     CachePutFailure,
 }
 
 type CacheMap = Arc<DashMap<((usize, usize), usize), (Vec<u8>, usize)>>;
-type SecureCacheMap = Arc<DashMap<((usize, usize), usize, usize), (usize, usize)>>; //(((key_space_id, cached_rdd_id), part_id, sub_part_id), (encrypted_data, size))
+type SecureCacheMap = Arc<DashMap<((usize, usize), usize), (usize, usize)>>; //(((key_space_id, cached_rdd_id), part_id), (encrypted_data, size))
 
 // Despite the name, it is currently unbounded cache. Once done with LRU iterator, have to make this bounded.
 // Since we are storing everything as serialized objects, size estimation is as simple as getting the length of byte vector
@@ -27,10 +26,6 @@ pub(crate) struct BoundedMemoryCache {
     current_bytes: usize,
     map: CacheMap,
     smap: SecureCacheMap,
-    //<(cached_rdd_id, part_id), HashSet<sub_part_id>>
-    //contains all sub_part_ids whether or not its corresponding value is cached
-    subpid_map: Arc<DashMap<(usize, usize), BTreeSet<usize>>>,
-    size_map: Arc<DashMap<(usize, usize), usize>>,  //rdd_id, part_id -> size
 }
 
 // TODO: remove all hardcoded values
@@ -42,8 +37,6 @@ impl BoundedMemoryCache {
             current_bytes: 0,
             map: Arc::new(DashMap::new()),
             smap: Arc::new(DashMap::new()),
-            subpid_map: Arc::new(DashMap::new()),
-            size_map: Arc::new(DashMap::new()),
         }
     }
 
@@ -79,13 +72,13 @@ impl BoundedMemoryCache {
         }
     }
 
-    pub fn scontain(&self, dataset_id: (usize, usize), part_id: usize, sub_part_id: usize) -> bool {
-        self.smap.contains_key(&(dataset_id, part_id, sub_part_id))
+    pub fn scontain(&self, dataset_id: (usize, usize), part_id: usize) -> bool {
+        self.smap.contains_key(&(dataset_id, part_id))
     }
 
-    pub fn sget(&self, dataset_id: (usize, usize), part_id: usize, sub_part_id: usize) -> Option<usize> {
+    pub fn sget(&self, dataset_id: (usize, usize), part_id: usize) -> Option<usize> {
         self.smap
-            .get(&(dataset_id, part_id, sub_part_id))
+            .get(&(dataset_id, part_id))
             .map(|entry| entry.0.clone())
     }
 
@@ -93,7 +86,6 @@ impl BoundedMemoryCache {
         &self,
         dataset_id: (usize, usize),
         part_id: usize,
-        sub_part_id: usize,
         value_ptr: *mut u8,
         avoid_moving: usize, //0 for need, and >0 for size in case of no need
     ) -> CachePutResponse {
@@ -107,25 +99,14 @@ impl BoundedMemoryCache {
             (value_ptr, avoid_moving)
         };
 
-        let key = (dataset_id, part_id, sub_part_id);
+        let key = (dataset_id, part_id);
         if size as f64 / (1000.0 * 1000.0) > self.max_mbytes as f64 {
-            if let Some(subpids) = self.subpid_map.get(&(dataset_id.1, part_id)) {
-                subpids.iter().map(|id| self.smap.remove(&(dataset_id, part_id, *id))).count();
-            }
+            self.smap.remove(&key);
             CachePutResponse::CachePutFailure
         } else {
             // TODO: ensure free space needs to be done and this needs to be modified
             self.smap.insert(key, (value as usize, size));
-            if let Some(mut acc_size) = self.size_map.get_mut(&(dataset_id.1, part_id)) {
-                *acc_size += size;
-            } else {
-                self.size_map.insert((dataset_id.1, part_id), size);
-            }
-            if sub_part_id == *self.subpid_map.get(&(dataset_id.1, part_id)).unwrap().last().unwrap() {
-                CachePutResponse::CachePutSuccess(self.size_map.remove(&(dataset_id.1, part_id)).unwrap().1)
-            } else {
-                CachePutResponse::CachePutPartial
-            }
+            CachePutResponse::CachePutSuccess(size)
         }
     }
 
@@ -138,26 +119,6 @@ impl BoundedMemoryCache {
                 None => panic!("invalid cached rdd id"),
             };
             rdd_base.free_data_enc(value.0 as *mut u8);
-        }
-    }
-
-    pub fn insert_subpid(&self, cache_meta: &CacheMeta) {
-        let (rdd_id, part_id, sub_part_id) = cache_meta.get_triplet();
-        if let Some(mut set) = self.subpid_map.get_mut(&(rdd_id, part_id)) {
-            set.insert(sub_part_id);
-            return;
-        }
-        let mut hs = BTreeSet::new();
-        hs.insert(sub_part_id);
-        self.subpid_map.insert((rdd_id, part_id), hs);
-    }
-
-    pub fn get_subpid(&self, rdd_id: usize, part_id: usize) -> Vec<usize> {
-        match self.subpid_map
-            .get(&(rdd_id, part_id)) 
-        {
-            Some(v) => v.iter().cloned().collect(),
-            None => Vec::new(),
         }
     }
 
@@ -193,18 +154,15 @@ impl<'a> KeySpace<'a> {
         self.cache
             .put((self.key_space_id, dataset_id), partition, value)
     }
-    pub fn scontain(&self, rdd_id: usize, part_id: usize, sub_part_id: usize) -> bool {
-        self.cache.scontain((self.key_space_id, rdd_id), part_id, sub_part_id)
+    pub fn scontain(&self, rdd_id: usize, part_id: usize) -> bool {
+        self.cache.scontain((self.key_space_id, rdd_id), part_id)
     }
-    pub fn get_subpid(&self, rdd_id: usize, part_id: usize) -> Vec<usize> {
-        self.cache.get_subpid(rdd_id, part_id)
+    pub fn sget(&self, dataset_id: usize, part_id: usize) -> Option<usize> {
+        self.cache.sget((self.key_space_id, dataset_id), part_id)
     }
-    pub fn sget(&self, dataset_id: usize, part_id: usize, sub_part_id: usize) -> Option<usize> {
-        self.cache.sget((self.key_space_id, dataset_id), part_id, sub_part_id)
-    }
-    pub fn sput(&self, dataset_id: usize, part_id: usize, sub_part_id: usize, value: *mut u8, avoid_moving: usize) -> CachePutResponse {
+    pub fn sput(&self, dataset_id: usize, part_id: usize, value: *mut u8, avoid_moving: usize) -> CachePutResponse {
         self.cache
-            .sput((self.key_space_id, dataset_id), part_id, sub_part_id, value, avoid_moving)
+            .sput((self.key_space_id, dataset_id), part_id, value, avoid_moving)
     }
     pub fn get_capacity(&self) -> usize {
         self.cache.max_mbytes

@@ -68,7 +68,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> JoinHandle<()> {
+    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> JoinHandle<()> {
         let data = self.values.clone();  
         let len = data.len();
         if len == 0 {
@@ -347,10 +347,11 @@ where
         self.rdd_vals.num_slices
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let part_id = split.get_index();
         if acc_arg.dep_info.dep_type() == 1 {
             let res = self.secure_iterator(split).unwrap();
-            self.secure_shuffle_write(res, acc_arg, tx)
+            self.secure_shuffle_write(res, part_id, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)
         }
@@ -403,24 +404,24 @@ where
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
             let cur_rdd_id = self.get_rdd_id();
             let cur_op_id = self.get_op_id();
+            let cur_part_id = split.get_index();
             let cur_split_num = self.number_of_splits();
-            acc_arg.insert_rdd_id(cur_rdd_id);
-            acc_arg.insert_op_id(cur_op_id);
-            acc_arg.insert_split_num(cur_split_num);
+            acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
 
             let should_cache = self.should_cache();
             if should_cache {
                 let mut handles = secure_compute_cached(
                     acc_arg, 
-                    cur_rdd_id, 
+                    cur_rdd_id,
+                    cur_part_id,
                     tx.clone(),
                 );
     
-                if !acc_arg.totally_cached() {
+                if handles.is_empty() {
                     acc_arg.set_caching_rdd_id(cur_rdd_id);
                     handles.append(&mut vec![s.secure_iterator(acc_arg, tx)]);
                 }

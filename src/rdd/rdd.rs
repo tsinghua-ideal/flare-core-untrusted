@@ -83,6 +83,7 @@ extern "C" {
         tid: u64,
         rdd_ids: *const u8,
         op_ids: *const u8,
+        part_ids: *const u8,
         cache_meta: CacheMeta,
         dep_info: DepInfo,
         input: Input,
@@ -179,16 +180,6 @@ extern "C" {
         eid: sgx_enclave_id_t,
         input: *mut u8, 
     ) -> sgx_status_t;
-    pub fn probe_caching(
-        eid: sgx_enclave_id_t,
-        ret_val: *mut usize,
-        rdd_id: usize,
-        part: usize,
-    ) -> sgx_status_t;
-    pub fn finish_probe_caching(
-        eid: sgx_enclave_id_t,
-        cached_sub_parts: *mut u8,
-    ) -> sgx_status_t;
 }
 
 #[no_mangle]
@@ -199,20 +190,18 @@ pub unsafe extern "C" fn sbrk_o(increment: usize) -> *mut c_void {
 #[no_mangle]
 pub unsafe extern "C" fn ocall_cache_to_outside(rdd_id: usize,
     part_id: usize,
-    sub_part_id: usize,
     data_ptr: usize,
 ) -> u8 {
     //need to clone from memory alloced by ucmalloc to memory alloced by default allocator
-    Env::get().cache_tracker.put_sdata((rdd_id, part_id, sub_part_id), data_ptr as *mut u8, 0);
+    Env::get().cache_tracker.put_sdata((rdd_id, part_id), data_ptr as *mut u8, 0);
     0  //need to revise
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ocall_cache_from_outside(rdd_id: usize,
     part_id: usize,
-    sub_part_id: usize,
 ) -> usize {
-    let res = Env::get().cache_tracker.get_sdata((rdd_id, part_id, sub_part_id));
+    let res = Env::get().cache_tracker.get_sdata((rdd_id, part_id));
     match res {
         Some(val) => val,
         None => 0,
@@ -228,6 +217,7 @@ pub fn default_hash<T: Hash>(t: &T) -> u64 {
 pub fn wrapper_secure_execute<T>(
     rdd_ids: &Vec<usize>, 
     op_ids: &Vec<OpId>,
+    part_ids: &Vec<usize>,
     cache_meta: CacheMeta,
     dep_info: DepInfo, 
     data: &T,
@@ -256,6 +246,7 @@ where
             tid,
             rdd_ids as *const Vec<usize> as *const u8,
             op_ids as *const Vec<OpId> as *const u8,
+            part_ids as *const Vec<usize> as *const u8,
             cache_meta,
             dep_info,
             input,
@@ -272,10 +263,14 @@ where
     (result_bl_ptr, (dur_comp, (last_mem_usage as f64, max_mem_usage as f64)))
 }
 
-pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> f64 {
+pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usize, (f64, f64, usize))>) -> f64 {
     let len = data.len();
+    //For narrow, streaming process in enclave
+    if acc_arg.dep_info.is_shuffle == 0 {
+        acc_arg.block_len.store(len, atomic::Ordering::SeqCst);
+    }
+
     let mut wait = 0.0;
-    let mut sub_part_id = 0;
     let mut cache_meta = acc_arg.to_cache_meta();
     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
         &acc_arg.op_ids,
@@ -283,7 +278,10 @@ pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usi
         cache_meta, 
         acc_arg.dep_info,
     );
-    let mut is_survivor = spec_call_seq_ptr.is_some();
+    if spec_call_seq_ptr.is_some() {
+        cache_meta.enable_spec();
+    }
+
     let mut cur = 0;
     let mut to_set_usage = 0;
     while cur < len {
@@ -292,7 +290,6 @@ pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usi
         let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
         wait += wait_dur;
 
-        //update block_len
         let block_len = acc_arg.block_len.load(atomic::Ordering::SeqCst);
         let cur_usage = acc_arg.cur_usage.load(atomic::Ordering::SeqCst);
         if cur_usage != 0 {
@@ -302,41 +299,29 @@ pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usi
             true => len,
             false => cur + block_len,
         };
-        is_survivor = is_survivor || (next == len && acc_arg.part_id == acc_arg.split_nums.last().unwrap() - 1);
-        //currently, all sub_partitions are not cached as long as coming to this rdd
-        if !acc_arg.cached(&sub_part_id) {
-            cache_meta.set_sub_part_id(sub_part_id);
-            cache_meta.set_is_survivor(is_survivor);
-            BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-            let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
-                &acc_arg.rdd_ids,
-                &acc_arg.op_ids,
-                cache_meta,
-                acc_arg.dep_info,
-                &data,
-                &mut vec![cur],
-                &mut vec![next],
-                &vec![len],
-                block_len,
-                to_set_usage,
-                &acc_arg.captured_vars,
-            );
-            wrapper_spec_execute(
-                &spec_call_seq_ptr, 
-                cache_meta,
-            );
-            match acc_arg.dep_info.is_shuffle == 0 {
-                true => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.0, acc_arg.acc_captured_size)))).unwrap(),
-                false => tx.send((sub_part_id, (result_bl_ptr, (time_comp, mem_usage.1, acc_arg.acc_captured_size)))).unwrap(),
-            };
-            to_set_usage = match spec_call_seq_ptr.is_none() {
-                true => mem_usage.0 as usize,
-                false => 0,
-            }
-        }
-        sub_part_id += 1;
+
+        let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
+            &acc_arg.rdd_ids,
+            &acc_arg.op_ids,
+            &acc_arg.part_ids,
+            cache_meta,
+            acc_arg.dep_info,
+            &data,
+            &mut vec![cur],
+            &mut vec![next],
+            &vec![len],
+            block_len,
+            to_set_usage,
+            &acc_arg.captured_vars,
+        );
+        wrapper_spec_execute(
+            &spec_call_seq_ptr, 
+            cache_meta,
+        );
+        tx.send((result_bl_ptr, (time_comp, mem_usage.1, acc_arg.acc_captured_size))).unwrap();
         cur = next; 
     }
+
     wait
 }
 
@@ -574,7 +559,7 @@ pub fn wrapper_spec_execute(
     let res = get_encrypted_data::<Vec<u8>>(Default::default(), DepInfo::padding_new(1), retval as *mut u8, true);
     let key = (
         hash_ops,
-        cache_meta.part_id,
+        cache_meta.caching_part_id,
         spec_call_seq.as_ref().unwrap().1,
     );
 
@@ -591,6 +576,7 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId) -> usiz
     let captured_vars = HashMap::new();
     let rdd_ids = vec![rdd_id];
     let op_ids = vec![op_id];
+    let part_ids = vec![0 as usize]; //placeholder
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut init_mem_usage = 0;
     let mut last_mem_usage = 0;
@@ -604,6 +590,7 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId) -> usiz
             tid,
             &rdd_ids as *const Vec<usize> as *const u8,
             &op_ids as *const Vec<OpId> as *const u8,
+            &part_ids as *const Vec<usize> as *const u8,
             Default::default(),  //meaningless
             DepInfo::padding_new(3),   //3 is for reduce & fold & aggregate
             input,
@@ -660,7 +647,7 @@ where
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(2), retval as *mut u8, false);
+    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(0), retval as *mut u8, false);
     *res
 }
 
@@ -706,7 +693,7 @@ pub fn wrapper_take<T: Data>(op_id: OpId, input: &Vec<T>, should_take: usize) ->
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(2), retval as *mut u8, false);
+    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(0), retval as *mut u8, false);
     (*res, have_take)
 }
 
@@ -852,7 +839,7 @@ pub fn move_data<T: Clone>(op_id: OpId, data: *mut u8) -> Box<Vec<T>> {
         priv_free_res_enc(
             eid,
             op_id,
-            DepInfo::padding_new(2), //default to 2, for cache should not appear at the end of stage
+            DepInfo::padding_new(0), //default to 0, for cache should not appear at the end of stage
             data
         )
     };
@@ -959,87 +946,22 @@ where
     data
 }
 
-//Return the cached or caching sub-partition number
-pub fn cached_or_caching_in_enclave(rdd_id: usize, part: usize) -> BTreeSet<usize> {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let mut ret_val = 0;
-    let sgx_status = unsafe {
-        probe_caching(
-            eid,
-            &mut ret_val,
-            rdd_id,
-            part,
-        )
-    };
-    match sgx_status {
-        sgx_status_t::SGX_SUCCESS => (),
-        _ => {
-            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
-    };
-    let cached_sub_parts_ = unsafe {
-        Box::from_raw(ret_val as *mut u8 as *mut Vec<usize>)
-    };
-    let cached_sub_parts = cached_sub_parts_.clone();
-    forget(cached_sub_parts_);
-    let sgx_status = unsafe {
-        finish_probe_caching(
-            eid,
-            ret_val as *mut u8,
-        )
-    };
-    match sgx_status {
-        sgx_status_t::SGX_SUCCESS => (),
-        _ => {
-            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
-    };
-    cached_sub_parts.into_iter().collect()
-}
-
 pub fn secure_compute_cached(
     acc_arg: &mut AccArg,
     cur_rdd_id: usize, 
-    tx: SyncSender<(usize, (usize, (f64, f64, usize)))>,
+    cur_part_id: usize,
+    tx: SyncSender<(usize, (f64, f64, usize))>,
 ) -> Vec<JoinHandle<()>> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let part_id = acc_arg.part_id;
-    //check whether it is cached inside enclave
-    let cached_sub_parts_in = cached_or_caching_in_enclave(cur_rdd_id, part_id);
-    //check whether it is cached outside enclave
-    let uncached_sub_parts = Env::get().cache_tracker
-        .get_uncached_subpids(cur_rdd_id, part_id)
-        .difference(&cached_sub_parts_in)
-        .map(|x| *x)
-        .collect::<BTreeSet<_>>();
-    let mut cached_sub_parts_out = Env::get().cache_tracker
-        .get_cached_subpids(cur_rdd_id, part_id)
-        .difference(&cached_sub_parts_in)
-        .map(|x| *x)
-        .collect::<Vec<_>>();
-    let mut cached_sub_parts = cached_sub_parts_in.into_iter().collect::<Vec<_>>();
-    cached_sub_parts.append(&mut cached_sub_parts_out);
-    // this cannot guarantee that cached data in enclave is used first
-    /*
-    cached_sub_parts = cached_sub_parts.union(&Env::get().cache_tracker.get_cached_subpids(cur_rdd_id, part_id))
-        .map(|x| *x)
-        .collect::<BTreeSet<_>>();
-    */
-    
-    //println!("get_subpids {:?}, {:?}", cur_rdd_id, part_id);
-    let subpids = Env::get().cache_tracker.get_subpids(cur_rdd_id, part_id);
-    //println!("subpids = {:?}, cached = {:?}, uncached = {:?}", subpids, cached_sub_parts, uncached_sub_parts);
-    assert_eq!(uncached_sub_parts.len() + cached_sub_parts.len(), subpids.len());
 
-    acc_arg.cached_sub_parts = cached_sub_parts.clone().into_iter().collect::<BTreeSet<_>>();
-    acc_arg.sub_parts_len = subpids.len();
+    let is_cached = Env::get().cache_tracker.scontain((cur_rdd_id, cur_part_id));
     let mut handles = Vec::new();
-    let cached_sub_parts_len = cached_sub_parts.len(); 
-    if cached_sub_parts_len > 0 {
+    if is_cached {
         acc_arg.set_cached_rdd_id(cur_rdd_id);
         // Compute based on cached values
         let rdd_ids = acc_arg.rdd_ids.clone();
         let op_ids = acc_arg.op_ids.clone();
+        let part_ids = acc_arg.part_ids.clone();
         let split_nums = acc_arg.split_nums.clone();
         let mut cache_meta = acc_arg.to_cache_meta();
         let dep_info = acc_arg.dep_info;
@@ -1049,56 +971,52 @@ pub fn secure_compute_cached(
 
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
-            for (seq_id, sub_part) in cached_sub_parts.into_iter().enumerate() {
-                let mut is_survivor = cached_sub_parts_len == subpids.len() &&  cached_sub_parts_len-1 == seq_id && cache_meta.part_id == split_nums.last().unwrap() - 1;
-                //No need to get memory usage, for the sub-partition is fixed when using cached data
-                let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                    &op_ids, 
-                    &split_nums,
-                    cache_meta, 
-                    dep_info,
-                );
-                if spec_call_seq_ptr.is_some() {
-                    is_survivor = true;
-                }
-                cache_meta.set_sub_part_id(sub_part);
-                cache_meta.set_is_survivor(is_survivor);
-                BOUNDED_MEM_CACHE.insert_subpid(&cache_meta);
-                let mut init_mem_usage = 0;
-                let mut last_mem_usage = 0;
-                let mut max_mem_usage = 0;
-                let mut result_ptr: usize = 0;
-                while eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
-                    //wait
-                }
-                let now_comp = Instant::now();
-                let sgx_status = unsafe {
-                    secure_execute(
-                        eid,
-                        &mut result_ptr,
-                        tid,
-                        &rdd_ids as *const Vec<usize> as *const u8,
-                        &op_ids as *const Vec<OpId> as *const u8,
-                        cache_meta,
-                        dep_info,   
-                        Input::padding(&mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage), //invalid pointer  TODO: send valid pointer
-                        &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-                    )
-                };
-                match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {},
-                    _ => {
-                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                    },
-                };
-                let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-                wrapper_spec_execute(
-                    &spec_call_seq_ptr, 
-                    cache_meta,
-                    
-                );
-                tx.send((sub_part, (result_ptr, (dur_comp, max_mem_usage as f64, acc_captured_size)))).unwrap();
+            //No need to get memory usage, for the sub-partition is fixed when using cached data
+            let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+                &op_ids, 
+                &split_nums,
+                cache_meta, 
+                dep_info,
+            );
+            if spec_call_seq_ptr.is_some() {
+                cache_meta.enable_spec();
             }
+            let mut init_mem_usage = 0;
+            let mut last_mem_usage = 0;
+            let mut max_mem_usage = 0;
+            let mut result_ptr: usize = 0;
+            while eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+                //wait
+            }
+            let now_comp = Instant::now();
+            let sgx_status = unsafe {
+                secure_execute(
+                    eid,
+                    &mut result_ptr,
+                    tid,
+                    &rdd_ids as *const Vec<usize> as *const u8,
+                    &op_ids as *const Vec<OpId> as *const u8,
+                    &part_ids as *const Vec<usize> as *const u8,
+                    cache_meta,
+                    dep_info,   
+                    Input::padding(&mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage), //invalid pointer  TODO: send valid pointer
+                    &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
+                )
+            };
+            match sgx_status {
+                sgx_status_t::SGX_SUCCESS => {},
+                _ => {
+                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                },
+            };
+            let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
+            wrapper_spec_execute(
+                &spec_call_seq_ptr, 
+                cache_meta,
+                
+            );
+            tx.send((result_ptr, (dur_comp, max_mem_usage as f64, acc_captured_size))).unwrap();
+        
         });
         handles.push(handle);
     } else {
@@ -1112,13 +1030,11 @@ pub fn secure_compute_cached(
 pub struct AccArg {
     pub rdd_ids: Vec<usize>,
     pub op_ids: Vec<OpId>,
+    pub part_ids: Vec<usize>,
     pub split_nums: Vec<usize>, 
-    pub part_id: usize,
     pub dep_info: DepInfo,
     caching_rdd_id: usize,
     cached_rdd_id: usize,
-    pub cached_sub_parts: BTreeSet<usize>,
-    pub sub_parts_len: usize,
     pub eenter_lock: Arc<AtomicBool>,
     pub block_len: Arc<AtomicUsize>,
     pub cur_usage: Arc<AtomicUsize>,  //for transfer the cur memory usage in union thread to prev thread
@@ -1139,13 +1055,11 @@ impl AccArg {
         AccArg {
             rdd_ids: Vec::new(),
             op_ids: Vec::new(),
+            part_ids: Vec::new(),
             split_nums,
-            part_id,
             dep_info,
             caching_rdd_id: 0,
             cached_rdd_id: 0,
-            cached_sub_parts: BTreeSet::new(),
-            sub_parts_len: 0,
             eenter_lock,
             block_len,
             cur_usage,
@@ -1188,44 +1102,34 @@ impl AccArg {
         let len = self.rdd_ids.len();
         assert_eq!(len, self.op_ids.len());
         let mut caching_op_id = Default::default();
+        let mut caching_part_id = Default::default();
         let mut cached_op_id = Default::default();
+        let mut cached_part_id = Default::default();
         for idx in 0..len {
             if self.caching_rdd_id == self.rdd_ids[idx] {
                 caching_op_id = self.op_ids[idx];
+                caching_part_id = self.part_ids[idx];
             }
             if self.cached_rdd_id == self.rdd_ids[idx] {
                 cached_op_id = self.op_ids[idx];
+                cached_part_id = self.part_ids[idx];
             }
         }
 
         CacheMeta::new(
             self.caching_rdd_id,
             caching_op_id,
+            caching_part_id,
             self.cached_rdd_id,
             cached_op_id,
-            self.part_id,
+            cached_part_id,
         )
     }
 
-    pub fn totally_cached(&self) -> bool {
-        let not_totally_cached = self.cached_sub_parts.len() < self.sub_parts_len ||
-            self.sub_parts_len == 0;
-        !not_totally_cached
-    }
-
-    pub fn cached(&self, subpid: &usize) -> bool {
-        self.cached_sub_parts.contains(subpid)
-    }
-
-    pub fn insert_rdd_id(&mut self, rdd_id: usize) {
+    pub fn insert_quadruple(&mut self, rdd_id: usize, op_id: OpId, part_id: usize, split_num: usize) {
         self.rdd_ids.push(rdd_id);
-    }
-
-    pub fn insert_op_id(&mut self, op_id: OpId) {
         self.op_ids.push(op_id);
-    }
-
-    pub fn insert_split_num(&mut self, split_num: usize) {
+        self.part_ids.push(part_id);
         self.split_nums.push(split_num);
     }
 
@@ -1249,48 +1153,41 @@ impl AccArg {
 pub struct CacheMeta {
     caching_rdd_id: usize,
     caching_op_id: OpId,
+    caching_part_id: usize,
     cached_rdd_id: usize,
     cached_op_id: OpId,
-    part_id: usize,
-    sub_part_id: usize, 
-    is_survivor: u8,
+    cached_part_id: usize,
+    can_spec: u8,
 }
 
 impl CacheMeta {
     pub fn new(
         caching_rdd_id: usize,
         caching_op_id: OpId,
+        caching_part_id: usize,
         cached_rdd_id: usize,
         cached_op_id: OpId,
-        part_id: usize,
+        cached_part_id: usize,
     ) -> Self {
         CacheMeta {
             caching_rdd_id,
             caching_op_id,
+            caching_part_id,
             cached_rdd_id,
             cached_op_id,
-            part_id,
-            sub_part_id: 0,
-            is_survivor: 0,
+            cached_part_id,
+            can_spec: 0,
         }
     }
 
-    pub fn set_sub_part_id(&mut self, sub_part_id: usize) {
-        self.sub_part_id = sub_part_id;
+    pub fn enable_spec(&mut self) {
+        self.can_spec = 1;
     }
 
-    pub fn set_is_survivor(&mut self, is_survivor: bool) {
-        match is_survivor {
-            true => self.is_survivor = 1,
-            false => self.is_survivor = 0,
-        }
-    }
-
-    pub fn get_triplet(&self) -> (usize, usize, usize) {
+    pub fn get_triplet(&self) -> (usize, usize) {
         (
             self.caching_rdd_id,
-            self.part_id,
-            self.sub_part_id,    
+            self.caching_part_id,   
         )
     }
 }
@@ -1685,7 +1582,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>>;
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -1756,7 +1653,7 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         (**self).get_rdd_base().iterator_raw(split, acc_arg, tx)
     }    
     fn iterator_any(
@@ -1781,7 +1678,7 @@ impl<I: RddE + ?Sized> Rdd for SerArc<I> {
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         (**self).secure_compute(split, acc_arg, tx)
     }
 
@@ -1828,7 +1725,7 @@ pub trait Rdd: RddBase + 'static {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>>;
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>>;
 }
 
 pub trait RddE: Rdd {
@@ -1853,7 +1750,7 @@ pub trait RddE: Rdd {
         let rdd_id = self.get_rdd_id();
         let op_id = self.get_op_id();
         let part_id = split.get_index();
-        let dep_info = DepInfo::padding_new(2);
+        let dep_info = DepInfo::padding_new(0);
         let mut acc_arg = AccArg::new(part_id, 
             dep_info, 
             None, 
@@ -1868,7 +1765,7 @@ pub trait RddE: Rdd {
         let mut result = Vec::new();
         let mut slopes = Vec::new();
         let mut aggresive = true;
-        for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
+        for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx {
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
             dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
             acc_arg.free_enclave_lock();
@@ -1878,7 +1775,7 @@ pub trait RddE: Rdd {
                 //cache
                 let size = result_bl.get_size();
                 let data_ptr = Box::into_raw(result_bl);
-                Env::get().cache_tracker.put_sdata((rdd_id, part_id, sub_part_id), data_ptr as *mut u8, size);
+                Env::get().cache_tracker.put_sdata((rdd_id, part_id), data_ptr as *mut u8, size);
             } else {
                 result.append(result_bl.borrow_mut());
             }
@@ -1889,13 +1786,11 @@ pub trait RddE: Rdd {
         Ok(Box::new(result.into_iter()))
     }
 
-    fn secure_shuffle_write(&self, data: Box<dyn Iterator<Item = Self::ItemE>>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_shuffle_write(&self, data: Box<dyn Iterator<Item = Self::ItemE>>, cur_part_id: usize, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_split_num = self.number_of_splits();
-        acc_arg.insert_rdd_id(cur_rdd_id);
-        acc_arg.insert_op_id(cur_op_id);
-        acc_arg.insert_split_num(cur_split_num);
+        acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
         
         let data = data.collect::<Vec<_>>();
         let acc_arg = acc_arg.clone();
@@ -2385,7 +2280,6 @@ pub trait RddE: Rdd {
 
 
     /// Return the count of each unique value in this RDD as a dictionary of (value, count) pairs.
-    /// TODO fe and fd should be drived from RddE automatically, not act as input
     #[track_caller]
     fn count_by_value(&self) -> SerArc<dyn RddE<Item = (Self::Item, u64), ItemE = (Self::ItemE, Vec<u8>)>>
     where
@@ -2421,7 +2315,6 @@ pub trait RddE: Rdd {
             assert_eq!(pt_x.len(), pt_y.len());
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
-        //TODO modify reduce_by_key
         let mapped = self.map(Fn!(|x| (x, 1u64)), fe_wrapper_mp, fd_wrapper_mp);
         self.get_context().add_num(1);
         mapped.reduce_by_key(

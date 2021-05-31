@@ -142,10 +142,11 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let part_id = split.get_index();
         if acc_arg.dep_info.dep_type() == 1 {
             let res = self.secure_iterator(split).unwrap();
-            self.secure_shuffle_write(res, acc_arg, tx)
+            self.secure_shuffle_write(res, part_id, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)
         }
@@ -206,13 +207,12 @@ where
         Ok(Box::new(self.prev.iterator(split)?.flat_map(f)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
+        let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
-        acc_arg.insert_rdd_id(cur_rdd_id);
-        acc_arg.insert_op_id(cur_op_id);
-        acc_arg.insert_split_num(cur_split_num);
+        acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
         let captured_vars = self.f.get_ser_captured_var(); 
         if !captured_vars.is_empty() {
             acc_arg.acc_captured_size += captured_vars.get_size();
@@ -222,11 +222,12 @@ where
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
-                cur_rdd_id, 
+                cur_rdd_id,
+                cur_part_id,
                 tx.clone(),
             );
 
-            if !acc_arg.totally_cached() {
+            if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
             }

@@ -138,7 +138,7 @@ where
         }
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
             let mut deps = split.clone().deps;
             let mut num_sub_part = vec![0, 0]; //kv, kw
@@ -149,7 +149,7 @@ where
                     let (tx, rx) = mpsc::sync_channel(0);
                     let part_id = split.get_index();
                     let mut acc_arg_cg = AccArg::new(part_id,
-                        DepInfo::padding_new(2), 
+                        DepInfo::padding_new(0), 
                         None,
                         Arc::new(AtomicBool::new(false)),
                         Arc::new(AtomicUsize::new(1)), 
@@ -162,7 +162,7 @@ where
                     let mut slopes = Vec::new();
                     let mut aggresive = true;
                     let mut kv_0 = Vec::new();
-                    for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
+                    for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx {
                         let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1, &mut aggresive);
                         acc_arg_cg.free_enclave_lock();
@@ -172,7 +172,7 @@ where
                             //cache
                             let size = result_bl.get_size();
                             let data_ptr = Box::into_raw(result_bl);
-                            Env::get().cache_tracker.put_sdata((rdd.get_rdd_id(), part_id, sub_part_id), data_ptr as *mut u8, size);
+                            Env::get().cache_tracker.put_sdata((rdd.get_rdd_id(), part_id), data_ptr as *mut u8, size);
                         } else {
                             kv_0.push(*result_bl);
                         }
@@ -227,7 +227,7 @@ where
                     let (tx, rx) = mpsc::sync_channel(0);
                     let part_id = split.get_index();
                     let mut acc_arg_cg = AccArg::new(part_id,
-                        DepInfo::padding_new(2), 
+                        DepInfo::padding_new(0),
                         None,
                         Arc::new(AtomicBool::new(false)),
                         Arc::new(AtomicUsize::new(1)), 
@@ -240,7 +240,7 @@ where
                     let mut slopes = Vec::new();
                     let mut aggresive = true;
                     let mut kw_0 = Vec::new();
-                    for (sub_part_id, (received, (time_comp, max_mem_usage, acc_captured_size))) in rx {
+                    for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx {
                         let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
                         dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1, &mut aggresive);
                         acc_arg_cg.free_enclave_lock();
@@ -250,7 +250,7 @@ where
                             //cache
                             let size = result_bl.get_size();
                             let data_ptr = Box::into_raw(result_bl);
-                            Env::get().cache_tracker.put_sdata((rdd.get_rdd_id(), part_id, sub_part_id), data_ptr as *mut u8, size);
+                            Env::get().cache_tracker.put_sdata((rdd.get_rdd_id(), part_id), data_ptr as *mut u8, size);
                         } else {
                             kw_0.push(*result_bl);
                         }
@@ -335,7 +335,8 @@ where
         acc_arg.get_enclave_lock();
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
-        let dep_info = DepInfo::padding_new(3);
+        let cur_part_ids = vec![*acc_arg.part_ids.last().unwrap()];
+        let dep_info = DepInfo::padding_new(2);
         let mut lower = vec![0; num_sub_part];
         let mut upper = vec![1; num_sub_part];
         let mut result = Vec::new();
@@ -353,6 +354,7 @@ where
             let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
                 &cur_rdd_ids,
                 &cur_op_ids,
+                &cur_part_ids,
                 Default::default(),
                 dep_info,
                 &buckets,
@@ -537,10 +539,11 @@ where
         Some(part)
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let part_id = split.get_index();
         if acc_arg.dep_info.dep_type() == 1 {
             let res = self.secure_iterator(split).unwrap();
-            self.secure_shuffle_write(res, acc_arg, tx)
+            self.secure_shuffle_write(res, part_id, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)
         }
@@ -653,23 +656,23 @@ where
         }
     }
     
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
+        let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
-        acc_arg.insert_rdd_id(cur_rdd_id);
-        acc_arg.insert_op_id(cur_op_id);
-        acc_arg.insert_split_num(cur_split_num);
+        acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
 
         let should_cache = self.should_cache();
         if should_cache {
             let mut handles = secure_compute_cached(
                 acc_arg, 
-                cur_rdd_id, 
+                cur_rdd_id,
+                cur_part_id,
                 tx.clone(),
             );
 
-            if !acc_arg.totally_cached() {
+            if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
             }

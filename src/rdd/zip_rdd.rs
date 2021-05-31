@@ -124,7 +124,7 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
         self.splits().len()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
@@ -166,7 +166,7 @@ impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
         Ok(Box::new(fst_iter.zip(sec_iter)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         //TODO
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }

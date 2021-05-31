@@ -372,13 +372,7 @@ where
         }
     }
 
-    fn secure_compute_(&self, cur_split_num: usize, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
-        let cur_rdd_id = self.id;
-        let cur_op_id = self.op_id;
-        acc_arg.insert_rdd_id(cur_rdd_id);
-        acc_arg.insert_op_id(cur_op_id);
-        acc_arg.insert_split_num(cur_split_num);
-
+    fn secure_compute_(&self, data: Vec<UE>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
@@ -437,7 +431,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             true
         }
 
-        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+        fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
             self.secure_compute(split, acc_arg, tx)
         }
 
@@ -552,7 +546,7 @@ where
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let now = Instant::now();
         let files_by_part = self.load_local_files()?;
@@ -574,7 +568,12 @@ where
         }
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("io time: {:?} s", dur);
-        self.secure_compute_(self.number_of_splits(), data, acc_arg, tx)
+        let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
+        let cur_part_id = split.get_index();
+        let cur_split_num = self.number_of_splits();
+        acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
+        self.secure_compute_(data, acc_arg, tx)
     }
 }
 
@@ -599,7 +598,7 @@ where
         ) as Box<dyn Iterator<Item = Self::Item>>)
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (usize, (f64, f64, usize)))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<FileReader>().unwrap();
         let files_by_part = self.load_local_files()?;
         let idx = split.idx;
@@ -619,7 +618,12 @@ where
             return Ok(Vec::new());
         }
 
-        self.secure_compute_(self.number_of_splits(), data, acc_arg, tx)
+        let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
+        let cur_part_id = split.get_index();
+        let cur_split_num = self.number_of_splits();
+        acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
+        self.secure_compute_(data, acc_arg, tx)
     }
 }
 

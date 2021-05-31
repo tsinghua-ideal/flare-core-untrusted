@@ -70,7 +70,7 @@ pub(crate) struct CacheTracker {
     slave_usage: DashMap<Ipv4Addr, usize>,
     registered_rdd_ids: DashSet<usize>,
     loading: DashSet<(usize, usize)>,   // (rdd, partition)
-    sloading: DashSet<(usize, usize, usize)>,  // (cached_rdd_id, part_id, sub_part_id)
+    sloading: DashSet<(usize, usize)>,  // (cached_rdd_id, part_id)
     cache: KeySpace<'static>,
     master_addr: SocketAddr,
 }
@@ -326,47 +326,23 @@ impl CacheTracker {
         }
     }
 
-    pub fn get_sdata(&self, key: (usize, usize, usize)) -> Option<usize> {
-        let (rdd_id, part_id, sub_part_id) = key;
-        self.cache.sget(rdd_id, part_id, sub_part_id)
+    pub fn scontain(&self, key: (usize, usize)) -> bool {
+        self.cache.scontain(key.0, key.1)
     }
 
-    pub fn get_subpids(&self, rdd_id: usize, part_id: usize) -> BTreeSet<usize> {
-        self.cache.get_subpid(rdd_id, part_id).into_iter().collect()
-    }
-
-    pub fn get_cached_subpids(&self, rdd_id: usize, part_id: usize) -> BTreeSet<usize> {
-        let cached_sub_parts = self.cache.get_subpid(rdd_id, part_id);
-        cached_sub_parts.into_iter().filter(|id| {
-            while self.sloading.contains(&(rdd_id, part_id, *id)) {
-                let dur = Duration::from_millis(1);
-                thread::sleep(dur);
-            }
-            let cached = self.cache.scontain(rdd_id, part_id, *id);
-            cached
-        }).collect()
-    }
-
-    pub fn get_uncached_subpids(&self, rdd_id: usize, part_id: usize) -> BTreeSet<usize> {
-        let uncached_sub_parts = self.cache.get_subpid(rdd_id, part_id);
-        uncached_sub_parts.into_iter().filter(|id| {
-            while self.sloading.contains(&(rdd_id, part_id, *id)) {
-                let dur = Duration::from_millis(1);
-                thread::sleep(dur);
-            }
-            let not_cached = !self.cache.scontain(rdd_id, part_id, *id);
-            not_cached
-        }).collect()
+    pub fn get_sdata(&self, key: (usize, usize)) -> Option<usize> {
+        let (rdd_id, part_id) = key;
+        self.cache.sget(rdd_id, part_id)
     }
 
     pub fn put_sdata(
         &self,
-        key: (usize, usize, usize),
+        key: (usize, usize),
         value: *mut u8,
         avoid_moving: usize,
     ) {
-        let (rdd_id, part_id, sub_part_id) = key;
-        let put_response = self.cache.sput(rdd_id, part_id, sub_part_id, value, avoid_moving);
+        let (rdd_id, part_id) = key;
+        let put_response = self.cache.sput(rdd_id, part_id, value, avoid_moving);
         if let CachePutResponse::CachePutSuccess(size) = put_response {
             futures::executor::block_on(self.client(CacheTrackerMessage::AddedToCache {
                 rdd_id: rdd_id,
