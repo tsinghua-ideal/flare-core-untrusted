@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::dependency::DepInfo;
 use crate::env;
 use crate::rdd::{RddE, STAGE_LOCK};
 use crate::scheduler::{Task, TaskBase, TaskContext};
@@ -171,7 +172,8 @@ where
                     Box::new(Vec::new().into_iter()),             
                     {
                         STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
-                        let res = match self.rdd.secure_iterator(split) {
+                        let dep_info = DepInfo::padding_new(0);
+                        let res = match self.rdd.secure_iterator(split, dep_info) {
                             Ok(r) => r,
                             Err(_) => Box::new(Vec::new().into_iter()),
                         };

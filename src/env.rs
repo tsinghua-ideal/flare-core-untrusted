@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex,
 
 use crate::cache::BoundedMemoryCache;
 use crate::cache_tracker::CacheTracker;
+use crate::dependency::SpecShuffleCache;
 use crate::error::Error;
 use crate::hosts::Hosts;
 use crate::map_output_tracker::MapOutputTracker;
@@ -24,9 +25,6 @@ use sgx_urts::SgxEnclave;
 
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
 type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
-/// The key is: {op_ids}/{input_id(part_id)}/{identifier}
-type SpecShuffleCache =  Arc<DashMap<(u64, usize, usize), Vec<Vec<Vec<u8>>> >>;
-
 
 const ENV_VAR_PREFIX: &str = "VEGA_";
 pub(crate) const THREAD_PREFIX: &str = "_VEGA";
@@ -35,7 +33,7 @@ static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);
 
 pub(crate) static SHUFFLE_CACHE: Lazy<ShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
-pub(crate) static SPEC_SHUFFLE_CACHE: Lazy<SpecShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
+pub(crate) static SPEC_SHUFFLE_CACHE: Lazy<SpecShuffleCache> = Lazy::new(SpecShuffleCache::new);
 pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(BoundedMemoryCache::new);
 pub(crate) static RDDB_MAP: Lazy<RddBMap> = Lazy::new(|| RddBMap::new()); 
 

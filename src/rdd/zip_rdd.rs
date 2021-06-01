@@ -125,7 +125,11 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
     }
 
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        self.secure_compute(split, acc_arg, tx)
+        todo!()
+    }
+
+    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        todo!()
     }
 
     fn iterator_any(

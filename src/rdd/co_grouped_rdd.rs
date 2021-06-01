@@ -163,7 +163,7 @@ where
                     let mut aggresive = true;
                     let mut kv_0 = Vec::new();
                     for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx {
-                        let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
+                        let result_bl = get_encrypted_data::<(KE, VE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8);
                         dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1, &mut aggresive);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
@@ -241,7 +241,7 @@ where
                     let mut aggresive = true;
                     let mut kw_0 = Vec::new();
                     for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx {
-                        let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8, false);
+                        let result_bl = get_encrypted_data::<(KE, WE)>(rdd.get_op_id(), acc_arg_cg.dep_info, received as *mut u8);
                         dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg_cg.block_len, &mut slopes, &acc_arg_cg.fresh_slope, 1, &mut aggresive);
                         acc_arg_cg.free_enclave_lock();
                         if caching {
@@ -364,10 +364,11 @@ where
                 block_len.load(atomic::Ordering::SeqCst),
                 to_set_usage,
                 &acc_arg.captured_vars,
+                &None,
             );
             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
             dynamic_subpart_meta(dur_comp, mem_usage.1, 0 as f64, &block_len, &mut slopes, &fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
-            let mut result_bl = get_encrypted_data::<(KE, (CE, DE))>(cur_op_ids[0], dep_info, result_bl_ptr as *mut u8, false);
+            let mut result_bl = get_encrypted_data::<(KE, (CE, DE))>(cur_op_ids[0], dep_info, result_bl_ptr as *mut u8);
             result.append(&mut result_bl);
             lower = lower.iter()
                 .zip(upper_bound.iter())
@@ -540,13 +541,23 @@ where
     }
 
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let part_id = split.get_index();
         if acc_arg.dep_info.dep_type() == 1 {
-            let res = self.secure_iterator(split).unwrap();
-            self.secure_shuffle_write(res, part_id, acc_arg, tx)
+            let mut dep_info = acc_arg.dep_info.clone();
+            dep_info.is_shuffle = 0;
+            let res = self.secure_iterator(split, dep_info).unwrap();
+            self.secure_shuffle_write(res, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)
         }
+    }
+
+    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let dep_info = DepInfo::padding_new(0);
+        let op_id = self.get_op_id();
+        let res = Box::new(data_ptr.into_iter()
+            .flat_map(move |data_ptr| get_encrypted_data::<(KE, (CE, DE))>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
+            as Box<dyn Iterator<Item = _>>;
+        self.secure_shuffle_write(res, acc_arg, tx)
     }
 
     fn iterator_any(

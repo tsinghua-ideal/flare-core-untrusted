@@ -433,13 +433,23 @@ where
     }
 
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let part_id = split.get_index();
         if acc_arg.dep_info.dep_type() == 1 {
-            let res = self.secure_iterator(split).unwrap();
-            self.secure_shuffle_write(res, part_id, acc_arg, tx)
+            let mut dep_info = acc_arg.dep_info.clone();
+            dep_info.is_shuffle = 0;
+            let res = self.secure_iterator(split, dep_info).unwrap();
+            self.secure_shuffle_write(res, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)
         }
+    }
+
+    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let dep_info = DepInfo::padding_new(0);
+        let op_id = self.get_op_id();
+        let res = Box::new(data_ptr.into_iter()
+            .flat_map(move |data_ptr| get_encrypted_data::<VE>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
+            as Box<dyn Iterator<Item = _>>;
+        self.secure_shuffle_write(res, acc_arg, tx)
     }
 
     default fn iterator_any(
@@ -658,13 +668,23 @@ where
     }
 
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let part_id = split.get_index();
         if acc_arg.dep_info.dep_type() == 1 {
-            let res = self.secure_iterator(split).unwrap();
-            self.secure_shuffle_write(res, part_id, acc_arg, tx)
+            let mut dep_info = acc_arg.dep_info.clone();
+            dep_info.is_shuffle = 0;
+            let res = self.secure_iterator(split, dep_info).unwrap();
+            self.secure_shuffle_write(res, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)
         }
+    }
+
+    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let dep_info = DepInfo::padding_new(0);
+        let op_id = self.get_op_id();
+        let res = Box::new(data_ptr.into_iter()
+            .flat_map(move |data_ptr| get_encrypted_data::<(KE, UE)>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
+            as Box<dyn Iterator<Item = _>>;
+        self.secure_shuffle_write(res, acc_arg, tx)
     }
 
     // TODO: Analyze the possible error in invariance here
@@ -894,13 +914,23 @@ where
     }
     
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let part_id = split.get_index();
         if acc_arg.dep_info.dep_type() == 1 {
-            let res = self.secure_iterator(split).unwrap();
-            self.secure_shuffle_write(res, part_id, acc_arg, tx)
+            let mut dep_info = acc_arg.dep_info.clone();
+            dep_info.is_shuffle = 0;
+            let res = self.secure_iterator(split, dep_info).unwrap();
+            self.secure_shuffle_write(res, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)
         }
+    }
+
+    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let dep_info = DepInfo::padding_new(0);
+        let op_id = self.get_op_id();
+        let res = Box::new(data_ptr.into_iter()
+            .flat_map(move |data_ptr| get_encrypted_data::<(KE, UE)>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
+            as Box<dyn Iterator<Item = _>>;
+        self.secure_shuffle_write(res, acc_arg, tx)
     }
 
     // TODO: Analyze the possible error in invariance here

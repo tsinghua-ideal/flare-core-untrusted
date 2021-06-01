@@ -88,6 +88,8 @@ extern "C" {
         dep_info: DepInfo,
         input: Input,
         captured_vars: *const u8,
+        spec_call_seq: *const u8,
+        spec_res: *mut usize,
     ) -> sgx_status_t;
     pub fn pre_merge(
         eid: sgx_enclave_id_t,
@@ -105,26 +107,18 @@ extern "C" {
         part_nums: *const u8,
         cache_meta: CacheMeta,
         dep_info: DepInfo,
-        spec_identifier: *mut usize,  
+        spec_identifier: *mut usize,
+        hash_ops: *mut u64, 
     ) -> sgx_status_t;
     pub fn free_spec_seq(
         eid: sgx_enclave_id_t,
         input: *mut u8,
-    ) -> sgx_status_t;
-    pub fn spec_execute(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        tid: u64, 
-        spec_call_seq: usize,
-        cache_meta: CacheMeta, 
-        hash_ops: *mut u64,
     ) -> sgx_status_t;
     pub fn free_res_enc(
         eid: sgx_enclave_id_t,
         op_id: OpId,
         dep_info: DepInfo,
         input: *mut u8,
-        is_spec: u8,
     ) -> sgx_status_t;
     pub fn priv_free_res_enc(
         eid: sgx_enclave_id_t,
@@ -138,7 +132,6 @@ extern "C" {
         dep_info: DepInfo,
         p_buf: *mut u8,
         p_data_enc: *mut u8,
-        is_spec: u8,
     ) -> sgx_status_t;
     pub fn clone_out(
         eid: sgx_enclave_id_t,
@@ -146,7 +139,6 @@ extern "C" {
         dep_info: DepInfo,
         p_out: usize,
         p_data_enc: *mut u8,
-        is_spec: u8,
     ) -> sgx_status_t;
     pub fn randomize_in_place(
         eid: sgx_enclave_id_t,
@@ -227,6 +219,7 @@ pub fn wrapper_secure_execute<T>(
     block_len: usize,
     to_set_usage: usize,
     captured_vars: &HashMap<usize, Vec<Vec<u8>>>,
+    spec_call_seq: &Option<(Vec<OpId>, usize, u64)>,
 ) -> (usize, (f64, (f64, f64)))  //(result_ptr, (time_for_sub_part_computation, last_memory_usage_per_thread, max_memory_usage_per_thread)) 
 where
     T: Construct + Data,
@@ -238,6 +231,9 @@ where
     let mut last_mem_usage = 0;
     let mut max_mem_usage = 0;
     let input = Input::new(data, lower, upper, upper_bound, block_len, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
+    let spec_call_seq = spec_call_seq.clone().unwrap_or((Vec::new(), 0, 0));
+    let mut spec_res: usize = 0; 
+
     let now_comp = Instant::now();
     let sgx_status = unsafe {
         secure_execute(
@@ -251,6 +247,8 @@ where
             dep_info,
             input,
             captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
+            &spec_call_seq.0 as *const Vec<OpId> as *const u8,
+            &mut spec_res,
         )
     };
     match sgx_status {
@@ -259,6 +257,25 @@ where
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
+
+    //have speculative execution
+    if !spec_call_seq.0.is_empty() {
+        let op_id = spec_call_seq.0[1];
+        let key = (
+            spec_call_seq.2, //hash_ops
+            cache_meta.caching_part_id,
+            spec_call_seq.1,
+        );
+
+        println!("have speculative execution, key = {:?}, ops = {:?}", key, spec_call_seq.0);
+    
+        if let Some(mut value) = env::SPEC_SHUFFLE_CACHE.get_mut(&key) {
+            value.0.push(spec_res);
+        } else {
+            env::SPEC_SHUFFLE_CACHE.insert(key, (vec![spec_res], op_id));
+        }
+    }
+
     let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
     (result_bl_ptr, (dur_comp, (last_mem_usage as f64, max_mem_usage as f64)))
 }
@@ -269,7 +286,6 @@ pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usi
     if acc_arg.dep_info.is_shuffle == 0 {
         acc_arg.block_len.store(len, atomic::Ordering::SeqCst);
     }
-
     let mut wait = 0.0;
     let mut cache_meta = acc_arg.to_cache_meta();
     let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
@@ -313,10 +329,7 @@ pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usi
             block_len,
             to_set_usage,
             &acc_arg.captured_vars,
-        );
-        wrapper_spec_execute(
-            &spec_call_seq_ptr, 
-            cache_meta,
+            &spec_call_seq_ptr,
         );
         tx.send((result_bl_ptr, (time_comp, mem_usage.1, acc_arg.acc_captured_size))).unwrap();
         cur = next; 
@@ -442,7 +455,7 @@ pub fn wrapper_pre_merge<T: Data>(
             };
             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
             dynamic_subpart_meta(dur_comp, max_mem_usage as f64, 0 as f64, &block_len, &mut slopes, &fresh_slope, num_splits, &mut aggresive);
-            let mut result_bl = get_encrypted_data::<Vec<T>>(op_id, dep_info, result_ptr as *mut u8, false);
+            let mut result_bl = get_encrypted_data::<Vec<T>>(op_id, dep_info, result_ptr as *mut u8);
             assert!(result_bl.len() == 1);
             result.append(&mut result_bl[0]);
             lower = lower.iter()
@@ -478,10 +491,11 @@ pub fn wrapper_exploit_spec_oppty(
     split_nums: &Vec<usize>,
     cache_meta: CacheMeta,
     dep_info: DepInfo
-) -> Option<((Vec<usize>, Vec<OpId>), usize)> {
+) -> Option<(Vec<OpId>, usize, u64)> {
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut retval: usize = 0;
     let mut spec_identifier = 0;
+    let mut hash_ops: u64= 0;
     let tid: u64 = thread::current().id().as_u64().into();
     let sgx_status = unsafe {
         exploit_spec_oppty(
@@ -492,7 +506,8 @@ pub fn wrapper_exploit_spec_oppty(
             split_nums as *const Vec<usize> as *const u8,
             cache_meta,
             dep_info,
-            &mut spec_identifier
+            &mut spec_identifier,
+            &mut hash_ops,
         )
     };
     match sgx_status {
@@ -502,7 +517,7 @@ pub fn wrapper_exploit_spec_oppty(
         },
     };
     if retval != 0 {
-        let res_ = unsafe{ Box::from_raw(retval as *mut (Vec<usize>, Vec<OpId>)) };
+        let res_ = unsafe{ Box::from_raw(retval as *mut Vec<OpId>) };
         let res = res_.clone();
         forget(res_);
         let sgx_status = unsafe {
@@ -517,57 +532,12 @@ pub fn wrapper_exploit_spec_oppty(
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
             },
         };
-        return None;   //test non-spec case
-        Some((*res, spec_identifier))
+        //return None;   //test non-spec case
+        Some((*res, spec_identifier, hash_ops))
     } else {
         None
     }
 
-}
-
-pub fn wrapper_spec_execute(
-    spec_call_seq: &Option<((Vec<usize>, Vec<OpId>), usize)>,
-    cache_meta: CacheMeta,
-) {
-    if spec_call_seq.is_none() {
-        println!("no speculative execution");
-        return;
-    }
-    println!("begin speculative execution");
-    let mut hash_ops: u64= 0;
-
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let mut retval: usize = 0;
-    let tid: u64 = thread::current().id().as_u64().into();
-    let sgx_status = unsafe {
-        spec_execute(
-            eid,
-            &mut retval,
-            tid, 
-            &spec_call_seq.as_ref().unwrap().0 as *const (Vec<usize>, Vec<OpId>) as usize,
-            cache_meta,
-            &mut hash_ops,
-        )
-    };
-    let _r = match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
-        _ => {
-            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
-    };
-    //The first two args are not used in this case actually
-    let res = get_encrypted_data::<Vec<u8>>(Default::default(), DepInfo::padding_new(1), retval as *mut u8, true);
-    let key = (
-        hash_ops,
-        cache_meta.caching_part_id,
-        spec_call_seq.as_ref().unwrap().1,
-    );
-
-    if let Some(mut value) = env::SPEC_SHUFFLE_CACHE.get_mut(&key) {
-        value.push(*res);
-        return;
-    }
-    env::SPEC_SHUFFLE_CACHE.insert(key, vec![*res]);
 }
 
 pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId) -> usize {
@@ -595,6 +565,8 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId) -> usiz
             DepInfo::padding_new(3),   //3 is for reduce & fold & aggregate
             input,
             &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
+            &Vec::new() as *const Vec<OpId> as *const u8,
+            &mut 0, 
         )
     };
     match sgx_status {
@@ -647,7 +619,7 @@ where
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(0), retval as *mut u8, false);
+    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(0), retval as *mut u8);
     *res
 }
 
@@ -693,7 +665,7 @@ pub fn wrapper_take<T: Data>(op_id: OpId, input: &Vec<T>, should_take: usize) ->
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         },
     };
-    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(0), retval as *mut u8, false);
+    let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(0), retval as *mut u8);
     (*res, have_take)
 }
 
@@ -732,7 +704,7 @@ pub fn wrapper_tail_compute(tail_info: &mut TailCompInfo) {
     *tail_info = *new_tail_info;
 }
 
-pub fn get_encrypted_data<T>(op_id: OpId, dep_info: DepInfo, p_data_enc: *mut u8, is_spec: bool) -> Box<Vec<T>> 
+pub fn get_encrypted_data<T>(op_id: OpId, dep_info: DepInfo, p_data_enc: *mut u8) -> Box<Vec<T>> 
 where
     T:  std::fmt::Debug 
         + Clone 
@@ -743,10 +715,6 @@ where
 {
     let tid: u64 = thread::current().id().as_u64().into();
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let is_spec: u8 = match is_spec {
-        false => 0,
-        true => 1,
-    };
     if immediate_cout {
         let res_ = unsafe{ Box::from_raw(p_data_enc as *mut Vec<T>) };
         let res = res_.clone();
@@ -757,7 +725,6 @@ where
                 op_id,
                 dep_info,
                 p_data_enc,
-                is_spec,
             )
         };
         match sgx_status {
@@ -779,7 +746,6 @@ where
                 dep_info,
                 size_buf_ptr as *mut u8,
                 p_data_enc,   //shuffle write
-                is_spec,
             )
         };
         match sgx_status {
@@ -804,7 +770,6 @@ where
                 dep_info,
                 ptr_out,
                 p_data_enc,
-                is_spec,
             )
         };
         let v = unsafe { Box::from_raw(ptr_out as *mut u8 as *mut Vec<T>) };
@@ -988,6 +953,9 @@ pub fn secure_compute_cached(
             while eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                 //wait
             }
+            let spec_call_seq = spec_call_seq_ptr.unwrap_or((Vec::new(), 0, 0));
+            let mut spec_res: usize = 0; 
+
             let now_comp = Instant::now();
             let sgx_status = unsafe {
                 secure_execute(
@@ -1001,6 +969,8 @@ pub fn secure_compute_cached(
                     dep_info,   
                     Input::padding(&mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage), //invalid pointer  TODO: send valid pointer
                     &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
+                    &spec_call_seq.0 as *const Vec<OpId> as *const u8,
+                    &mut spec_res,
                 )
             };
             match sgx_status {
@@ -1009,14 +979,25 @@ pub fn secure_compute_cached(
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                 },
             };
+
+            //have speculative execution
+            if !spec_call_seq.0.is_empty() {
+                let op_id = spec_call_seq.0[1];
+                let key = (
+                    spec_call_seq.2, //hash_ops
+                    cache_meta.caching_part_id,
+                    spec_call_seq.1,
+                );
+            
+                if let Some(mut value) = env::SPEC_SHUFFLE_CACHE.get_mut(&key) {
+                    value.0.push(spec_res);
+                } else {
+                    env::SPEC_SHUFFLE_CACHE.insert(key, (vec![spec_res], op_id));
+                }
+            }
+
             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-            wrapper_spec_execute(
-                &spec_call_seq_ptr, 
-                cache_meta,
-                
-            );
             tx.send((result_ptr, (dur_comp, max_mem_usage as f64, acc_captured_size))).unwrap();
-        
         });
         handles.push(handle);
     } else {
@@ -1583,6 +1564,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
         self.splits().len()
     }
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>>;
+    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
     fn iterator_any(
         &self,
@@ -1655,7 +1637,10 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     }
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         (**self).get_rdd_base().iterator_raw(split, acc_arg, tx)
-    }    
+    }
+    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        (**self).get_rdd_base().iterator_raw_spec(data_ptr, acc_arg, tx)
+    }
     fn iterator_any(
         &self,
         split: Box<dyn Split>,
@@ -1745,12 +1730,11 @@ pub trait RddE: Rdd {
         batch_decrypt(data_enc, self.get_fd())
     }
 
-    fn secure_iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
+    fn secure_iterator(&self, split: Box<dyn Split>, dep_info: DepInfo) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let (tx, rx) = sync_channel(0);
         let rdd_id = self.get_rdd_id();
         let op_id = self.get_op_id();
         let part_id = split.get_index();
-        let dep_info = DepInfo::padding_new(0);
         let mut acc_arg = AccArg::new(part_id, 
             dep_info, 
             None, 
@@ -1766,7 +1750,7 @@ pub trait RddE: Rdd {
         let mut slopes = Vec::new();
         let mut aggresive = true;
         for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx {
-            let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8, false);
+            let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8);
             dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
             acc_arg.free_enclave_lock();
             if caching {
@@ -1786,12 +1770,7 @@ pub trait RddE: Rdd {
         Ok(Box::new(result.into_iter()))
     }
 
-    fn secure_shuffle_write(&self, data: Box<dyn Iterator<Item = Self::ItemE>>, cur_part_id: usize, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let cur_rdd_id = self.get_rdd_id();
-        let cur_op_id = self.get_op_id();
-        let cur_split_num = self.number_of_splits();
-        acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
-        
+    fn secure_shuffle_write(&self, data: Box<dyn Iterator<Item = Self::ItemE>>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
         let data = data.collect::<Vec<_>>();
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
@@ -1957,7 +1936,6 @@ pub trait RddE: Rdd {
             self.get_op_id(), 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
-            false,
         );
         /* Return type: Result<Option<UE>> */
         /*
@@ -2027,7 +2005,6 @@ pub trait RddE: Rdd {
             self.get_op_id(), 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
-            false,
         );
         /* Return type: Result<UE> */
         /*
@@ -2092,7 +2069,6 @@ pub trait RddE: Rdd {
             self.get_op_id(), 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
-            false,
         );
         /* Return type: Result<UE> */
         /*

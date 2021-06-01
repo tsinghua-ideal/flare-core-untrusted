@@ -402,11 +402,12 @@ impl Context {
     }
 
     fn worker_clean_up_directives(run_result: Result<Signal>, work_dir: PathBuf) -> Result<!> {
+        env::SPEC_SHUFFLE_CACHE.free_data_enc();
+        env::BOUNDED_MEM_CACHE.free_data_enc();
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
         if let Some(enclave) = std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None) {
             enclave.destroy();
         }
-        env::BOUNDED_MEM_CACHE.free_data_enc();
         utils::clean_up_work_dir(&work_dir);
         match run_result {
             Err(err) => {
@@ -424,11 +425,12 @@ impl Context {
         Context::drop_executors(executors);
         // Give some time for the executors to shut down and clean up
         std::thread::sleep(std::time::Duration::from_millis(1_500));
+        env::SPEC_SHUFFLE_CACHE.free_data_enc();
+        env::BOUNDED_MEM_CACHE.free_data_enc();
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
         if let Some(enclave) = std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None) {
             enclave.destroy();
         }
-        env::BOUNDED_MEM_CACHE.free_data_enc();
         utils::clean_up_work_dir(work_dir);
     }
 

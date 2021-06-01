@@ -435,6 +435,10 @@ macro_rules! impl_common_lfs_rddb_funcs {
             self.secure_compute(split, acc_arg, tx)
         }
 
+        fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+            unreachable!()
+        }
+
         default fn iterator_any(
             &self,
             split: Box<dyn Split>,

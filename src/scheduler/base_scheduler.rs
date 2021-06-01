@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::dependency::{Dependency, ShuffleDependencyTrait};
+use crate::dependency::{DepInfo, Dependency, ShuffleDependencyTrait};
 use crate::env;
 use crate::error::{Error, Result};
 use crate::rdd::{RddBase, STAGE_LOCK};
@@ -45,8 +45,9 @@ pub(crate) trait NativeScheduler: Send + Sync {
                         true => (
                             Box::new(Vec::new().into_iter()),
                             {    
-                                STAGE_LOCK.get_stage_lock((final_rdd_id, final_rdd_id, 0));           
-                                let res = match final_rdd.secure_iterator(split) {
+                                STAGE_LOCK.get_stage_lock((final_rdd_id, final_rdd_id, 0)); 
+                                let dep_info = DepInfo::padding_new(0);          
+                                let res = match final_rdd.secure_iterator(split, dep_info) {
                                     Ok(r) => r,
                                     Err(_) => Box::new(Vec::new().into_iter()),
                                 };

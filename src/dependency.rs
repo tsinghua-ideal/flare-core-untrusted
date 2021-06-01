@@ -1,12 +1,17 @@
 use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
-use crate::rdd::{default_hash, dynamic_subpart_meta, get_encrypted_data, AccArg, OpId, RddBase, STAGE_LOCK};
+use crate::rdd::{default_hash, dynamic_subpart_meta, get_encrypted_data, free_res_enc, AccArg, OpId, RddBase, STAGE_LOCK};
 use crate::serializable_traits::Data;
+use dashmap::DashMap;
+use dashmap::mapref::one::RefMut;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
+use sgx_types::*;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::convert::TryInto;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -280,77 +285,65 @@ where
                 partition,
                 dep_info.identifier
             );
+
+            println!("in denepdency, key = {:?}, ops = {:?}", key, op_ids);
             STAGE_LOCK.get_stage_lock((dep_info.child_rdd_id, dep_info.parent_rdd_id, dep_info.identifier));
+            
+            let now = Instant::now();
+            let (tx, rx) = mpsc::sync_channel(0);
+            let mut acc_arg = AccArg::new(partition, 
+                dep_info, 
+                Some(self.partitioner.get_num_of_partitions()), 
+                Arc::new(atomic::AtomicBool::new(false)),
+                Arc::new(atomic::AtomicUsize::new(1)),
+                Arc::new(atomic::AtomicUsize::new(0)),
+                Arc::new(atomic::AtomicBool::new(false)),
+                0,
+            );
+            let cur_rdd_id = rdd_base.get_rdd_id();
+            let cur_op_id = rdd_base.get_op_id();
+            let cur_split_num = rdd_base.number_of_splits();
+            acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, partition, cur_split_num);
+            
             //remove after get, otherwise it will causes the accumulation
             let res = env::SPEC_SHUFFLE_CACHE.remove(&key);
-            match res {
-                //TODO: adjust speculative execution，且原先的实现有bug，因为spec的加密类型
+            let handles = match res {
                 Some((_key, item)) => {
-                    STAGE_LOCK.free_stage_lock();
-                    let mut ser_result = HashMap::new();
-                    let mut acc_header = HashMap::new();
-                    for (_sub_part_id, buckets) in item.into_iter().enumerate() {
-                        for (reduce_id, bucket) in buckets.into_iter().enumerate() {
-                            //bukcet with the same reduce id merge together
-                            let entry = ser_result.entry(reduce_id).or_insert(vec![0; 8]);
-                            let header = acc_header.entry(reduce_id).or_insert(0 as usize);
-                            *header += 1;
-                            entry.extend_from_slice(&bucket[..]);
-                        }
-                    }
-
-                    for (reduce_id, mut bucket) in ser_result {
-                        for (idx, v) in acc_header[&reduce_id].to_le_bytes().iter().enumerate() {
-                            bucket[idx] = *v;
-                        }
-                        env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, reduce_id), bucket);
-                    }
-                    env::Env::get().shuffle_manager.get_server_uri()          
+                    rdd_base.iterator_raw_spec(item.0, &mut acc_arg, tx).unwrap()
                 },
                 None => {
                     let split = rdd_base.splits()[partition].clone();
-                    let now = Instant::now();
                     log::debug!("split index: {}", split.get_index());
-                    let (tx, rx) = mpsc::sync_channel(0);
-                    let mut acc_arg = AccArg::new(partition, 
-                        dep_info, 
-                        Some(self.partitioner.get_num_of_partitions()), 
-                        Arc::new(atomic::AtomicBool::new(false)),
-                        Arc::new(atomic::AtomicUsize::new(1)),
-                        Arc::new(atomic::AtomicUsize::new(0)),
-                        Arc::new(atomic::AtomicBool::new(false)),
-                        0,
-                    );
-                    let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
-                    let num_output_splits = self.partitioner.get_num_of_partitions();
-                    let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
-                        .map(|_| Vec::new())
-                        .collect::<Vec<_>>();
-                    let mut slopes = Vec::new();
-                    let mut aggresive = true;
-                    for (block_ptr, (time_comp, max_mem_usage, acc_captured_size)) in rx { 
-                        let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8, false);
-                        dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
-                        acc_arg.free_enclave_lock();
-                        for (i, bucket) in buckets_bl.into_iter().enumerate() {
-                            buckets[i].push(bucket); 
-                        }
-                    }                   
-                    for handle in handles {
-                        handle.join().unwrap();
-                    }
-                    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-                    log::info!("in dependency, shuffle write {:?}", dur);
-                    STAGE_LOCK.free_stage_lock();
-                    for (i, bucket) in buckets.into_iter().enumerate() {
-                        let ser_bytes = bincode::serialize(&bucket).unwrap();
-                        env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
-                    }
-
-                    env::Env::get().shuffle_manager.get_server_uri()  
+                    rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap()
                 },
+            };
+
+            let num_output_splits = self.partitioner.get_num_of_partitions();
+            let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
+                .map(|_| Vec::new())
+                .collect::<Vec<_>>();
+            let mut slopes = Vec::new();
+            let mut aggresive = true;
+            for (block_ptr, (time_comp, max_mem_usage, acc_captured_size)) in rx { 
+                let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8);
+                dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
+                acc_arg.free_enclave_lock();
+                for (i, bucket) in buckets_bl.into_iter().enumerate() {
+                    buckets[i].push(bucket); 
+                }
+            }                   
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            log::info!("in dependency, shuffle write {:?}", dur);
+            STAGE_LOCK.free_stage_lock();
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let ser_bytes = bincode::serialize(&bucket).unwrap();
+                env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
             }
 
+            env::Env::get().shuffle_manager.get_server_uri()  
   
         } else {
             let split = rdd_base.splits()[partition].clone();
@@ -417,4 +410,57 @@ where
             env::Env::get().shuffle_manager.get_server_uri()
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SpecShuffleCache {
+    /// The key is: {op_ids}/{input_id(part_id)}/{identifier}
+    /// The value is : {res_ptr}/{final_op_id} 
+    inner: Arc<DashMap<(u64, usize, usize), (Vec<usize>, OpId)>>,
+}
+
+impl SpecShuffleCache {
+    pub fn new() -> Self {
+        SpecShuffleCache {
+            inner: Arc::new(DashMap::new())
+        }
+    }
+
+    pub fn get_mut(&self, key: &(u64, usize, usize)) -> Option<RefMut<(u64, usize, usize), (Vec<usize>, OpId), RandomState>> {
+        self.inner.get_mut(key)
+    }
+
+    pub fn insert(&self, key: (u64, usize, usize), value: (Vec<usize>, OpId)) {
+        self.inner.insert(key, value);
+    }
+
+    pub fn remove(&self, key: &(u64, usize, usize)) -> Option<((u64, usize, usize), (Vec<usize>, OpId))> {
+        self.inner.remove(key)
+    }
+
+    //should be called in the end of program
+    pub fn free_data_enc(&self) {
+        let eid = env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let dep_info = DepInfo::padding_new(0);
+        for (key, (ps, op_id)) in (*self.inner).clone() {
+            println!("free op_id {:?}", op_id);
+            for p_data_enc in ps {
+                let sgx_status = unsafe { 
+                    free_res_enc(
+                        eid,
+                        op_id,
+                        dep_info,
+                        p_data_enc as *mut u8,
+                    )
+                };
+                match sgx_status {
+                    sgx_status_t::SGX_SUCCESS => {},
+                    _ => {
+                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+                    }
+                }
+            }
+        }
+    }
+
 }
