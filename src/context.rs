@@ -30,12 +30,29 @@ use Schedulers::*;
 use sgx_types::*;
 
 extern "C" {
+    fn clear_cache(
+        eid: sgx_enclave_id_t, 
+    ) -> sgx_status_t;
     fn pre_touching(
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         zero: u8,
-    ) -> sgx_status_t; 
+    ) -> sgx_status_t;
 }
+
+fn wrapper_clear_cache() {
+    let eid = env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let sgx_status = unsafe {
+        clear_cache(eid)
+    };
+    match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {},
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        },
+    };
+}
+
 pub const PRI_KEY_LOC: &str =  "/home/lixiang/.ssh/124.9";
 // There is a problem with this approach since T needs to satisfy PartialEq, Eq for Range
 // No such restrictions are needed for Vec
@@ -402,6 +419,7 @@ impl Context {
     }
 
     fn worker_clean_up_directives(run_result: Result<Signal>, work_dir: PathBuf) -> Result<!> {
+        wrapper_clear_cache();
         env::SPEC_SHUFFLE_CACHE.free_data_enc();
         env::BOUNDED_MEM_CACHE.free_data_enc();
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
@@ -425,6 +443,7 @@ impl Context {
         Context::drop_executors(executors);
         // Give some time for the executors to shut down and clean up
         std::thread::sleep(std::time::Duration::from_millis(1_500));
+        wrapper_clear_cache();
         env::SPEC_SHUFFLE_CACHE.free_data_enc();
         env::BOUNDED_MEM_CACHE.free_data_enc();
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
