@@ -395,8 +395,13 @@ pub fn dynamic_subpart_meta(
             } else if k <= avg_k * 1.2 && max_mem_usage < limit_per_partition {
                 slopes.push(k);
                 block_len += 1;
-            } else if k <= avg_k * 1.5 && block_len > 1 {
-                block_len -= 1;
+            } else if k <= avg_k * 1.5 {
+                if  block_len > 1 {
+                    block_len -= 1;
+                } else {
+                    slopes.clear();
+                    slopes.push(k);
+                }
             } else {
                 block_len = (block_len + 1) / 2;
             }
@@ -1283,7 +1288,7 @@ impl StageLock {
             lock_holder_info: RwLock::new(LockHolderInfo {
                 cur_holder: (0, 0, 0),
                 num_cur_holders: 0,
-                max_cur_holders: 20,
+                max_cur_holders: 1,
             }),
             waiting_list: RwLock::new(BTreeMap::new()),
             num_splits_mapping: RwLock::new(BTreeMap::new()),
