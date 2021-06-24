@@ -60,4 +60,4 @@ pub use io::LocalFsReaderConfig;
 pub use partial::BoundedDouble;
 pub use serializable_traits::Data;
 pub use serialization_free::Construct;
-pub use rdd::{PairRdd, Rdd, RddE, TailCompInfo, Text, OText, wrapper_tail_compute, encrypt, decrypt, ser_encrypt, ser_decrypt, MAX_ENC_BL};
+pub use rdd::{PairRdd, Rdd, RddE, TailCompInfo, Text, OpId, OText, wrapper_tail_compute, encrypt, decrypt, ser_encrypt, ser_decrypt, batch_encrypt, batch_decrypt, MAX_ENC_BL};

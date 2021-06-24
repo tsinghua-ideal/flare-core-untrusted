@@ -32,27 +32,137 @@ impl Split for ZippedPartitionsSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ZippedPartitionsRdd<F: Data, S: Data> {
+pub struct ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data, 
+    U: Data, 
+    TE: Data, 
+    UE: Data,
+    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
+    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
+{
     #[serde(with = "serde_traitobject")]
-    first: Arc<dyn Rdd<Item = F>>,
+    first: Arc<dyn RddE<Item = T, ItemE = TE>>,
     #[serde(with = "serde_traitobject")]
-    second: Arc<dyn Rdd<Item = S>>,
+    second: Arc<dyn RddE<Item = U, ItemE = UE>>,
     vals: Arc<RddVals>,
-    _marker_t: PhantomData<(F, S)>,
+    fe: FE,
+    fd: FD,
+    _marker_t: PhantomData<(TE, UE)>,
 }
 
-impl<F: Data, S: Data> Clone for ZippedPartitionsRdd<F, S> {
+impl<T, U, TE, UE, FE, FD> Clone for ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data, 
+    U: Data, 
+    TE: Data, 
+    UE: Data,
+    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
+    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
+{
     fn clone(&self) -> Self {
         ZippedPartitionsRdd {
             first: self.first.clone(),
             second: self.second.clone(),
             vals: self.vals.clone(),
+            fe: self.fe.clone(),
+            fd: self.fd.clone(),
             _marker_t: PhantomData,
         }
     }
 }
 
-impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
+impl<T, U, TE, UE, FE, FD> ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+where 
+    T: Data, 
+    U: Data, 
+    TE: Data, 
+    UE: Data,
+    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
+    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
+{
+    #[track_caller]
+    pub fn new(first: Arc<dyn RddE<Item = T, ItemE = TE>>, second: Arc<dyn RddE<Item = U, ItemE = UE>>, fe: FE, fd: FD) -> Self {
+        let vals = RddVals::new(first.get_context(), first.get_secure()); //temp
+        let vals = Arc::new(vals);
+
+        ZippedPartitionsRdd {
+            first,
+            second,
+            vals,
+            fe,
+            fd,
+            _marker_t: PhantomData,
+        }
+    }
+
+    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+        let current_split = split
+            .downcast::<ZippedPartitionsSplit>()
+            .or(Err(Error::DowncastFailure("ZippedPartitionsSplit")))?;
+
+        let dep_info = DepInfo::padding_new(0);
+        let fst = self.first.secure_iterator(current_split.fst_split.clone(), dep_info.clone(), None)?.collect::<Vec<_>>();
+        let sec = self.second.secure_iterator(current_split.sec_split.clone(), dep_info, None)?.collect::<Vec<_>>();
+        
+        let data = self.secure_zip((fst, sec), acc_arg);
+        let acc_arg = acc_arg.clone();
+        let handle = std::thread::spawn(move || {
+            let now = Instant::now();
+            let wait = start_execute(acc_arg, data, tx);
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
+            println!("***in zipped rdd, compute, total {:?}***", dur);  
+        });
+        Ok(vec![handle])
+    }
+
+    fn secure_zip(&self, 
+        data: (Vec<TE>, Vec<UE>),
+        acc_arg: &mut AccArg,
+    ) -> Vec<(TE, UE)> {
+        acc_arg.get_enclave_lock();
+        let cur_rdd_ids = vec![self.vals.id];
+        let cur_op_ids = vec![self.vals.op_id];
+        let cur_part_ids = vec![*acc_arg.part_ids.last().unwrap()];
+        let len_first = data.0.len();
+        let len_second = data.1.len();
+        let dep_info = DepInfo::padding_new(2);
+
+        let now_comp = Instant::now();
+        let (result_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
+            &cur_rdd_ids,
+            &cur_op_ids,
+            &cur_part_ids,
+            Default::default(),
+            dep_info,
+            &data,
+            &mut vec![0, 0],
+            &mut vec![len_first, len_second],
+            &mut vec![len_first, len_second],
+            std::cmp::max(len_first, len_second),
+            0,
+            &acc_arg.captured_vars,
+            &None,
+        );
+        let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
+        let result = get_encrypted_data::<(TE, UE)>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+        println!("***in zipped rdd, secure_zip, total {:?}***", dur_comp); 
+
+        acc_arg.free_enclave_lock();
+        *result
+    }
+
+}
+
+impl<T, U, TE, UE, FE, FD> RddBase for ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data, 
+    U: Data, 
+    TE: Data, 
+    UE: Data,
+    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
+    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
+{
     fn cache(&self) {
         self.vals.cache();
         RDDB_MAP.insert(
@@ -66,7 +176,9 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
     }
     
     fn free_data_enc(&self, ptr: *mut u8) {
-        todo!()
+        let _data_enc = unsafe {
+            Box::from_raw(ptr as *mut Vec<(TE, UE)>)
+        };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -78,7 +190,7 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
     }
 
     fn get_op_ids(&self, op_ids: &mut Vec<OpId>) {
-        todo!()
+        op_ids.push(self.get_op_id());
     }
 
     fn get_context(&self) -> Arc<Context> {
@@ -88,6 +200,9 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
     fn get_dependencies(&self) -> Vec<Dependency> {
         vec![Dependency::NarrowDependency(Arc::new(
                 OneToOneDependency::new(self.first.get_rdd_base()),
+            )), 
+            Dependency::NarrowDependency(Arc::new(
+                OneToOneDependency::new(self.second.get_rdd_base()),
             ))]
     }
 
@@ -96,7 +211,9 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
     }
 
     fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        todo!()
+        let value = move_data::<(TE, UE)>(self.get_op_id(), value_ptr);
+        let size = value.get_size();
+        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -125,11 +242,23 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
     }
 
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        todo!()
+        if acc_arg.dep_info.dep_type() == 1 {
+            let mut dep_info = acc_arg.dep_info.clone();
+            dep_info.is_shuffle = 0;
+            let res = self.secure_iterator(split, dep_info, None).unwrap();
+            self.secure_shuffle_write(res, acc_arg, tx)
+        } else {
+            self.secure_compute(split, acc_arg, tx)
+        }
     }
 
     fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        todo!()
+        let dep_info = DepInfo::padding_new(0);
+        let op_id = self.get_op_id();
+        let res = Box::new(data_ptr.into_iter()
+            .flat_map(move |data_ptr| get_encrypted_data::<(TE, UE)>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
+            as Box<dyn Iterator<Item = _>>;
+        self.secure_shuffle_write(res, acc_arg, tx)
     }
 
     fn iterator_any(
@@ -149,8 +278,16 @@ impl<F: Data, S: Data> RddBase for ZippedPartitionsRdd<F, S> {
     }
 }
 
-impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
-    type Item = (F, S);
+impl<T, U, TE, UE, FE, FD> Rdd for ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data, 
+    U: Data, 
+    TE: Data, 
+    UE: Data,
+    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
+    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
+{
+    type Item = (T, U);
 
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
         Arc::new(self.clone())
@@ -171,8 +308,29 @@ impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
     }
 
     fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        //TODO
-        Err(Error::UnsupportedOperation("Unsupported secure_compute"))
+        let cur_rdd_id = self.get_rdd_id();
+        let cur_op_id = self.get_op_id();
+        let cur_part_id = split.get_index();
+        let cur_split_num = self.number_of_splits();
+        acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
+
+        let should_cache = self.should_cache();
+        if should_cache {
+            let mut handles = secure_compute_cached(
+                acc_arg, 
+                cur_rdd_id,
+                cur_part_id,
+                tx.clone(),
+            );
+
+            if handles.is_empty() {
+                acc_arg.set_caching_rdd_id(cur_rdd_id);
+                handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
+            }
+            Ok(handles)     
+        } else {
+            self.secure_compute_prev(split, acc_arg, tx)
+        }
     }
 
     fn iterator(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
@@ -180,17 +338,26 @@ impl<F: Data, S: Data> Rdd for ZippedPartitionsRdd<F, S> {
     }
 }
 
-impl<F: Data, S: Data> ZippedPartitionsRdd<F, S> {
-    #[track_caller]
-    pub fn new(first: Arc<dyn Rdd<Item = F>>, second: Arc<dyn Rdd<Item = S>>) -> Self {
-        let mut vals = RddVals::new(first.get_context(), first.get_secure()); //temp
-        let vals = Arc::new(vals);
+impl<T, U, TE, UE, FE, FD> RddE for ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+where
+    T: Data, 
+    U: Data, 
+    TE: Data, 
+    UE: Data,
+    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
+    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
+{
+    type ItemE = (TE, UE);
 
-        ZippedPartitionsRdd {
-            first,
-            second,
-            vals,
-            _marker_t: PhantomData,
-        }
+    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
+        Arc::new(self.clone())
+    }
+
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
+    }
+
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
     }
 }

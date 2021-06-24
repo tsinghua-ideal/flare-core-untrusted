@@ -253,7 +253,7 @@ where
         if acc_arg.dep_info.dep_type() == 1 {
             let mut dep_info = acc_arg.dep_info.clone();
             dep_info.is_shuffle = 0;
-            let res = self.secure_iterator(split, dep_info).unwrap();
+            let res = self.secure_iterator(split, dep_info, None).unwrap();
             self.secure_shuffle_write(res, acc_arg, tx)
         } else {
             self.secure_compute(split, acc_arg, tx)

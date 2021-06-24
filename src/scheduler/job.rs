@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::scheduler::{JobListener, NativeScheduler, Stage, TaskBase, TaskContext};
 use crate::serializable_traits::{Data, SerFunc};
-use crate::{RddE, Result};
+use crate::{RddE, OpId, Result};
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -56,6 +56,7 @@ where
     pub final_stage: Stage,
     pub func: Arc<F>,
     pub final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+    pub action_id: Option<OpId>,
     pub run_id: usize,
     pub waiting: Mutex<BTreeSet<Stage>>,
     pub running: Mutex<BTreeSet<Stage>>,
@@ -77,6 +78,7 @@ where
         scheduler: &S,
         func: Arc<F>,
         final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         output_parts: Vec<usize>,
         listener: L,
     ) -> Result<Arc<JobTracker<F, U, T, TE, L>>>
@@ -92,6 +94,7 @@ where
             final_stage,
             func,
             final_rdd,
+            action_id,
             output_parts,
             listener,
         ))
@@ -102,6 +105,7 @@ where
         final_stage: Stage,
         func: Arc<F>,
         final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         output_parts: Vec<usize>,
         listener: L,
     ) -> Arc<JobTracker<F, U, T, TE, L>> {
@@ -113,6 +117,7 @@ where
             final_stage,
             func,
             final_rdd,
+            action_id,
             run_id,
             waiting: Mutex::new(BTreeSet::new()),
             running: Mutex::new(BTreeSet::new()),

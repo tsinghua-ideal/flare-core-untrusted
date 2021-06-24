@@ -885,7 +885,7 @@ where
     }
 }
 
-fn batch_encrypt<T, TE, FE>(mut data: Vec<T>, fe: FE) -> Vec<TE> 
+pub fn batch_encrypt<T, TE, FE>(mut data: Vec<T>, fe: FE) -> Vec<TE> 
 where
     FE: Func(Vec<T>)->TE
 {
@@ -904,7 +904,7 @@ where
     data_enc
 }
 
-fn batch_decrypt<T, TE, FD>(data_enc: Vec<TE>, fd: FD) -> Vec<T> 
+pub fn batch_decrypt<T, TE, FD>(data_enc: Vec<TE>, fd: FD) -> Vec<T> 
 where
     FD: Func(TE)->Vec<T>
 {
@@ -1517,7 +1517,7 @@ pub(crate) struct RddVals {
 impl RddVals {
     #[track_caller]
     pub fn new(sc: Arc<Context>, secure: bool) -> Self {
-        let loc = Location::caller(); 
+        let loc = Location::caller();
         RddVals {
             id: sc.new_rdd_id(),
             op_id: sc.new_op_id(loc),
@@ -1735,7 +1735,7 @@ pub trait RddE: Rdd {
         batch_decrypt(data_enc, self.get_fd())
     }
 
-    fn secure_iterator(&self, split: Box<dyn Split>, dep_info: DepInfo) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
+    fn secure_iterator(&self, split: Box<dyn Split>, dep_info: DepInfo, action_id: Option<OpId>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let (tx, rx) = sync_channel(0);
         let rdd_id = self.get_rdd_id();
         let op_id = self.get_op_id();
@@ -1748,6 +1748,9 @@ pub trait RddE: Rdd {
             Arc::new(AtomicUsize::new(0)), 
             Arc::new(AtomicBool::new(false)),
             0);
+        if let Some(action_id) = action_id {
+            acc_arg.insert_quadruple(rdd_id, action_id, usize::MAX, usize::MAX);
+        }
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
 
@@ -1895,7 +1898,8 @@ pub trait RddE: Rdd {
             }
         }
         let cl = Fn!(move |(ctx, (iter, _))| save::<Self::Item>(ctx, iter, path.to_string()));
-        self.get_context().run_job_with_context(self.get_rdde(), cl)
+        //TODO action_id
+        self.get_context().run_job_with_context(self.get_rdde(), None, cl)
     }
 
     fn reduce<F>(&self, f: F) -> Result<Option<Self::Item>>
@@ -1913,7 +1917,7 @@ pub trait RddE: Rdd {
             }
         });
         let now = Instant::now();
-        let results = self.get_context().run_job(self.get_rdde(), reduce_partition);
+        let results = self.get_context().run_job(self.get_rdde(), None, reduce_partition);
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("mapper {:?}s", dur);
         let now = Instant::now();
@@ -1924,21 +1928,23 @@ pub trait RddE: Rdd {
     }
 
     #[track_caller]
-    fn secure_reduce<F, UE, FE, FD>(&self, f: F, fe: FE, fd: FD) -> Result<CT<Vec<Self::Item>, Vec<UE>>>
+    fn secure_reduce<F, UE, FE, FD>(&self, f: F, fe: FE, fd: FD) -> Result<CT<Self::Item, UE>>
     where
         Self: Sized,
         UE: Data,
         F: SerFunc(Self::Item, Self::Item) -> Self::Item,
-        FE: SerFunc(Vec<Self::Item>) -> UE,
-        FD: SerFunc(UE) -> Vec<Self::Item>,
+        FE: SerFunc(Self::Item) -> UE,
+        FD: SerFunc(UE) -> Self::Item,
     {
-
+        let ctx = self.get_context();
+        let loc = Location::caller();
+        let action_id = ctx.new_op_id(loc);
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
-        let data = self.get_context().run_job(self.get_rdde(), cl)?
+        let data = self.get_context().run_job(self.get_rdde(), Some(action_id.clone()), cl)?
             .into_iter().flatten().collect::<Vec<Self::ItemE>>();
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id());
-        let temp = get_encrypted_data::<UE>(
-            self.get_op_id(), 
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone());
+        let mut temp = get_encrypted_data::<UE>(
+            action_id, 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
         );
@@ -1950,14 +1956,7 @@ pub trait RddE: Rdd {
         };
         Ok(result)
         */
-        let bfe = Box::new(Fn!(move |data | {
-            batch_encrypt::<>(data, fe.clone())
-        }));
-    
-        let bfd = Box::new(Fn!(move |data_enc | {
-            batch_decrypt::<>(data_enc, fd.clone())
-        }));
-        Ok(Text::new(*temp, Some(bfe), Some(bfd)))
+        Ok(Text::new(temp.pop().unwrap(), Some(Box::new(fe)), Some(Box::new(fd))))
     }
 
     /// Aggregate the elements of each partition, and then the results for all the partitions, using a
@@ -1988,7 +1987,7 @@ pub trait RddE: Rdd {
         let zero = init.clone();
         let reduce_partition =
             Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.fold(zero.clone(), &cf));
-        let results = self.get_context().run_job(self.get_rdde(), reduce_partition);
+        let results = self.get_context().run_job(self.get_rdde(), None, reduce_partition);
         Ok(results?.into_iter().fold(init, f))
     }
 
@@ -2001,13 +2000,16 @@ pub trait RddE: Rdd {
         FE: SerFunc(Vec<Self::Item>) -> UE,
         FD: SerFunc(UE) -> Vec<Self::Item>,
     {
+        let ctx = self.get_context();
+        let loc = Location::caller();
+        let action_id = ctx.new_op_id(loc);
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
-        let data = self.get_context().run_job(self.get_rdde(), cl)?
+        let data = self.get_context().run_job(self.get_rdde(), Some(action_id.clone()), cl)?
             .into_iter().flatten().collect::<Vec<Self::ItemE>>();
        
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone());
         let mut temp = get_encrypted_data::<UE>(
-            self.get_op_id(), 
+            action_id, 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
         );
@@ -2050,7 +2052,7 @@ pub trait RddE: Rdd {
         let zero = init.clone();
         let reduce_partition =
             Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.fold(zero.clone(), &seq_fn));
-        let results = self.get_context().run_job(self.get_rdde(), reduce_partition);
+        let results = self.get_context().run_job(self.get_rdde(), None, reduce_partition);
         Ok(results?.into_iter().fold(init, comb_fn))
     }
 
@@ -2065,13 +2067,16 @@ pub trait RddE: Rdd {
         FE: SerFunc(Vec<U>) -> UE,
         FD: SerFunc(UE) -> Vec<U>,
     {
+        let ctx = self.get_context();
+        let loc = Location::caller();
+        let action_id = ctx.new_op_id(loc);
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
-        let data = self.get_context().run_job(self.get_rdde(), cl)?
+        let data = ctx.run_job(self.get_rdde(), Some(action_id.clone()), cl)?
             .into_iter().flatten().collect::<Vec<_>>();
        
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone());
         let mut temp = get_encrypted_data::<UE>(
-            self.get_op_id(), 
+            action_id, 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
         );
@@ -2197,7 +2202,7 @@ pub trait RddE: Rdd {
     {
         let cl =
             Fn!(|(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::Item>>());
-        let results = self.get_context().run_job(self.get_rdde(), cl)?;
+        let results = self.get_context().run_job(self.get_rdde(), None, cl)?;
         let size = results.iter().fold(0, |a, b: &Vec<Self::Item>| a + b.len());
         Ok(results
             .into_iter()
@@ -2214,7 +2219,7 @@ pub trait RddE: Rdd {
     {
         let cl =
             Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
-        let results = self.get_context().run_job(self.get_rdde(), cl)?;
+        let results = self.get_context().run_job(self.get_rdde(), None, cl)?;
         let size = results.iter().fold(0, |a, b: &Vec<Self::ItemE>| a + b.len());
         let result = results
             .into_iter()
@@ -2238,19 +2243,23 @@ pub trait RddE: Rdd {
         let counting_func =
             Fn!(|(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| { iter.count() as u64 });
         Ok(context
-            .run_job(self.get_rdde(), counting_func)?
+            .run_job(self.get_rdde(), None, counting_func)?
             .into_iter()
             .sum())
     }
 
+    #[track_caller]
     fn secure_count(&self) -> Result<u64>
     where
         Self: Sized,
     {
+        let ctx = self.get_context();
+        let loc = Location::caller();
+        let action_id = ctx.new_op_id(loc);
         let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
-        let data = self.get_context().run_job(self.get_rdde(), cl)?
+        let data = self.get_context().run_job(self.get_rdde(), Some(action_id.clone()), cl)?
             .into_iter().flatten().collect::<Vec<_>>();
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), self.get_op_id());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone());
         /*
         let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 3, result_ptr as *mut u8);
         //temp only contains one element
@@ -2346,7 +2355,7 @@ pub trait RddE: Rdd {
         let rdd = self.get_rdde();
         rdd.register_op_name("count_by_value_approx");
         self.get_context()
-            .run_approximate_job(count_partition, rdd, evaluator, timeout)
+            .run_approximate_job(count_partition, rdd, None, evaluator, timeout)
     }
 
     /// Return a new RDD containing the distinct elements in this RDD.
@@ -2491,6 +2500,7 @@ pub trait RddE: Rdd {
 
             let res = self.get_context().run_job_with_partitions(
                 self.get_rdde(),
+                None,
                 take_from_partion,
                 partitions,
             )?;
@@ -2553,6 +2563,7 @@ pub trait RddE: Rdd {
 
             let res = self.get_context().run_job_with_partitions(
                 self.get_rdde(),
+                None,
                 take_from_partition,
                 partitions,
             )?;
@@ -2820,7 +2831,7 @@ pub trait RddE: Rdd {
         Self: Sized,
     {
         let func = Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.for_each(&func));
-        self.get_context().run_job(self.get_rdde(), func)
+        self.get_context().run_job(self.get_rdde(), None, func)
     }
 
     /// Applies a function f to each partition of this RDD.
@@ -2830,7 +2841,7 @@ pub trait RddE: Rdd {
         Self: Sized + 'static,
     {
         let func = Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| (&func)(iter));
-        self.get_context().run_job(self.get_rdde(), func)
+        self.get_context().run_job(self.get_rdde(), None, func)
     }
 
     #[track_caller]
@@ -2848,16 +2859,24 @@ pub trait RddE: Rdd {
     }
 
     #[track_caller]
-    fn zip<S: Data>(
+    fn zip<S, SE, FE, FD>(
         &self,
-        second: Arc<dyn Rdd<Item = S>>,
-    ) -> SerArc<dyn Rdd<Item = (Self::Item, S)>>
+        second: Arc<dyn RddE<Item = S, ItemE = SE>>,
+        fe: FE,
+        fd: FD,
+    ) -> SerArc<dyn RddE<Item = (Self::Item, S), ItemE = (Self::ItemE, SE)>>
     where
         Self: Clone,
+        S: Data,
+        SE: Data,
+        FE: SerFunc(Vec<(Self::Item, S)>) -> (Self::ItemE, SE),
+        FD: SerFunc((Self::ItemE, SE)) -> Vec<(Self::Item, S)>,
     {
-        SerArc::new(ZippedPartitionsRdd::<Self::Item, S>::new(
-            Arc::new(self.clone()) as Arc<dyn Rdd<Item = Self::Item>>,
+        SerArc::new(ZippedPartitionsRdd::new(
+            Arc::new(self.clone()) as Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>,
             second,
+            fe,
+            fd,
         ))
     }
 
@@ -3264,7 +3283,7 @@ pub trait RddE: Rdd {
         let rdd = self.get_rdde();
         rdd.register_op_name("count_approx");
         self.get_context()
-            .run_approximate_job(count_elements, rdd, evaluator, timeout)
+            .run_approximate_job(count_elements, rdd, None, evaluator, timeout)
     }
 
     /// Creates tuples of the elements in this RDD by applying `f`.

@@ -38,6 +38,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
             let now = Instant::now();
             let func = jt.func.clone();
             let final_rdd = jt.final_rdd.clone();
+            let action_id = jt.action_id.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let res = Ok(Some(vec![(&func)((
                     task_context,
@@ -47,7 +48,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
                             {    
                                 STAGE_LOCK.get_stage_lock((final_rdd_id, final_rdd_id, 0)); 
                                 let dep_info = DepInfo::padding_new(0);          
-                                let res = match final_rdd.secure_iterator(split, dep_info) {
+                                let res = match final_rdd.secure_iterator(split, dep_info, action_id) {
                                     Ok(r) => r,
                                     Err(_) => Box::new(Vec::new().into_iter()),
                                 };
@@ -435,6 +436,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
                     jt.run_id,
                     jt.final_stage.id,
                     jt.final_rdd.clone(),
+                    jt.action_id.clone(),
                     jt.func.clone(),
                     *part,
                     locs,

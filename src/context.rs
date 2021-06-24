@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::executor::{Executor, Signal};
 use crate::io::ReaderConfiguration;
 use crate::partial::{ApproximateEvaluator, PartialResult};
-use crate::rdd::{OpId, ParallelCollection, Rdd, RddE, RddBase, UnionRdd, ser_encrypt, ser_decrypt};
+use crate::rdd::{ParallelCollection, Rdd, RddE, RddBase, OpId, UnionRdd, ser_encrypt, ser_decrypt};
 use crate::scheduler::{DistributedScheduler, LocalScheduler, NativeScheduler, TaskContext};
 use crate::serializable_traits::{Data, Func, SerFunc};
 use crate::serialized_data_capnp::serialized_data;
@@ -78,6 +78,7 @@ impl Schedulers {
         &self,
         func: Arc<F>,
         final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         partitions: Vec<usize>,
         allow_local: bool,
     ) -> Result<Vec<U>>
@@ -91,7 +92,7 @@ impl Schedulers {
             Distributed(distributed) => {
                 let res = distributed
                     .clone()
-                    .run_job(func, final_rdd, partitions, allow_local);
+                    .run_job(func, final_rdd, action_id, partitions, allow_local);
                 log::info!(
                     "`{}` job finished, took {}s",
                     op_name,
@@ -102,7 +103,7 @@ impl Schedulers {
             Local(local) => {
                 let res = local
                     .clone()
-                    .run_job(func, final_rdd, partitions, allow_local);
+                    .run_job(func, final_rdd, action_id, partitions, allow_local);
                 log::info!(
                     "`{}` job finished, took {}s",
                     op_name,
@@ -117,6 +118,7 @@ impl Schedulers {
         &self,
         func: Arc<F>,
         final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         evaluator: E,
         timeout: Duration,
     ) -> Result<PartialResult<R>>
@@ -131,10 +133,10 @@ impl Schedulers {
         let res = match self {
             Distributed(distributed) => distributed
                 .clone()
-                .run_approximate_job(func, final_rdd, evaluator, timeout),
+                .run_approximate_job(func, final_rdd, action_id, evaluator, timeout),
             Local(local) => local
                 .clone()
-                .run_approximate_job(func, final_rdd, evaluator, timeout),
+                .run_approximate_job(func, final_rdd, action_id, evaluator, timeout),
         };
         log::info!(
             "`{}` job finished, took {}s",
@@ -528,7 +530,7 @@ impl Context {
             line,
             num,
         );
-        //println!("file = {:?}, line = {:?}, num = {:?}, op_id = {:?}", file, line, num, op_id);
+        //println!("rdd, file = {:?}, line = {:?}, num = {:?}, op_id = {:?}", file, line, num, op_id);
         op_id
     }
 
@@ -622,6 +624,7 @@ impl Context {
     pub fn run_job<T: Data, TE: Data, U: Data, F>(
         self: &Arc<Self>,
         rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         func: F,
     ) -> Result<Vec<U>>
     where
@@ -632,6 +635,7 @@ impl Context {
         self.scheduler.run_job(
             func,
             rdd.clone(),
+            action_id,
             (0..rdd.number_of_splits()).collect(),
             false,
         )
@@ -640,6 +644,7 @@ impl Context {
     pub fn run_job_with_partitions<T: Data, TE: Data, U: Data, F, P>(
         self: &Arc<Self>,
         rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         func: F,
         partitions: P,
     ) -> Result<Vec<U>>
@@ -649,12 +654,13 @@ impl Context {
     {
         let cl = Fn!(move |(_task_context, iter)| (func)(iter));
         self.scheduler
-            .run_job(Arc::new(cl), rdd, partitions.into_iter().collect(), false)
+            .run_job(Arc::new(cl), rdd, action_id, partitions.into_iter().collect(), false)
     }
 
     pub fn run_job_with_context<T: Data, TE: Data, U: Data, F>(
         self: &Arc<Self>,
         rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         func: F,
     ) -> Result<Vec<U>>
     where
@@ -665,6 +671,7 @@ impl Context {
         self.scheduler.run_job(
             func,
             rdd.clone(),
+            action_id,
             (0..rdd.number_of_splits()).collect(),
             true,
         )
@@ -677,6 +684,7 @@ impl Context {
         self: &Arc<Self>,
         func: F,
         rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         evaluator: E,
         timeout: Duration,
     ) -> Result<PartialResult<R>>
@@ -686,7 +694,7 @@ impl Context {
         R: Clone + Debug + Send + Sync + 'static,
     {
         self.scheduler
-            .run_approximate_job(Arc::new(func), rdd, evaluator, timeout)
+            .run_approximate_job(Arc::new(func), rdd, action_id, evaluator, timeout)
     }
 
     pub(crate) fn get_preferred_locs(

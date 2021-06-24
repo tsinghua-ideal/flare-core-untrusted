@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::dependency::ShuffleDependencyTrait;
 use crate::map_output_tracker::MapOutputTracker;
 use crate::partial::{ApproximateActionListener, ApproximateEvaluator, PartialResult};
-use crate::rdd::{RddE, RddBase};
+use crate::rdd::{RddE, RddBase, OpId};
 use crate::scheduler::{
     listener::{JobEndListener, JobStartListener},
     CompletionEvent, EventQueue, Job, JobListener, JobTracker, LiveListenerBus, NativeScheduler,
@@ -91,6 +91,7 @@ impl LocalScheduler {
         self: Arc<Self>,
         func: Arc<F>,
         final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         evaluator: E,
         timeout: Duration,
     ) -> Result<PartialResult<R>>
@@ -112,6 +113,7 @@ impl LocalScheduler {
                     &*self,
                     func,
                     final_rdd.clone(),
+                    action_id,
                     partitions,
                     listener,
                 )
@@ -144,6 +146,7 @@ impl LocalScheduler {
         self: Arc<Self>,
         func: Arc<F>,
         final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         partitions: Vec<usize>,
         allow_local: bool,
     ) -> Result<Vec<U>>
@@ -161,6 +164,7 @@ impl LocalScheduler {
                     &*self,
                     func,
                     final_rdd.clone(),
+                    action_id,
                     partitions,
                     NoOpListener,
                 )

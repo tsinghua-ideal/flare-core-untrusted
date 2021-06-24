@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::dependency::DepInfo;
 use crate::env;
-use crate::rdd::{RddE, STAGE_LOCK};
+use crate::rdd::{RddE, OpId, STAGE_LOCK};
 use crate::scheduler::{Task, TaskBase, TaskContext};
 use crate::serializable_traits::{AnyData, Data};
 use crate::SerBox;
@@ -30,6 +30,7 @@ where
     pinned: bool,
     #[serde(with = "serde_traitobject")]
     pub rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+    pub action_id: Option<OpId>,
     pub func: Arc<F>,
     pub partition: usize,
     pub locs: Vec<Ipv4Addr>,
@@ -68,6 +69,7 @@ where
             stage_id: self.stage_id,
             pinned: self.rdd.is_pinned(),
             rdd: self.rdd.clone(),
+            action_id: self.action_id.clone(),
             func: self.func.clone(),
             partition: self.partition,
             locs: self.locs.clone(),
@@ -91,6 +93,7 @@ where
         run_id: usize,
         stage_id: usize,
         rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        action_id: Option<OpId>,
         func: Arc<F>,
         partition: usize,
         locs: Vec<Ipv4Addr>,
@@ -102,6 +105,7 @@ where
             stage_id,
             pinned: rdd.is_pinned(),
             rdd,
+            action_id,
             func,
             partition,
             locs,
@@ -173,7 +177,7 @@ where
                     {
                         STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
                         let dep_info = DepInfo::padding_new(0);
-                        let res = match self.rdd.secure_iterator(split, dep_info) {
+                        let res = match self.rdd.secure_iterator(split, dep_info, self.action_id.clone()) {
                             Ok(r) => r,
                             Err(_) => Box::new(Vec::new().into_iter()),
                         };
