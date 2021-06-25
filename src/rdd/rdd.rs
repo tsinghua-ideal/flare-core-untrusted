@@ -1002,6 +1002,7 @@ pub fn secure_compute_cached(
             }
 
             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
+            println!("compute start cached data, total {:?} s", dur_comp);
             tx.send((result_ptr, (dur_comp, max_mem_usage as f64, acc_captured_size))).unwrap();
         });
         handles.push(handle);
