@@ -418,7 +418,7 @@ pub fn wrapper_pre_merge<T: Data>(
     dep_info: DepInfo,
     num_splits: usize,
 ) -> Vec<Vec<T>> {
-    let merge_factor = 16;
+    let merge_factor = 64;
     fn ecall_pre_merge<T: Data>(op_id: OpId, data: Vec<Vec<T>>, dep_info: DepInfo, num_sub_part: usize, num_splits: usize) -> Vec<Vec<T>> {
         let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
         let tid: u64 = thread::current().id().as_u64().into();
@@ -474,7 +474,9 @@ pub fn wrapper_pre_merge<T: Data>(
     let now = Instant::now();
     let mut n = data.len();
     let mut r = Vec::new();
+    let mut c = 0;
     while n > merge_factor {
+        c += 1;
         let m = (n-1)/merge_factor+1;
         for i in 0..m {
             let start = i*merge_factor;
@@ -487,7 +489,7 @@ pub fn wrapper_pre_merge<T: Data>(
     
     }
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-    println!("pre_merge took {:?}s", dur);
+    println!("pre_merge total {:?}s, encryption count {:?}", dur, c);
     data
 }
 
