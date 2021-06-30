@@ -127,11 +127,8 @@ impl Env {
             let enclave_path_str = enclave_path
                 .to_str()
                 .unwrap_or_else(|| panic!("env::Env enclave PathBuf2str error"));
-            let enclave = match conf.deployment_mode == DeploymentMode::Distributed  && conf.is_driver == true {
-                true => Arc::new(Mutex::new(None)),
-                false => Arc::new(Mutex::new(Some(Env::init_enclave(&enclave_path_str)
-                              .unwrap_or_else(|x| panic!("[-] Init Enclave Failed {}!", x.as_str()))))),
-            };
+            let enclave = Arc::new(Mutex::new(Some(Env::init_enclave(&enclave_path_str)
+                        .unwrap_or_else(|x| panic!("[-] Init Enclave Failed {}!", x.as_str())))));
             Env {
                 map_output_tracker,
                 shuffle_manager,

@@ -2894,7 +2894,7 @@ pub trait RddE: Rdd {
         self.intersection_with_num_partitions(other, self.number_of_splits())
     }
 
-    /// subtract function, same as the one found in apache spark 
+    /// subtract function, same as the one found in apache spark
     /// example of subtract can be found in subtract.rs
     /// performs a full outer join followed by and intersection with self to get subtraction.
     #[track_caller]
@@ -2907,7 +2907,7 @@ pub trait RddE: Rdd {
     {
         self.subtract_with_num_partition(other, self.number_of_splits())
     }
-    
+  
     //Both should have consistent security guarantee (encrypted columns)
     #[track_caller]
     fn subtract_with_num_partition<T>(
@@ -3422,26 +3422,5 @@ pub trait RddE: Rdd {
 
             Ok(queue.into())
         }
-    }
-}
-
-pub trait Reduce<T> {
-    fn reduce<F>(self, f: F) -> Option<T>
-    where
-        Self: Sized,
-        F: FnMut(T, T) -> T;
-}
-
-impl<T, I> Reduce<T> for I
-where
-    I: Iterator<Item = T>,
-{
-    #[inline]
-    fn reduce<F>(mut self, f: F) -> Option<T>
-    where
-        Self: Sized,
-        F: FnMut(T, T) -> T,
-    {
-        self.next().map(|first| self.fold(first, f))
     }
 }

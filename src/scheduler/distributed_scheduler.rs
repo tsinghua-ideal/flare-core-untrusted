@@ -443,7 +443,7 @@ impl NativeScheduler for DistributedScheduler {
                         break;
                     }
                     Err(_) => {
-                        if num_retries > 5 {
+                        if num_retries > 5000 { //100s
                             panic!("executor @{} not initialized", target_executor.port());
                         }
                         tokio::time::delay_for(Duration::from_millis(20)).await;
