@@ -283,7 +283,7 @@ where
 pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usize, (f64, f64, usize))>) -> f64 {
     let len = data.len();
     //For narrow, streaming process in enclave
-    if acc_arg.dep_info.is_shuffle == 0 {
+    if acc_arg.dep_info.is_shuffle == 0 || acc_arg.dep_info.is_shuffle == 1 {
         acc_arg.block_len.store(len, atomic::Ordering::SeqCst);
     }
     let mut wait = 0.0;
@@ -460,7 +460,7 @@ pub fn wrapper_pre_merge<T: Data>(
             };
             let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
             dynamic_subpart_meta(dur_comp, max_mem_usage as f64, 0 as f64, &block_len, &mut slopes, &fresh_slope, num_splits, &mut aggresive);
-            let mut result_bl = get_encrypted_data::<Vec<T>>(op_id, dep_info, result_ptr as *mut u8);
+            let mut result_bl = get_encrypted_data::<Vec<Vec<T>>>(op_id, dep_info, result_ptr as *mut u8).remove(0);
             assert!(result_bl.len() == 1);
             result.append(&mut result_bl[0]);
             lower = lower.iter()
@@ -539,7 +539,7 @@ pub fn wrapper_exploit_spec_oppty(
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
             },
         };
-        //return None;   //test non-spec case
+        return None;   //test non-spec case
         Some((*res, spec_identifier, hash_ops))
     } else {
         None

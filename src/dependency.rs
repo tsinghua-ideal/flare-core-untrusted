@@ -300,10 +300,6 @@ where
                 Arc::new(atomic::AtomicBool::new(false)),
                 0,
             );
-            let cur_rdd_id = rdd_base.get_rdd_id();
-            let cur_op_id = rdd_base.get_op_id();
-            let cur_split_num = rdd_base.number_of_splits();
-            acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, partition, cur_split_num);
             
             //remove after get, otherwise it will causes the accumulation
             let res = env::SPEC_SHUFFLE_CACHE.remove(&key);
@@ -325,11 +321,14 @@ where
             let mut slopes = Vec::new();
             let mut aggresive = true;
             for (block_ptr, (time_comp, max_mem_usage, acc_captured_size)) in rx { 
-                let buckets_bl = get_encrypted_data::<Vec<(KE, CE)>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8);
+                let buckets_bls = get_encrypted_data::<Vec<Vec<(KE, CE)>>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8);
                 dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
                 acc_arg.free_enclave_lock();
-                for (i, bucket) in buckets_bl.into_iter().enumerate() {
-                    buckets[i].push(bucket); 
+
+                for buckets_bl in buckets_bls.into_iter() {
+                    for (i, bucket) in buckets_bl.into_iter().enumerate() {
+                        buckets[i].push(bucket); 
+                    }
                 }
             }                   
             for handle in handles {

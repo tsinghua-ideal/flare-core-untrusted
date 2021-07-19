@@ -427,14 +427,7 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
     }
 
     fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        if acc_arg.dep_info.dep_type() == 1 {
-            let mut dep_info = acc_arg.dep_info.clone();
-            dep_info.is_shuffle = 0;
-            let res = self.secure_iterator(split, dep_info, None).unwrap();
-            self.secure_shuffle_write(res, acc_arg, tx)
-        } else {
-            self.secure_compute(split, acc_arg, tx)
-        }
+        self.secure_compute(split, acc_arg, tx)
     }
 
     fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
