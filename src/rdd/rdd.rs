@@ -547,13 +547,18 @@ pub fn wrapper_exploit_spec_oppty(
 
 }
 
-pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId) -> usize {
+pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, is_local: bool) -> usize {
     let now = Instant::now();
     let tid: u64 = thread::current().id().as_u64().into();
     let captured_vars = HashMap::new();
     let rdd_ids = vec![rdd_id];
     let op_ids = vec![op_id];
     let part_ids = vec![0 as usize]; //placeholder
+    let dep_info = if is_local {
+        DepInfo::padding_new(4)
+    } else {
+        DepInfo::padding_new(3)
+    };
     let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
     let mut init_mem_usage = 0;
     let mut last_mem_usage = 0;
@@ -569,7 +574,7 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId) -> usiz
             &op_ids as *const Vec<OpId> as *const u8,
             &part_ids as *const Vec<usize> as *const u8,
             Default::default(),  //meaningless
-            DepInfo::padding_new(3),   //3 is for reduce & fold & aggregate
+            dep_info,
             input,
             &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
             &Vec::new() as *const Vec<OpId> as *const u8,
@@ -1123,7 +1128,7 @@ impl AccArg {
     }
 
     pub fn is_caching_final_rdd(&self) -> bool {
-        self.rdd_ids[0] == self.caching_rdd_id
+        self.rdd_ids.is_empty()
     }
 
     pub fn get_enclave_lock(&self) {
@@ -1746,7 +1751,7 @@ pub trait RddE: Rdd {
         let mut acc_arg = AccArg::new(part_id, 
             dep_info, 
             None, 
-            Arc::new(AtomicBool::new(false)), 
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicUsize::new(1)), 
             Arc::new(AtomicUsize::new(0)), 
             Arc::new(AtomicBool::new(false)),
@@ -1754,13 +1759,16 @@ pub trait RddE: Rdd {
         if let Some(action_id) = action_id {
             acc_arg.insert_quadruple(rdd_id, action_id, usize::MAX, usize::MAX);
         }
-        let handles = self.secure_compute(split, &mut acc_arg, tx)?;
         let caching = acc_arg.is_caching_final_rdd();
+        let handles = self.secure_compute(split, &mut acc_arg, tx)?;
 
         let mut result = Vec::new();
         let mut slopes = Vec::new();
         let mut aggresive = true;
+        let mut c = 0;
         for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx {
+            assert!(c == 0);  //otherwise the put_sdata should be changed
+            c += 1;
             let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8);
             dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
             acc_arg.free_enclave_lock();
@@ -1942,23 +1950,26 @@ pub trait RddE: Rdd {
         let ctx = self.get_context();
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
-        let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
+        let action_id_c = action_id.clone();
+        let cur_rdd_id = self.get_rdd_id();
+        let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+            let data = iter.collect::<Vec<Self::ItemE>>();
+            let result_ptr = wrapper_action(data, cur_rdd_id, action_id_c, true);
+            let partial_res = get_encrypted_data::<UE>(
+                action_id, 
+                DepInfo::padding_new(4), 
+                result_ptr as *mut u8,
+            );
+            *partial_res
+        });
         let data = self.get_context().run_job(self.get_rdde(), Some(action_id.clone()), cl)?
-            .into_iter().flatten().collect::<Vec<Self::ItemE>>();
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone());
+            .into_iter().flatten().collect::<Vec<UE>>();
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone(), false);
         let mut temp = get_encrypted_data::<UE>(
             action_id, 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
         );
-        /* Return type: Result<Option<UE>> */
-        /*
-        let result = match temp.is_empty() {
-            true => None,
-            false => Some(temp[0].clone()),
-        };
-        Ok(result)
-        */
         Ok(Text::new(temp.pop().unwrap(), Some(Box::new(fe)), Some(Box::new(fd))))
     }
 
@@ -1995,39 +2006,39 @@ pub trait RddE: Rdd {
     }
 
     #[track_caller]
-    fn secure_fold<F, UE, FE, FD>(&self, init: Self::Item, f: F, fe: FE, fd: FD) -> Result<CT<Vec<Self::Item>, Vec<UE>>> 
+    fn secure_fold<F, UE, FE, FD>(&self, init: Self::Item, f: F, fe: FE, fd: FD) -> Result<CT<Self::Item, UE>> 
     where
         Self: Sized,
         UE: Data,
         F: SerFunc(Self::Item, Self::Item) -> Self::Item,
-        FE: SerFunc(Vec<Self::Item>) -> UE,
-        FD: SerFunc(UE) -> Vec<Self::Item>,
+        FE: SerFunc(Self::Item) -> UE,
+        FD: SerFunc(UE) -> Self::Item,
     {
         let ctx = self.get_context();
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
-        let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
+        let action_id_c = action_id.clone();
+        let cur_rdd_id = self.get_rdd_id();
+        let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+            let data = iter.collect::<Vec<Self::ItemE>>();
+            let result_ptr = wrapper_action(data, cur_rdd_id, action_id_c, true);
+            let partial_res = get_encrypted_data::<UE>(
+                action_id, 
+                DepInfo::padding_new(4), 
+                result_ptr as *mut u8,
+            );
+            *partial_res
+        });
         let data = self.get_context().run_job(self.get_rdde(), Some(action_id.clone()), cl)?
-            .into_iter().flatten().collect::<Vec<Self::ItemE>>();
+            .into_iter().flatten().collect::<Vec<UE>>();
        
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone(), false);
         let mut temp = get_encrypted_data::<UE>(
             action_id, 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
         );
-        /* Return type: Result<UE> */
-        /*
-        //temp only contains one element
-        Ok(temp.pop().unwrap())
-        */
-        let bfe = Box::new(Fn!(move |data| {
-            batch_encrypt(data, fe.clone())
-        }));
-        let bfd = Box::new(Fn!(move |data_enc| {
-            batch_decrypt(data_enc, fd.clone())
-        }));
-        Ok(Text::new(*temp, Some(bfe), Some(bfd)))
+        Ok(Text::new(temp.pop().unwrap(), Some(Box::new(fe)), Some(Box::new(fd))))
     }
 
 
@@ -2060,41 +2071,42 @@ pub trait RddE: Rdd {
     }
 
     #[track_caller]
-    fn secure_aggregate<U, UE, SF, CF, FE, FD>(&self, init: U, seq_fn: SF, comb_fn: CF, fe: FE, fd: FD) -> Result<CT<Vec<U>, Vec<UE>>> 
+    fn secure_aggregate<U, UE, SF, CF, FE, FD>(&self, init: U, seq_fn: SF, comb_fn: CF, fe: FE, fd: FD) -> Result<CT<U, UE>> 
     where
         Self: Sized,
         U: Data,
         UE: Data,
         SF: SerFunc(U, Self::Item) -> U,
         CF: SerFunc(U, U) -> U,
-        FE: SerFunc(Vec<U>) -> UE,
-        FD: SerFunc(UE) -> Vec<U>,
+        FE: SerFunc(U) -> UE,
+        FD: SerFunc(UE) -> U,
     {
         let ctx = self.get_context();
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
-        let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
-        let data = ctx.run_job(self.get_rdde(), Some(action_id.clone()), cl)?
-            .into_iter().flatten().collect::<Vec<_>>();
+        let action_id_c = action_id.clone();
+        let cur_rdd_id = self.get_rdd_id();
+        let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+            let data = iter.collect::<Vec<Self::ItemE>>();
+            let result_ptr = wrapper_action(data, cur_rdd_id, action_id_c, true);
+            let partial_res = get_encrypted_data::<UE>(
+                action_id, 
+                DepInfo::padding_new(4), 
+                result_ptr as *mut u8,
+            );
+            *partial_res
+        });
+        
+        let data = ctx.run_job(self.get_rdde(), None, cl)?
+            .into_iter().flatten().collect::<Vec<UE>>();
        
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone());
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone(), false);
         let mut temp = get_encrypted_data::<UE>(
             action_id, 
             DepInfo::padding_new(3), 
             result_ptr as *mut u8,
         );
-        /* Return type: Result<UE> */
-        /*
-        //temp only contains one element
-        Ok(temp.pop().unwrap())
-        */
-        let bfe = Box::new(Fn!(move |data| {
-            batch_encrypt(data, fe.clone())
-        }));
-        let bfd = Box::new(Fn!(move |data_enc| {
-            batch_decrypt(data_enc, fd.clone())
-        }));
-        Ok(Text::new(*temp, Some(bfe), Some(bfd)))
+        Ok(Text::new(temp.pop().unwrap(), Some(Box::new(fe)), Some(Box::new(fd))))
     }
 
     /// Return the Cartesian product of this RDD and another one, that is, the RDD of all pairs of
@@ -2259,16 +2271,22 @@ pub trait RddE: Rdd {
         let ctx = self.get_context();
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
-        let cl = Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
-        let data = self.get_context().run_job(self.get_rdde(), Some(action_id.clone()), cl)?
-            .into_iter().flatten().collect::<Vec<_>>();
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone());
-        /*
-        let mut temp = get_encrypted_data::<u64>(self.get_rdd_id(), 3, result_ptr as *mut u8);
-        //temp only contains one element
-        Ok(temp.pop().unwrap())
-        */
-        Ok(result_ptr as u64)
+        let action_id_c = action_id.clone();
+        let cur_rdd_id = self.get_rdd_id();
+        let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+            let data = iter.collect::<Vec<Self::ItemE>>();
+            let result_ptr = wrapper_action(data, cur_rdd_id, action_id_c, true);
+            let partial_res = get_encrypted_data::<u64>(
+                action_id, 
+                DepInfo::padding_new(4),
+                result_ptr as *mut u8,
+            );
+            *partial_res
+        });
+        let data = self.get_context().run_job(self.get_rdde(), None, cl)?
+            .into_iter().flatten().collect::<Vec<u64>>();
+        let res = data.into_iter().sum::<u64>();
+        Ok(res)
     }   
 
 
