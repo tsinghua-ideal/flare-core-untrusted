@@ -1950,11 +1950,10 @@ pub trait RddE: Rdd {
         let ctx = self.get_context();
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
-        let action_id_c = action_id.clone();
         let cur_rdd_id = self.get_rdd_id();
         let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
             let data = iter.collect::<Vec<Self::ItemE>>();
-            let result_ptr = wrapper_action(data, cur_rdd_id, action_id_c, true);
+            let result_ptr = wrapper_action(data, cur_rdd_id, action_id, true);
             let partial_res = get_encrypted_data::<UE>(
                 action_id, 
                 DepInfo::padding_new(4), 
@@ -1962,9 +1961,9 @@ pub trait RddE: Rdd {
             );
             *partial_res
         });
-        let data = self.get_context().run_job(self.get_rdde(), Some(action_id.clone()), cl)?
+        let data = self.get_context().run_job(self.get_rdde(), Some(action_id), cl)?
             .into_iter().flatten().collect::<Vec<UE>>();
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone(), false);
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id, false);
         let mut temp = get_encrypted_data::<UE>(
             action_id, 
             DepInfo::padding_new(3), 
@@ -2017,11 +2016,10 @@ pub trait RddE: Rdd {
         let ctx = self.get_context();
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
-        let action_id_c = action_id.clone();
         let cur_rdd_id = self.get_rdd_id();
         let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
             let data = iter.collect::<Vec<Self::ItemE>>();
-            let result_ptr = wrapper_action(data, cur_rdd_id, action_id_c, true);
+            let result_ptr = wrapper_action(data, cur_rdd_id, action_id, true);
             let partial_res = get_encrypted_data::<UE>(
                 action_id, 
                 DepInfo::padding_new(4), 
@@ -2029,10 +2027,10 @@ pub trait RddE: Rdd {
             );
             *partial_res
         });
-        let data = self.get_context().run_job(self.get_rdde(), Some(action_id.clone()), cl)?
+        let data = self.get_context().run_job(self.get_rdde(), Some(action_id), cl)?
             .into_iter().flatten().collect::<Vec<UE>>();
        
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone(), false);
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id, false);
         let mut temp = get_encrypted_data::<UE>(
             action_id, 
             DepInfo::padding_new(3), 
@@ -2084,11 +2082,10 @@ pub trait RddE: Rdd {
         let ctx = self.get_context();
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
-        let action_id_c = action_id.clone();
         let cur_rdd_id = self.get_rdd_id();
         let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
             let data = iter.collect::<Vec<Self::ItemE>>();
-            let result_ptr = wrapper_action(data, cur_rdd_id, action_id_c, true);
+            let result_ptr = wrapper_action(data, cur_rdd_id, action_id, true);
             let partial_res = get_encrypted_data::<UE>(
                 action_id, 
                 DepInfo::padding_new(4), 
@@ -2100,7 +2097,7 @@ pub trait RddE: Rdd {
         let data = ctx.run_job(self.get_rdde(), None, cl)?
             .into_iter().flatten().collect::<Vec<UE>>();
        
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id.clone(), false);
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id, false);
         let mut temp = get_encrypted_data::<UE>(
             action_id, 
             DepInfo::padding_new(3), 
