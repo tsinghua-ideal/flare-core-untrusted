@@ -2542,6 +2542,7 @@ pub trait RddE: Rdd {
         const SCALE_UP_FACTOR: f64 = 2.0;
         let fe = self.get_fe();
         let fd = self.get_fd();
+        let op_id = self.get_op_id();
         let bfe = Box::new(Fn!(move |data | {
             batch_encrypt::<>(data, fe.clone())
         }));
@@ -2576,7 +2577,9 @@ pub trait RddE: Rdd {
                 .collect();
             let num_partitions = partitions.len() as u32;
             let take_from_partition = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
-                iter.collect::<Vec<Self::ItemE>>()
+                let data = iter.collect::<Vec<Self::ItemE>>();
+                let (partial, _) = wrapper_take(op_id, &data, left);
+                partial
             });
 
             let res = self.get_context().run_job_with_partitions(
@@ -2588,7 +2591,7 @@ pub trait RddE: Rdd {
             res.into_iter().for_each(|r| {
                 let should_take = num - count;
                 if should_take != 0 {
-                    let (mut temp, have_take) = wrapper_take(self.get_op_id(), &r, should_take);
+                    let (mut temp, have_take) = wrapper_take(op_id, &r, should_take);
                     count += have_take;
                     buf.append(&mut temp);
                 }
