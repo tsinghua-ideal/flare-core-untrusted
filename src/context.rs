@@ -262,12 +262,16 @@ impl Context {
         let mut port: u16 = 10000;
         let mut address_map = Vec::new();
         let job_id = Uuid::new_v4().to_string();
-        let job_work_dir = env::Configuration::get()
+        let leader_work_dir = env::Configuration::get()
             .local_dir
             .join(format!("ns-session-{}", job_id));
-        let job_work_dir_str = job_work_dir
+
+        let worker_work_dir = env::Configuration::get()
+            .local_dir
+            .join(format!("ns-session-{}-worker", job_id));
+        let worker_work_dir_str = worker_work_dir
             .to_str()
-            .ok_or_else(|| Error::PathToString(job_work_dir.clone()))?;
+            .ok_or_else(|| Error::PathToString(worker_work_dir.clone()))?;
 
         let binary_path = std::env::current_exe().map_err(|_| Error::CurrentBinaryPath)?;
         let binary_path_str = binary_path
@@ -296,10 +300,10 @@ impl Context {
             .into_string()
             .map_err(Error::OsStringToString)?;
                     
-        fs::create_dir_all(&job_work_dir).unwrap();
-        let conf_path = job_work_dir.join("config.toml");
+        fs::create_dir_all(&leader_work_dir).unwrap();
+        let conf_path = leader_work_dir.join("config.toml");
         let conf_path = conf_path.to_str().unwrap();
-        initialize_loggers(job_work_dir.join("ns-driver.log"));
+        initialize_loggers(leader_work_dir.join("ns-driver.log"));
 
         for address in &hosts::Hosts::get()?.slaves {
             log::debug!("deploying executor at address {:?}", address);
@@ -314,7 +318,7 @@ impl Context {
             log::debug!("creating workdir");
             // Create work dir:
             Command::new("ssh")
-                .args(&["-i", PRI_KEY_LOC, address, "mkdir", &job_work_dir_str])
+                .args(&["-i", PRI_KEY_LOC, address, "mkdir", &worker_work_dir_str])
                 .output()
                 .map_err(|e| Error::CommandOutput {
                     source: e,
@@ -324,7 +328,7 @@ impl Context {
             log::debug!("copy conf file to remote");
             // Copy conf file to remote:
             Context::create_workers_config_file(address_ip, port, conf_path)?;
-            let remote_path = format!("{}:{}/config.toml", address, job_work_dir_str);
+            let remote_path = format!("{}:{}/config.toml", address, worker_work_dir_str);
             Command::new("scp")
                 .args(&["-i", PRI_KEY_LOC, conf_path, &remote_path])
                 .output()
@@ -335,7 +339,7 @@ impl Context {
 
             log::debug!("copy binary");
             // Copy binary:
-            let remote_path = format!("{}:{}/{}", address, job_work_dir_str, binary_name);
+            let remote_path = format!("{}:{}/{}", address, worker_work_dir_str, binary_name);
             Command::new("scp")
                 .args(&["-i", PRI_KEY_LOC, &binary_path_str, &remote_path])
                 .output()
@@ -345,7 +349,7 @@ impl Context {
                 })?;
 
             // Copy enclave
-            let remote_path = format!("{}:{}/{}", address, job_work_dir_str, enclave_name);
+            let remote_path = format!("{}:{}/{}", address, worker_work_dir_str, enclave_name);
             log::debug!("copy enclave");
             Command::new("scp")
                 .args(&["-i", PRI_KEY_LOC, &enclave_path_str, &remote_path])
@@ -358,7 +362,7 @@ impl Context {
 
             log::debug!("deploy a remote slave");
             // Deploy a remote slave:
-            let path = format!("{}/{}", job_work_dir_str, binary_name);
+            let path = format!("{}/{}", worker_work_dir_str, binary_name);
             log::debug!("remote path {}", path);
             Command::new("ssh")
                 .args(&["-i", PRI_KEY_LOC, address, &path])
@@ -381,13 +385,13 @@ impl Context {
             ))),
             address_map,
             distributed_driver: true,
-            work_dir: job_work_dir,
+            work_dir: leader_work_dir,
             last_loc_file: RwLock::new("null"),
             last_loc_line: AtomicU32::new(0), 
             num: AtomicUsize::new(0),
         }))
     }
-
+    
     fn init_distributed_worker() -> Result<!> {
         Context::launch_pre_touching();
         let mut work_dir = PathBuf::from("");
