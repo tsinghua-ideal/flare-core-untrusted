@@ -3,7 +3,7 @@ use std::any::{Any, TypeId};
 use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap};
 use std::convert::TryInto;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -12,17 +12,17 @@ use std::mem::forget;
 use std::net::Ipv4Addr;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::{Arc, RwLock, Weak,
+use std::sync::{
     atomic::{self, AtomicBool, AtomicUsize},
-    mpsc::{sync_channel, SyncSender, Receiver} 
-    };
-use std::thread::{JoinHandle, self};
+    mpsc::{sync_channel, Receiver, SyncSender},
+    Arc, RwLock, Weak,
+};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-
 use crate::context::Context;
-use crate::dependency::{Dependency, DepInfo};
-use crate::env::{self, BOUNDED_MEM_CACHE, Env};
+use crate::dependency::{DepInfo, Dependency};
+use crate::env::{self, Env, BOUNDED_MEM_CACHE};
 use crate::error::{Error, Result};
 use crate::partial::{BoundedDouble, CountEvaluator, GroupedCountEvaluator, PartialResult};
 use crate::partitioner::{HashPartitioner, Partitioner};
@@ -34,11 +34,11 @@ use crate::utils::bounded_priority_queue::BoundedPriorityQueue;
 use crate::utils::random::{BernoulliCellSampler, BernoulliSampler, PoissonSampler, RandomSampler};
 use crate::{utils, Fn, SerArc, SerBox};
 
+use aes_gcm::aead::{generic_array::GenericArray, Aead, NewAead};
 use aes_gcm::Aes128Gcm;
-use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
 use fasthash::MetroHasher;
-use ordered_float::OrderedFloat;
 use once_cell::sync::Lazy;
+use ordered_float::OrderedFloat;
 use rand::{Rng, SeedableRng};
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
@@ -70,13 +70,21 @@ mod union_rdd;
 pub use union_rdd::*;
 
 type CT<T, TE> = Text<T, TE>;
-pub type OText<T> = Text<T, T>; 
+pub type OText<T> = Text<T, T>;
 
 static immediate_cout: bool = true;
 pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
+pub const MERGE_FACTOR: usize = 64;
 pub const MAX_ENC_BL: usize = 1024;
 
 extern "C" {
+    pub fn secure_execute_pre(
+        eid: sgx_enclave_id_t,
+        tid: u64,
+        op_ids: *const u8,
+        part_nums: *const u8,
+        dep_info: DepInfo,
+    ) -> sgx_status_t;
     pub fn secure_execute(
         eid: sgx_enclave_id_t,
         retval: *mut usize,
@@ -88,8 +96,6 @@ extern "C" {
         dep_info: DepInfo,
         input: Input,
         captured_vars: *const u8,
-        spec_call_seq: *const u8,
-        spec_res: *mut usize,
     ) -> sgx_status_t;
     pub fn pre_merge(
         eid: sgx_enclave_id_t,
@@ -98,21 +104,6 @@ extern "C" {
         op_id: OpId,
         dep_info: DepInfo,
         input: Input,
-    ) -> sgx_status_t;
-    pub fn exploit_spec_oppty(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        tid: u64, 
-        op_ids: *const u8,
-        part_nums: *const u8,
-        cache_meta: CacheMeta,
-        dep_info: DepInfo,
-        spec_identifier: *mut usize,
-        hash_ops: *mut u64, 
-    ) -> sgx_status_t;
-    pub fn free_spec_seq(
-        eid: sgx_enclave_id_t,
-        input: *mut u8,
     ) -> sgx_status_t;
     pub fn free_res_enc(
         eid: sgx_enclave_id_t,
@@ -124,7 +115,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         op_id: OpId,
         dep_info: DepInfo,
-        input: *mut u8,  
+        input: *mut u8,
     ) -> sgx_status_t;
     pub fn get_sketch(
         eid: sgx_enclave_id_t,
@@ -148,7 +139,7 @@ extern "C" {
         seed: u64,
         is_some: u8,
         num: u64,
-    ) -> sgx_status_t; 
+    ) -> sgx_status_t;
     pub fn set_sampler(
         eid: sgx_enclave_id_t,
         op_id: OpId,
@@ -163,15 +154,8 @@ extern "C" {
         should_take: usize,
         have_take: *mut usize,
     ) -> sgx_status_t;
-    pub fn tail_compute(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        input: *mut u8,
-    ) -> sgx_status_t;
-    pub fn free_tail_info(
-        eid: sgx_enclave_id_t,
-        input: *mut u8, 
-    ) -> sgx_status_t;
+    pub fn tail_compute(eid: sgx_enclave_id_t, retval: *mut usize, input: *mut u8) -> sgx_status_t;
+    pub fn free_tail_info(eid: sgx_enclave_id_t, input: *mut u8) -> sgx_status_t;
 }
 
 #[no_mangle]
@@ -180,19 +164,20 @@ pub unsafe extern "C" fn sbrk_o(increment: usize) -> *mut c_void {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ocall_cache_to_outside(rdd_id: usize,
+pub unsafe extern "C" fn ocall_cache_to_outside(
+    rdd_id: usize,
     part_id: usize,
     data_ptr: usize,
 ) -> u8 {
     //need to clone from memory alloced by ucmalloc to memory alloced by default allocator
-    Env::get().cache_tracker.put_sdata((rdd_id, part_id), data_ptr as *mut u8, 0);
-    0  //need to revise
+    Env::get()
+        .cache_tracker
+        .put_sdata((rdd_id, part_id), data_ptr as *mut u8, 0);
+    0 //need to revise
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ocall_cache_from_outside(rdd_id: usize,
-    part_id: usize,
-) -> usize {
+pub unsafe extern "C" fn ocall_cache_from_outside(rdd_id: usize, part_id: usize) -> usize {
     let res = Env::get().cache_tracker.get_sdata((rdd_id, part_id));
     match res {
         Some(val) => val,
@@ -206,35 +191,55 @@ pub fn default_hash<T: Hash>(t: &T) -> u64 {
     s.finish()
 }
 
+pub fn wrapper_secure_execute_pre(op_ids: &Vec<OpId>, split_nums: &Vec<usize>, dep_info: DepInfo) {
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
+    let tid: u64 = thread::current().id().as_u64().into();
+    let sgx_status = unsafe {
+        secure_execute_pre(
+            eid,
+            tid,
+            op_ids as *const Vec<OpId> as *const u8,
+            split_nums as *const Vec<usize> as *const u8,
+            dep_info,
+        )
+    };
+    match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {}
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        }
+    };
+}
+
 pub fn wrapper_secure_execute<T>(
-    rdd_ids: &Vec<usize>, 
+    rdd_ids: &Vec<usize>,
     op_ids: &Vec<OpId>,
     part_ids: &Vec<usize>,
     cache_meta: CacheMeta,
-    dep_info: DepInfo, 
+    dep_info: DepInfo,
     data: &T,
-    lower: &mut Vec<usize>,
-    upper: &mut Vec<usize>,
-    upper_bound: &Vec<usize>,
-    block_len: usize,
-    to_set_usage: usize,
     captured_vars: &HashMap<usize, Vec<Vec<u8>>>,
-    spec_call_seq: &Option<(Vec<OpId>, usize, u64)>,
-) -> (usize, (f64, (f64, f64)))  //(result_ptr, (time_for_sub_part_computation, last_memory_usage_per_thread, max_memory_usage_per_thread)) 
+) -> usize
+// return result_ptr
 where
     T: Construct + Data,
 {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
     let mut result_bl_ptr: usize = 0;
     let tid: u64 = thread::current().id().as_u64().into();
-    let mut init_mem_usage = to_set_usage;
-    let mut last_mem_usage = 0;
-    let mut max_mem_usage = 0;
-    let input = Input::new(data, lower, upper, upper_bound, block_len, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
-    let spec_call_seq = spec_call_seq.clone().unwrap_or((Vec::new(), 0, 0));
-    let mut spec_res: usize = 0; 
-
-    let now_comp = Instant::now();
+    let input = Input::new(data);
     let sgx_status = unsafe {
         secure_execute(
             eid,
@@ -247,304 +252,70 @@ where
             dep_info,
             input,
             captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-            &spec_call_seq.0 as *const Vec<OpId> as *const u8,
-            &mut spec_res,
         )
     };
     match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
-    };
-
-    //have speculative execution
-    if !spec_call_seq.0.is_empty() {
-        let op_id = spec_call_seq.0[1];
-        let key = (
-            spec_call_seq.2, //hash_ops
-            cache_meta.caching_part_id,
-            spec_call_seq.1,
-        );
-
-        println!("have speculative execution, key = {:?}, ops = {:?}", key, spec_call_seq.0);
-    
-        if let Some(mut value) = env::SPEC_SHUFFLE_CACHE.get_mut(&key) {
-            value.0.push(spec_res);
-        } else {
-            env::SPEC_SHUFFLE_CACHE.insert(key, (vec![spec_res], op_id));
         }
-    }
-
-    let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-    (result_bl_ptr, (dur_comp, (last_mem_usage as f64, max_mem_usage as f64)))
+    };
+    result_bl_ptr
 }
 
-pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<(usize, (f64, f64, usize))>) -> f64 {
-    let len = data.len();
-    //For narrow, streaming process in enclave
-    if acc_arg.dep_info.is_shuffle == 0 || acc_arg.dep_info.is_shuffle == 1 {
-        acc_arg.block_len.store(len, atomic::Ordering::SeqCst);
-    }
+pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<usize>) -> f64 {
     let mut wait = 0.0;
-    let mut cache_meta = acc_arg.to_cache_meta();
-    let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
+    let cache_meta = acc_arg.to_cache_meta();
+    wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
+    let wait_now = Instant::now();
+    acc_arg.get_enclave_lock();
+    let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
+    wait += wait_dur;
+    let result_ptr = wrapper_secure_execute(
+        &acc_arg.rdd_ids,
         &acc_arg.op_ids,
-        &acc_arg.split_nums,
-        cache_meta, 
+        &acc_arg.part_ids,
+        cache_meta,
         acc_arg.dep_info,
+        &data,
+        &acc_arg.captured_vars,
     );
-    if spec_call_seq_ptr.is_some() {
-        cache_meta.enable_spec();
-    }
-
-    let mut cur = 0;
-    let mut to_set_usage = 0;
-    while cur < len {
-        let wait_now = Instant::now();
-        acc_arg.get_enclave_lock();
-        let wait_dur = wait_now.elapsed().as_nanos() as f64 * 1e-9;
-        wait += wait_dur;
-
-        let block_len = acc_arg.block_len.load(atomic::Ordering::SeqCst);
-        let cur_usage = acc_arg.cur_usage.load(atomic::Ordering::SeqCst);
-        if cur_usage != 0 {
-            to_set_usage = cur_usage;
-        }
-        let next = match cur + block_len > len {
-            true => len,
-            false => cur + block_len,
-        };
-
-        let (result_bl_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
-            &acc_arg.rdd_ids,
-            &acc_arg.op_ids,
-            &acc_arg.part_ids,
-            cache_meta,
-            acc_arg.dep_info,
-            &data,
-            &mut vec![cur],
-            &mut vec![next],
-            &vec![len],
-            block_len,
-            to_set_usage,
-            &acc_arg.captured_vars,
-            &spec_call_seq_ptr,
-        );
-        tx.send((result_bl_ptr, (time_comp, mem_usage.1, acc_arg.acc_captured_size))).unwrap();
-        cur = next; 
-    }
+    tx.send(result_ptr).unwrap();
 
     wait
 }
 
-pub fn dynamic_subpart_meta(
-    time_comp: f64,
-    max_mem_usage: f64,
-    acc_captured_size: f64,
-    block_len_: &Arc<AtomicUsize>,
-    slopes: &mut Vec<f64>,
-    fresh_slope: &Arc<AtomicBool>,
-    num_splits: usize,
-    aggresive: &mut bool,
-) {
-    let tid: u64 = thread::current().id().as_u64().into();
-    let cache_size = 12*(1<<20); //L3 Cache Size
-    let threshold = 0.25 * cache_size as f64;  //threshold for aggresive strategy
-    let limit_per_partition = ((80*(1<<20)) as f64)/(num_splits as f64);  //about 80MB/num_splits
-    let mut block_len = block_len_.load(atomic::Ordering::SeqCst);
-    if fresh_slope.compare_and_swap(true, false, atomic::Ordering::SeqCst) {
-        //for unique-partitioner-union, it may affect other cases but does not matter
-        slopes.clear();
-    }
-    let cur_mem_usage = max_mem_usage+acc_captured_size*(block_len-1) as f64;
-    if *aggresive {
-        println!("aggresive!");
-        let k = time_comp/(cur_mem_usage/((1<<30) as f64));   // s/GB
-        if slopes.is_empty() {
-            slopes.push(k);
-            block_len *= 2;
-        } else {
-            let limit = std::cmp::min(OrderedFloat(limit_per_partition), OrderedFloat(threshold));
-            let avg_k = slopes.iter().sum::<f64>()/(slopes.len() as f64);
-            if k <= avg_k * 0.8 && max_mem_usage < *limit {
-                slopes.clear();
-                slopes.push(k);
-                block_len *= 2;
-            } else if k <= avg_k * 1.2 && max_mem_usage < *limit {
-                slopes.push(k);
-                block_len *= 2;
-            } else {
-                *aggresive = false;
-                println!("disable aggresive strategy!");
-                block_len = (block_len + 1) / 2;
-            }
-        }
-    } else {
-        println!("non-aggresive!");
-        let k = time_comp/(cur_mem_usage/((1<<30) as f64));   // s/GB
-        if slopes.is_empty() {
-            slopes.push(k);
-            block_len += 1;
-        } else {
-            let avg_k = slopes.iter().sum::<f64>()/(slopes.len() as f64);
-            if k <= avg_k * 0.8 && max_mem_usage < limit_per_partition {
-                slopes.clear();
-                slopes.push(k);
-                block_len += 1;
-            } else if k <= avg_k * 1.2 && max_mem_usage < limit_per_partition {
-                slopes.push(k);
-                block_len += 1;
-            } else if k <= avg_k * 1.5 {
-                if  block_len > 1 {
-                    block_len -= 1;
-                } else {
-                    slopes.clear();
-                    slopes.push(k);
-                }
-            } else {
-                block_len = (block_len + 1) / 2;
-            }
-        }
-    }
-    //block_len = 1; //mark
-    println!("tid: {:?}, limit_per_partition {:?}B, block_len: {:?}", tid, limit_per_partition, block_len);
-    block_len_.store(block_len, atomic::Ordering::SeqCst);
-}
-
 pub fn wrapper_pre_merge<T: Data>(
     op_id: OpId,
-    mut data: Vec<Vec<T>>,
+    data: Vec<Vec<T>>,
     dep_info: DepInfo,
-    num_splits: usize,
 ) -> Vec<Vec<T>> {
-    let merge_factor = 64;
-    fn ecall_pre_merge<T: Data>(op_id: OpId, data: Vec<Vec<T>>, dep_info: DepInfo, num_sub_part: usize, num_splits: usize) -> Vec<Vec<T>> {
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-        let tid: u64 = thread::current().id().as_u64().into();
-        let mut lower = vec![0; num_sub_part];
-        let mut upper = vec![1; num_sub_part];
-        let upper_bound = data.iter().map(|sub_part| sub_part.len()).collect::<Vec<_>>();
-        let mut result = Vec::new();
-        let block_len = Arc::new(AtomicUsize::new(1));
-        let mut slopes = Vec::new();
-        let fresh_slope = Arc::new(AtomicBool::new(false));
-        let mut aggresive = false;
-        let mut to_set_usage = 0;
-        while lower.iter().zip(upper_bound.iter()).filter(|(l, ub)| l < ub).count() > 0 {
-            upper = upper.iter()
-                .zip(upper_bound.iter())
-                .map(|(l, ub)| std::cmp::min(*l, *ub))
-                .collect::<Vec<_>>();
-            let mut result_ptr: usize = 0;
-            let mut init_mem_usage = to_set_usage;
-            let mut last_mem_usage = 0;
-            let mut max_mem_usage = 0;
-            let input = Input::new(&data, &mut lower, &mut upper, &upper_bound, block_len.load(atomic::Ordering::SeqCst), &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
-            let now_comp = Instant::now();
-            let sgx_status = unsafe {
-                pre_merge(
-                    eid,
-                    &mut result_ptr,
-                    tid,
-                    op_id,
-                    dep_info,
-                    input,
-                )
-            };
-            match sgx_status {
-                sgx_status_t::SGX_SUCCESS => {},
-                _ => {
-                    panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                },
-            };
-            let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-            dynamic_subpart_meta(dur_comp, max_mem_usage as f64, 0 as f64, &block_len, &mut slopes, &fresh_slope, num_splits, &mut aggresive);
-            let mut result_bl = get_encrypted_data::<Vec<Vec<T>>>(op_id, dep_info, result_ptr as *mut u8).remove(0);
-            assert!(result_bl.len() == 1);
-            result.append(&mut result_bl[0]);
-            lower = lower.iter()
-                .zip(upper_bound.iter())
-                .map(|(l, ub)| std::cmp::min(*l, *ub))
-                .collect::<Vec<_>>();
-            to_set_usage = last_mem_usage;
-        }
-        vec![result]
+    if data.len() <= MERGE_FACTOR {
+        return data;
     }
-    let now = Instant::now();
-    let mut n = data.len();
-    let mut r = Vec::new();
-    let mut c = 0;
-    while n > merge_factor {
-        c += 1;
-        let m = (n-1)/merge_factor+1;
-        for i in 0..m {
-            let start = i*merge_factor;
-            let end = std::cmp::min((i+1)*merge_factor, n);
-            r.append(&mut ecall_pre_merge(op_id, (&data[start..end]).to_vec(), dep_info, end-start, num_splits));    
-        }
-        data = r;
-        n = data.len();
-        r = Vec::new();
-    
-    }
-    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-    println!("pre_merge total {:?}s, encryption count {:?}", dur, c);
-    data
-}
 
-pub fn wrapper_exploit_spec_oppty(
-    op_ids: &Vec<OpId>,
-    split_nums: &Vec<usize>,
-    cache_meta: CacheMeta,
-    dep_info: DepInfo
-) -> Option<(Vec<OpId>, usize, u64)> {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let mut retval: usize = 0;
-    let mut spec_identifier = 0;
-    let mut hash_ops: u64= 0;
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
     let tid: u64 = thread::current().id().as_u64().into();
-    let sgx_status = unsafe {
-        exploit_spec_oppty(
-            eid,
-            &mut retval,
-            tid,
-            op_ids as *const Vec<OpId> as *const u8,
-            split_nums as *const Vec<usize> as *const u8,
-            cache_meta,
-            dep_info,
-            &mut spec_identifier,
-            &mut hash_ops,
-        )
-    };
+    let now = Instant::now();
+    let mut result_ptr = 0;
+    let input = Input::new(&data);
+    let sgx_status = unsafe { pre_merge(eid, &mut result_ptr, tid, op_id, dep_info, input) };
     match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
+        }
     };
-    if retval != 0 {
-        let res_ = unsafe{ Box::from_raw(retval as *mut Vec<OpId>) };
-        let res = res_.clone();
-        forget(res_);
-        let sgx_status = unsafe {
-            free_spec_seq(
-                eid,
-                retval as *mut u8,
-            )
-        };
-        match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            },
-        };
-        return None;   //test non-spec case
-        Some((*res, spec_identifier, hash_ops))
-    } else {
-        None
-    }
-
+    let mut data = get_encrypted_data::<Vec<Vec<T>>>(op_id, dep_info, result_ptr as *mut u8);
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("pre_merge total {:?}s", dur);
+    data.remove(0)
 }
 
 pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, is_local: bool) -> usize {
@@ -559,11 +330,14 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, is_loca
     } else {
         DepInfo::padding_new(3)
     };
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let mut init_mem_usage = 0;
-    let mut last_mem_usage = 0;
-    let mut max_mem_usage = 0;
-    let input = Input::new(&data, &mut vec![0], &mut vec![data.len()], &vec![data.len()], usize::MAX, &mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage);
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
+    let input = Input::new_with(&data, usize::MAX);
     let mut result_ptr: usize = 0;
     let sgx_status = unsafe {
         secure_execute(
@@ -573,19 +347,17 @@ pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, is_loca
             &rdd_ids as *const Vec<usize> as *const u8,
             &op_ids as *const Vec<OpId> as *const u8,
             &part_ids as *const Vec<usize> as *const u8,
-            Default::default(),  //meaningless
+            Default::default(), //meaningless
             dep_info,
             input,
             &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-            &Vec::new() as *const Vec<OpId> as *const u8,
-            &mut 0, 
         )
     };
     match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
+        }
     };
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("in aggregate, ecall {:?}s", dur);
@@ -600,14 +372,20 @@ pub fn wrapper_randomize_in_place<T>(
     num: u64,
 ) -> Vec<T>
 where
-    T:  std::fmt::Debug 
-        + Clone 
+    T: std::fmt::Debug
+        + Clone
         + Serialize
         + serde::ser::Serialize
         + serde::de::DeserializeOwned
-        + 'static 
+        + 'static,
 {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
     let (seed, is_some) = match seed {
         Some(seed) => (seed, 1),
         None => (0, 0),
@@ -626,39 +404,44 @@ where
         )
     };
     let _r = match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
+        }
     };
     let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(0), retval as *mut u8);
     *res
 }
 
 pub fn wrapper_set_sampler(op_id: OpId, with_replacement: bool, fraction: f64) {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
     let with_replacement = match with_replacement {
         true => 1,
         false => 0,
     };
-    let sgx_status = unsafe {
-        set_sampler(
-            eid,
-            op_id,
-            with_replacement,
-            fraction,
-        )
-    };
+    let sgx_status = unsafe { set_sampler(eid, op_id, with_replacement, fraction) };
     let _r = match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
+        }
     };
 }
 
 pub fn wrapper_take<T: Data>(op_id: OpId, input: &Vec<T>, should_take: usize) -> (Vec<T>, usize) {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
     let mut retval: usize = 0;
     let mut have_take: usize = 0;
     let sgx_status = unsafe {
@@ -668,21 +451,27 @@ pub fn wrapper_take<T: Data>(op_id: OpId, input: &Vec<T>, should_take: usize) ->
             op_id,
             input as *const Vec<T> as *const u8,
             should_take,
-            &mut have_take
+            &mut have_take,
         )
     };
     let _r = match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
+        }
     };
     let res = get_encrypted_data::<T>(op_id, DepInfo::padding_new(0), retval as *mut u8);
     (*res, have_take)
 }
 
 pub fn wrapper_tail_compute(tail_info: &mut TailCompInfo) {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
     let mut p_new_tail_info: usize = 0;
     let sgx_status = unsafe {
         tail_compute(
@@ -692,61 +481,55 @@ pub fn wrapper_tail_compute(tail_info: &mut TailCompInfo) {
         )
     };
     let _r = match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
+        }
     };
-    let new_tail_info_ = unsafe{ Box::from_raw( p_new_tail_info as *mut u8 as *mut TailCompInfo) };
+    let new_tail_info_ = unsafe { Box::from_raw(p_new_tail_info as *mut u8 as *mut TailCompInfo) };
     let new_tail_info = new_tail_info_.clone();
     forget(new_tail_info_);
 
-    let sgx_status = unsafe {
-        free_tail_info(
-            eid,
-            p_new_tail_info as *mut u8,
-        )
-    };
+    let sgx_status = unsafe { free_tail_info(eid, p_new_tail_info as *mut u8) };
     let _r = match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
+        }
     };
     *tail_info = *new_tail_info;
 }
 
-pub fn get_encrypted_data<T>(op_id: OpId, dep_info: DepInfo, p_data_enc: *mut u8) -> Box<Vec<T>> 
+pub fn get_encrypted_data<T>(op_id: OpId, dep_info: DepInfo, p_data_enc: *mut u8) -> Box<Vec<T>>
 where
-    T:  std::fmt::Debug 
-        + Clone 
+    T: std::fmt::Debug
+        + Clone
         + Serialize
         + serde::ser::Serialize
         + serde::de::DeserializeOwned
-        + 'static
+        + 'static,
 {
     let tid: u64 = thread::current().id().as_u64().into();
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
     if immediate_cout {
-        let res_ = unsafe{ Box::from_raw(p_data_enc as *mut Vec<T>) };
+        let res_ = unsafe { Box::from_raw(p_data_enc as *mut Vec<T>) };
         let res = res_.clone();
         forget(res_);
-        let sgx_status = unsafe { 
-            free_res_enc(
-                eid,
-                op_id,
-                dep_info,
-                p_data_enc,
-            )
-        };
+        let sgx_status = unsafe { free_res_enc(eid, op_id, dep_info, p_data_enc) };
         match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
+            sgx_status_t::SGX_SUCCESS => {}
             _ => {
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
             }
         }
         res
-    } else { 
+    } else {
         let now = Instant::now();
         let size_buf_len = 1 << (7 + 10 + 10); //128M * 8B
         let size_buf = SizeBuf::new(size_buf_len);
@@ -757,36 +540,28 @@ where
                 op_id,
                 dep_info,
                 size_buf_ptr as *mut u8,
-                p_data_enc,   //shuffle write
+                p_data_enc, //shuffle write
             )
         };
         match sgx_status {
             sgx_status_t::SGX_SUCCESS => (),
             _ => {
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-            },
+            }
         };
 
-        let size_buf = unsafe{ Box::from_raw(size_buf_ptr) };
+        let size_buf = unsafe { Box::from_raw(size_buf_ptr) };
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("get sketch {:?}s", dur);
         let now = Instant::now();
         let mut v: Vec<T> = Vec::new();
         let mut idx = Idx::new();
         v.recv(&size_buf, &mut idx);
-        let ptr_out = Box::into_raw(Box::new(v)) as *mut u8 as usize; 
-        let sgx_status = unsafe {
-            clone_out(
-                eid,
-                op_id,
-                dep_info,
-                ptr_out,
-                p_data_enc,
-            )
-        };
+        let ptr_out = Box::into_raw(Box::new(v)) as *mut u8 as usize;
+        let sgx_status = unsafe { clone_out(eid, op_id, dep_info, ptr_out, p_data_enc) };
         let v = unsafe { Box::from_raw(ptr_out as *mut u8 as *mut Vec<T>) };
         match sgx_status {
-            sgx_status_t::SGX_SUCCESS => {},
+            sgx_status_t::SGX_SUCCESS => {}
             _ => {
                 panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
             }
@@ -808,20 +583,26 @@ where
 }
 
 pub fn move_data<T: Clone>(op_id: OpId, data: *mut u8) -> Box<Vec<T>> {
-    let res_ = unsafe{ Box::from_raw(data as *mut Vec<T>) };
+    let res_ = unsafe { Box::from_raw(data as *mut Vec<T>) };
     let res = res_.clone();
     forget(res_);
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let sgx_status = unsafe { 
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
+    let sgx_status = unsafe {
         priv_free_res_enc(
             eid,
             op_id,
             DepInfo::padding_new(0), //default to 0, for cache should not appear at the end of stage
-            data
+            data,
         )
     };
     match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         }
@@ -845,9 +626,9 @@ pub fn encrypt(pt: &[u8]) -> Vec<u8> {
 }
 
 #[inline(always)]
-pub fn ser_encrypt<T>(pt: Vec<T>) -> Vec<u8> 
+pub fn ser_encrypt<T>(pt: Vec<T>) -> Vec<u8>
 where
-    T: serde::ser::Serialize + serde::de::DeserializeOwned + 'static
+    T: serde::ser::Serialize + serde::de::DeserializeOwned + 'static,
 {
     match TypeId::of::<u8>() == TypeId::of::<T>() {
         true => {
@@ -857,9 +638,9 @@ where
                 Vec::from_raw_parts(ptr, len, cap)
             };
             encrypt(&rebuilt)
-        },
+        }
         false => encrypt(bincode::serialize(&pt).unwrap().as_ref()),
-    } 
+    }
 }
 
 #[inline(always)]
@@ -871,9 +652,9 @@ pub fn decrypt(ct: &[u8]) -> Vec<u8> {
 }
 
 #[inline(always)]
-pub fn ser_decrypt<T>(ct: Vec<u8>) -> Vec<T> 
+pub fn ser_decrypt<T>(ct: Vec<u8>) -> Vec<T>
 where
-    T: serde::ser::Serialize + serde::de::DeserializeOwned + 'static
+    T: serde::ser::Serialize + serde::de::DeserializeOwned + 'static,
 {
     if ct.len() == 0 {
         return Vec::new();
@@ -887,17 +668,17 @@ where
                 Vec::from_raw_parts(ptr, len, cap)
             };
             rebuilt
-        },
+        }
         false => bincode::deserialize(decrypt(&ct).as_ref()).unwrap(),
     }
 }
 
-pub fn batch_encrypt<T, TE, FE>(mut data: Vec<T>, fe: FE) -> Vec<TE> 
+pub fn batch_encrypt<T, TE, FE>(mut data: Vec<T>, fe: FE) -> Vec<TE>
 where
-    FE: Func(Vec<T>)->TE
+    FE: Func(Vec<T>) -> TE,
 {
     let mut len = data.len();
-    let mut data_enc = Vec::with_capacity(len/MAX_ENC_BL+1);
+    let mut data_enc = Vec::with_capacity(len / MAX_ENC_BL + 1);
     while len >= MAX_ENC_BL {
         len -= MAX_ENC_BL;
         let remain = data.split_off(MAX_ENC_BL);
@@ -911,9 +692,9 @@ where
     data_enc
 }
 
-pub fn batch_decrypt<T, TE, FD>(data_enc: Vec<TE>, fd: FD) -> Vec<T> 
+pub fn batch_decrypt<T, TE, FD>(data_enc: Vec<TE>, fd: FD) -> Vec<T>
 where
-    FD: Func(TE)->Vec<T>
+    FD: Func(TE) -> Vec<T>,
 {
     let mut data = Vec::new();
     for block in data_enc {
@@ -925,11 +706,17 @@ where
 
 pub fn secure_compute_cached(
     acc_arg: &mut AccArg,
-    cur_rdd_id: usize, 
+    cur_rdd_id: usize,
     cur_part_id: usize,
-    tx: SyncSender<(usize, (f64, f64, usize))>,
+    tx: SyncSender<usize>,
 ) -> Vec<JoinHandle<()>> {
-    let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
 
     let is_cached = Env::get().cache_tracker.scontain((cur_rdd_id, cur_part_id));
     let mut handles = Vec::new();
@@ -940,35 +727,18 @@ pub fn secure_compute_cached(
         let op_ids = acc_arg.op_ids.clone();
         let part_ids = acc_arg.part_ids.clone();
         let split_nums = acc_arg.split_nums.clone();
-        let mut cache_meta = acc_arg.to_cache_meta();
+        let cache_meta = acc_arg.to_cache_meta();
         let dep_info = acc_arg.dep_info;
         let eenter_lock = acc_arg.eenter_lock.clone();
-        let acc_captured_size = acc_arg.acc_captured_size;
         let captured_vars = acc_arg.captured_vars.clone();
 
         let handle = std::thread::spawn(move || {
             let tid: u64 = thread::current().id().as_u64().into();
-            //No need to get memory usage, for the sub-partition is fixed when using cached data
-            let spec_call_seq_ptr = wrapper_exploit_spec_oppty(
-                &op_ids, 
-                &split_nums,
-                cache_meta, 
-                dep_info,
-            );
-            if spec_call_seq_ptr.is_some() {
-                cache_meta.enable_spec();
-            }
-            let mut init_mem_usage = 0;
-            let mut last_mem_usage = 0;
-            let mut max_mem_usage = 0;
+            wrapper_secure_execute_pre(&op_ids, &split_nums, dep_info);
             let mut result_ptr: usize = 0;
             while eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
                 //wait
             }
-            let spec_call_seq = spec_call_seq_ptr.unwrap_or((Vec::new(), 0, 0));
-            let mut spec_res: usize = 0; 
-
-            let now_comp = Instant::now();
             let sgx_status = unsafe {
                 secure_execute(
                     eid,
@@ -978,39 +748,18 @@ pub fn secure_compute_cached(
                     &op_ids as *const Vec<OpId> as *const u8,
                     &part_ids as *const Vec<usize> as *const u8,
                     cache_meta,
-                    dep_info,   
-                    Input::padding(&mut init_mem_usage, &mut last_mem_usage, &mut max_mem_usage), //invalid pointer  TODO: send valid pointer
+                    dep_info,
+                    Input::build_from_ptr(0 as *const u8), //invalid pointer  TODO: send valid pointer
                     &captured_vars as *const HashMap<usize, Vec<Vec<u8>>> as *const u8,
-                    &spec_call_seq.0 as *const Vec<OpId> as *const u8,
-                    &mut spec_res,
                 )
             };
             match sgx_status {
-                sgx_status_t::SGX_SUCCESS => {},
+                sgx_status_t::SGX_SUCCESS => {}
                 _ => {
                     panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                },
-            };
-
-            //have speculative execution
-            if !spec_call_seq.0.is_empty() {
-                let op_id = spec_call_seq.0[1];
-                let key = (
-                    spec_call_seq.2, //hash_ops
-                    cache_meta.caching_part_id,
-                    spec_call_seq.1,
-                );
-            
-                if let Some(mut value) = env::SPEC_SHUFFLE_CACHE.get_mut(&key) {
-                    value.0.push(spec_res);
-                } else {
-                    env::SPEC_SHUFFLE_CACHE.insert(key, (vec![spec_res], op_id));
                 }
-            }
-
-            let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
-            println!("compute start cached data, total {:?} s", dur_comp);
-            tx.send((result_ptr, (dur_comp, max_mem_usage as f64, acc_captured_size))).unwrap();
+            };
+            tx.send(result_ptr).unwrap();
         });
         handles.push(handle);
     } else {
@@ -1019,31 +768,31 @@ pub fn secure_compute_cached(
     handles
 }
 
-
 #[derive(Clone, Debug)]
 pub struct AccArg {
     pub rdd_ids: Vec<usize>,
     pub op_ids: Vec<OpId>,
     pub part_ids: Vec<usize>,
-    pub split_nums: Vec<usize>, 
+    pub split_nums: Vec<usize>,
     pub dep_info: DepInfo,
     caching_rdd_id: usize,
     cached_rdd_id: usize,
     pub eenter_lock: Arc<AtomicBool>,
-    pub block_len: Arc<AtomicUsize>,
-    pub cur_usage: Arc<AtomicUsize>,  //for transfer the cur memory usage in union thread to prev thread
-    pub fresh_slope: Arc<AtomicBool>,
-    pub acc_captured_size: usize,
     pub captured_vars: HashMap<usize, Vec<Vec<u8>>>,
 }
 
 impl AccArg {
-    pub fn new(part_id: usize, dep_info: DepInfo, reduce_num: Option<usize>, eenter_lock: Arc<AtomicBool>, block_len: Arc<AtomicUsize>, cur_usage: Arc<AtomicUsize>, fresh_slope: Arc<AtomicBool>, acc_captured_size: usize) -> Self {
+    pub fn new(
+        part_id: usize,
+        dep_info: DepInfo,
+        reduce_num: Option<usize>,
+        eenter_lock: Arc<AtomicBool>,
+    ) -> Self {
         let split_nums = match reduce_num {
             Some(reduce_num) => {
                 assert!(dep_info.is_shuffle == 1);
                 vec![reduce_num]
-            },
+            }
             None => Vec::new(),
         };
         AccArg {
@@ -1055,10 +804,6 @@ impl AccArg {
             caching_rdd_id: 0,
             cached_rdd_id: 0,
             eenter_lock,
-            block_len,
-            cur_usage,
-            fresh_slope,
-            acc_captured_size,
             captured_vars: HashMap::new(),
         }
     }
@@ -1076,7 +821,7 @@ impl AccArg {
             true => {
                 self.caching_rdd_id = caching_rdd_id;
                 return true;
-            },
+            }
             false => return false,
         }
     }
@@ -1087,7 +832,7 @@ impl AccArg {
             true => {
                 self.cached_rdd_id = cached_rdd_id;
                 return true;
-            },
+            }
             false => return false,
         }
     }
@@ -1120,7 +865,13 @@ impl AccArg {
         )
     }
 
-    pub fn insert_quadruple(&mut self, rdd_id: usize, op_id: OpId, part_id: usize, split_num: usize) {
+    pub fn insert_quadruple(
+        &mut self,
+        rdd_id: usize,
+        op_id: OpId,
+        part_id: usize,
+        split_num: usize,
+    ) {
         self.rdd_ids.push(rdd_id);
         self.op_ids.push(op_id);
         self.part_ids.push(part_id);
@@ -1132,13 +883,20 @@ impl AccArg {
     }
 
     pub fn get_enclave_lock(&self) {
-        while self.eenter_lock.compare_and_swap(false, true, atomic::Ordering::SeqCst) {
+        while self
+            .eenter_lock
+            .compare_and_swap(false, true, atomic::Ordering::SeqCst)
+        {
             //wait
         }
     }
 
     pub fn free_enclave_lock(&self) {
-        assert_eq!(self.eenter_lock.compare_and_swap(true, false, atomic::Ordering::SeqCst), true);
+        assert_eq!(
+            self.eenter_lock
+                .compare_and_swap(true, false, atomic::Ordering::SeqCst),
+            true
+        );
     }
 }
 
@@ -1151,7 +909,6 @@ pub struct CacheMeta {
     cached_rdd_id: usize,
     cached_op_id: OpId,
     cached_part_id: usize,
-    can_spec: u8,
 }
 
 impl CacheMeta {
@@ -1170,104 +927,39 @@ impl CacheMeta {
             cached_rdd_id,
             cached_op_id,
             cached_part_id,
-            can_spec: 0,
         }
     }
 
-    pub fn enable_spec(&mut self) {
-        self.can_spec = 1;
-    }
-
     pub fn get_triplet(&self) -> (usize, usize) {
-        (
-            self.caching_rdd_id,
-            self.caching_part_id,   
-        )
+        (self.caching_rdd_id, self.caching_part_id)
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Input {
     data: usize,
-    lower: usize,
-    upper: usize,
-    upper_bound: usize,
-    block_len: usize,
-    init_mem_usage: usize,
-    last_mem_usage: usize,
-    max_mem_usage: usize,
+    parallel_num: usize,
 }
 
 impl Input {
-    pub fn new<T: Data>(data: &T, 
-        lower: &mut Vec<usize>, 
-        upper: &mut Vec<usize>,
-        upper_bound: &Vec<usize>,
-        block_len: usize, 
-        init_mem_usage: &mut usize, 
-        last_mem_usage: &mut usize,
-        max_mem_usage: &mut usize,
-    ) -> Self {
+    pub fn new<T: Data>(data: &T) -> Self {
         let data = data as *const T as usize;
-        let lower = lower as *mut Vec<usize> as usize;
-        let upper = upper as *mut Vec<usize> as usize;
-        let upper_bound = upper_bound as *const Vec<usize> as usize;
-        let init_mem_usage = init_mem_usage as *mut usize as usize;
-        let last_mem_usage = last_mem_usage as *mut usize as usize;
-        let max_mem_usage = max_mem_usage as *mut usize as usize;
         Input {
             data,
-            lower,
-            upper,
-            upper_bound,
-            block_len,
-            init_mem_usage,
-            last_mem_usage,
-            max_mem_usage,
+            parallel_num: STAGE_LOCK.get_parall_num(),
         }
     }
 
-    pub fn build_from_ptr(data: *const u8, 
-        lower: &mut Vec<usize>, 
-        upper: &mut Vec<usize>,
-        upper_bound: &Vec<usize>, 
-        block_len: usize, 
-        init_mem_usage: &mut usize,
-        last_mem_usage: &mut usize,
-        max_mem_usage: &mut usize,
-    ) -> Self {
-        let lower = lower as *mut Vec<usize> as usize;
-        let upper = upper as *mut Vec<usize> as usize;
-        let upper_bound = upper_bound as *const Vec<usize> as usize;
-        let init_mem_usage = init_mem_usage as *mut usize as usize;
-        let last_mem_usage = last_mem_usage as *mut usize as usize;
-        let max_mem_usage = max_mem_usage as *mut usize as usize;
+    pub fn new_with<T: Data>(data: &T, parallel_num: usize) -> Self {
+        let data = data as *const T as usize;
+        Input { data, parallel_num }
+    }
+
+    pub fn build_from_ptr(data: *const u8) -> Self {
         Input {
             data: data as usize,
-            lower,
-            upper,
-            upper_bound,
-            block_len,
-            init_mem_usage,
-            last_mem_usage,
-            max_mem_usage,
-        }
-    }
-
-    pub fn padding(init_mem_usage: &mut usize, last_mem_usage: &mut usize, max_mem_usage: &mut usize) -> Self {
-        let init_mem_usage = init_mem_usage as *mut usize as usize;
-        let last_mem_usage = last_mem_usage as *mut usize as usize;
-        let max_mem_usage = max_mem_usage as *mut usize as usize;
-        Input {
-            data: 0,
-            lower: 0,
-            upper: 0,
-            upper_bound: 0,
-            block_len: 0,
-            init_mem_usage,
-            last_mem_usage,
-            max_mem_usage,
+            parallel_num: STAGE_LOCK.get_parall_num(),
         }
     }
 }
@@ -1302,10 +994,13 @@ impl StageLock {
             num_splits_mapping: RwLock::new(BTreeMap::new()),
         }
     }
-    
+
     pub fn insert_stage(&self, rdd_id_pair: (usize, usize, usize), task_id: usize) {
         let mut waiting_list = self.waiting_list.write().unwrap();
-        waiting_list.entry(rdd_id_pair).or_insert(vec![]).push(task_id);
+        waiting_list
+            .entry(rdd_id_pair)
+            .or_insert(vec![])
+            .push(task_id);
     }
 
     pub fn remove_stage(&self, rdd_id_pair: (usize, usize, usize), task_id: usize) {
@@ -1319,7 +1014,10 @@ impl StageLock {
         }
         if remaining == 0 {
             waiting_list.remove(&rdd_id_pair);
-            self.num_splits_mapping.write().unwrap().remove(&rdd_id_pair);
+            self.num_splits_mapping
+                .write()
+                .unwrap()
+                .remove(&rdd_id_pair);
         }
     }
 
@@ -1333,7 +1031,7 @@ impl StageLock {
         let info = self.lock_holder_info.read().unwrap();
         std::cmp::min(
             *num_splits_mapping.get(&info.cur_holder).unwrap(),
-            info.max_cur_holders
+            info.max_cur_holders,
         )
     }
 
@@ -1345,13 +1043,21 @@ impl StageLock {
                 //wait or bypass
                 let mut info = self.lock_holder_info.write().unwrap();
                 if cur_rdd_id_pair == info.cur_holder  //The case for bypass
-                    && info.num_cur_holders < info.max_cur_holders 
+                    && info.num_cur_holders < info.max_cur_holders
                 {
                     info.num_cur_holders += 1;
-                    return
+                    return;
                 }
             }
-            if *self.waiting_list.read().unwrap().first_key_value().unwrap().0 < cur_rdd_id_pair {
+            if *self
+                .waiting_list
+                .read()
+                .unwrap()
+                .first_key_value()
+                .unwrap()
+                .0
+                < cur_rdd_id_pair
+            {
                 self.slock.store(false, SeqCst);
             } else {
                 let mut info = self.lock_holder_info.write().unwrap();
@@ -1361,7 +1067,7 @@ impl StageLock {
             }
         }
     }
-    
+
     pub fn free_stage_lock(&self) {
         use atomic::Ordering::SeqCst;
         self.lock_holder_info.write().unwrap().num_cur_holders -= 1;
@@ -1370,11 +1076,10 @@ impl StageLock {
             self.slock.compare_and_swap(true, false, SeqCst);
         }
     }
-    
 }
 
 #[derive(Default, Clone)]
-pub struct Text<T, TE> 
+pub struct Text<T, TE>
 where
     T: Data,
     TE: Data,
@@ -1385,23 +1090,23 @@ where
     bfd: Option<Box<dyn Func(TE) -> T>>,
 }
 
-impl<T, TE> Text<T, TE> 
+impl<T, TE> Text<T, TE>
 where
     T: Data,
     TE: Data,
 {
     #[track_caller]
-    pub fn new(data_enc: TE, bfe: Option<Box<dyn Func(T) -> TE>>, bfd: Option<Box<dyn Func(TE) -> T>>) -> Self {
-        let loc = Location::caller(); 
+    pub fn new(
+        data_enc: TE,
+        bfe: Option<Box<dyn Func(T) -> TE>>,
+        bfd: Option<Box<dyn Func(TE) -> T>>,
+    ) -> Self {
+        let loc = Location::caller();
 
         let file = loc.file();
         let line = loc.line();
         let num = 0;
-        let id = OpId::new(
-            file,
-            line,
-            num,
-        ).h;
+        let id = OpId::new(file, line, num).h;
 
         Text {
             data_enc,
@@ -1426,13 +1131,12 @@ where
             None => {
                 let data_enc = Box::new(self.data_enc.clone()) as Box<dyn Any>;
                 *data_enc.downcast::<T>().unwrap()
-            },
+            }
         }
     }
-
 }
 
-impl<T, TE> Deref for Text<T, TE> 
+impl<T, TE> Deref for Text<T, TE>
 where
     T: Data,
     TE: Data,
@@ -1444,7 +1148,7 @@ where
     }
 }
 
-impl<T, TE> DerefMut for Text<T, TE> 
+impl<T, TE> DerefMut for Text<T, TE>
 where
     T: Data,
     TE: Data,
@@ -1462,9 +1166,7 @@ pub struct TailCompInfo {
 
 impl TailCompInfo {
     pub fn new() -> Self {
-        TailCompInfo {
-            m: HashMap::new(),
-        }
+        TailCompInfo { m: HashMap::new() }
     }
 
     pub fn insert<T, TE>(&mut self, text: &Text<T, TE>)
@@ -1491,12 +1193,12 @@ impl TailCompInfo {
     pub fn clear(&mut self) {
         self.m.clear();
     }
-
 }
 
-
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 pub struct OpId {
     h: u64,
 }
@@ -1504,9 +1206,7 @@ pub struct OpId {
 impl OpId {
     pub fn new(file: &'static str, line: u32, num: usize) -> Self {
         let h = default_hash(&(file.to_string(), line, num));
-        OpId {
-            h,
-        }
+        OpId { h }
     }
 }
 
@@ -1576,17 +1276,15 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     fn number_of_splits(&self) -> usize {
         self.splits().len()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>>;
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>>;
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>>;
     // Analyse whether this is required or not. It requires downcasting while executing tasks which could hurt performance.
-    fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>>;
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>>;
+    fn cogroup_iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         self.iterator_any(split)
     }
     fn is_pinned(&self) -> bool {
@@ -1648,16 +1346,15 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     fn splits(&self) -> Vec<Box<dyn Split>> {
         (**self).get_rdd_base().splits()
     }
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        (**self).get_rdd_base().iterator_raw(split, acc_arg, tx)
-    }
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        (**self).get_rdd_base().iterator_raw_spec(data_ptr, acc_arg, tx)
-    }
-    fn iterator_any(
+    fn iterator_raw(
         &self,
         split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
+        (**self).get_rdd_base().iterator_raw(split, acc_arg, tx)
+    }
+    fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         (**self).get_rdd_base().iterator_any(split)
     }
 }
@@ -1670,16 +1367,23 @@ impl<I: RddE + ?Sized> Rdd for SerArc<I> {
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
         (**self).get_rdd_base()
     }
-    fn get_or_compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+    fn get_or_compute(
+        &self,
+        split: Box<dyn Split>,
+    ) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).get_or_compute(split)
     }
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         (**self).compute(split)
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         (**self).secure_compute(split, acc_arg, tx)
     }
-
 }
 
 impl<I: RddE + ?Sized> RddE for SerArc<I> {
@@ -1687,10 +1391,10 @@ impl<I: RddE + ?Sized> RddE for SerArc<I> {
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         (**self).get_rdde()
     }
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
         (**self).get_fe()
     }
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
         (**self).get_fd()
     }
     fn batch_encrypt(&self, data: Vec<Self::Item>) -> Vec<Self::ItemE> {
@@ -1708,7 +1412,10 @@ pub trait Rdd: RddBase + 'static {
 
     fn get_rdd_base(&self) -> Arc<dyn RddBase>;
 
-    fn get_or_compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
+    fn get_or_compute(
+        &self,
+        split: Box<dyn Split>,
+    ) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         let cache_tracker = Env::get().cache_tracker.clone();
         Ok(cache_tracker.get_or_compute(self.get_rdd(), split))
     }
@@ -1723,7 +1430,12 @@ pub trait Rdd: RddBase + 'static {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>>;
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>>;
 }
 
 pub trait RddE: Rdd {
@@ -1731,9 +1443,9 @@ pub trait RddE: Rdd {
 
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>;
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE>;
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>;
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>>;
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>;
 
     fn batch_encrypt(&self, data: Vec<Self::Item>) -> Vec<Self::ItemE> {
         batch_encrypt(data, self.get_fe())
@@ -1743,19 +1455,17 @@ pub trait RddE: Rdd {
         batch_decrypt(data_enc, self.get_fd())
     }
 
-    fn secure_iterator(&self, split: Box<dyn Split>, dep_info: DepInfo, action_id: Option<OpId>) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
+    fn secure_iterator(
+        &self,
+        split: Box<dyn Split>,
+        dep_info: DepInfo,
+        action_id: Option<OpId>,
+    ) -> Result<Box<dyn Iterator<Item = Self::ItemE>>> {
         let (tx, rx) = sync_channel(0);
         let rdd_id = self.get_rdd_id();
         let op_id = self.get_op_id();
         let part_id = split.get_index();
-        let mut acc_arg = AccArg::new(part_id, 
-            dep_info, 
-            None, 
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicUsize::new(1)), 
-            Arc::new(AtomicUsize::new(0)), 
-            Arc::new(AtomicBool::new(false)),
-            0);
+        let mut acc_arg = AccArg::new(part_id, dep_info, None, Arc::new(AtomicBool::new(false)));
         if let Some(action_id) = action_id {
             acc_arg.insert_quadruple(rdd_id, action_id, usize::MAX, usize::MAX);
         }
@@ -1763,42 +1473,26 @@ pub trait RddE: Rdd {
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
 
         let mut result = Vec::new();
-        let mut slopes = Vec::new();
-        let mut aggresive = true;
-        let mut c = 0;
-        for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx {
-            assert!(c == 0);  //otherwise the put_sdata should be changed
-            c += 1;
-            let mut result_bl = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8);
-            dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
+        for received in rx {
+            let mut result_bl =
+                get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8);
             acc_arg.free_enclave_lock();
-            if caching {
-                //collect result
-                result.extend_from_slice(&result_bl);
-                //cache
-                let size = result_bl.get_size();
-                let data_ptr = Box::into_raw(result_bl);
-                Env::get().cache_tracker.put_sdata((rdd_id, part_id), data_ptr as *mut u8, size);
-            } else {
-                result.append(result_bl.borrow_mut());
-            }
+            result.append(result_bl.borrow_mut());
         }
+
         for handle in handles {
             handle.join().unwrap();
         }
-        Ok(Box::new(result.into_iter()))
-    }
 
-    fn secure_shuffle_write(&self, data: Box<dyn Iterator<Item = Self::ItemE>>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let data = data.collect::<Vec<_>>();
-        let acc_arg = acc_arg.clone();
-        let handle = std::thread::spawn(move || {
-            let now = Instant::now();
-            let wait = start_execute(acc_arg, data, tx);
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
-            println!("***shuffle write, total {:?}***", dur);
-        });
-        Ok(vec![handle])         
+        if caching {
+            let size = result.get_size();
+            let data_ptr = Box::into_raw(Box::new(result.clone()));
+            Env::get()
+                .cache_tracker
+                .put_sdata((rdd_id, part_id), data_ptr as *mut u8, size);
+        }
+
+        Ok(Box::new(result.into_iter()))
     }
 
     /// Return a new RDD containing only the elements that satisfy a predicate.
@@ -1813,11 +1507,21 @@ pub trait RddE: Rdd {
               -> Box<dyn Iterator<Item = _>> {
             Box::new(items.filter(predicate))
         });
-        SerArc::new(MapPartitionsRdd::new(self.get_rdd(), filter_fn, self.get_fe(), self.get_fd()))
+        SerArc::new(MapPartitionsRdd::new(
+            self.get_rdd(),
+            filter_fn,
+            self.get_fe(),
+            self.get_fd(),
+        ))
     }
 
     #[track_caller]
-    fn map<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
+    fn map<U: Data, UE: Data, F, FE, FD>(
+        &self,
+        f: F,
+        fe: FE,
+        fd: FD,
+    ) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Self::Item) -> U,
         FE: SerFunc(Vec<U>) -> UE,
@@ -1828,7 +1532,12 @@ pub trait RddE: Rdd {
     }
 
     #[track_caller]
-    fn flat_map<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
+    fn flat_map<U: Data, UE: Data, F, FE, FD>(
+        &self,
+        f: F,
+        fe: FE,
+        fd: FD,
+    ) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Self::Item) -> Box<dyn Iterator<Item = U>>,
         FE: SerFunc(Vec<U>) -> UE,
@@ -1840,7 +1549,12 @@ pub trait RddE: Rdd {
 
     /// Return a new RDD by applying a function to each partition of this RDD.
     #[track_caller]
-    fn map_partitions<U: Data, UE: Data, F, FE, FD>(&self, func: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
+    fn map_partitions<U: Data, UE: Data, F, FE, FD>(
+        &self,
+        func: F,
+        fe: FE,
+        fd: FD,
+    ) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(Box<dyn Iterator<Item = Self::Item>>) -> Box<dyn Iterator<Item = U>>,
         FE: SerFunc(Vec<U>) -> UE,
@@ -1856,7 +1570,12 @@ pub trait RddE: Rdd {
     /// Return a new RDD by applying a function to each partition of this RDD,
     /// while tracking the index of the original partition.
     #[track_caller]
-    fn map_partitions_with_index<U: Data, UE: Data, F, FE, FD>(&self, f: F, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
+    fn map_partitions_with_index<U: Data, UE: Data, F, FE, FD>(
+        &self,
+        f: F,
+        fe: FE,
+        fd: FD,
+    ) -> SerArc<dyn RddE<Item = U, ItemE = UE>>
     where
         F: SerFunc(usize, Box<dyn Iterator<Item = Self::Item>>) -> Box<dyn Iterator<Item = U>>,
         FE: SerFunc(Vec<U>) -> UE,
@@ -1885,7 +1604,9 @@ pub trait RddE: Rdd {
             v.into_iter().map(|x| (fe)(x)).collect::<Vec<Self::ItemE>>()
         });
         let fd_wrapper = Fn!(move |v: Vec<Self::ItemE>| {
-            v.into_iter().map(|x| (fd)(x)).collect::<Vec<Vec<Self::Item>>>()
+            v.into_iter()
+                .map(|x| (fd)(x))
+                .collect::<Vec<Vec<Self::Item>>>()
         });
         let rdd = MapPartitionsRdd::new(self.get_rdd(), Box::new(func), fe_wrapper, fd_wrapper);
         rdd.register_op_name("gloom");
@@ -1910,7 +1631,8 @@ pub trait RddE: Rdd {
         }
         let cl = Fn!(move |(ctx, (iter, _))| save::<Self::Item>(ctx, iter, path.to_string()));
         //TODO action_id
-        self.get_context().run_job_with_context(self.get_rdde(), None, cl)
+        self.get_context()
+            .run_job_with_context(self.get_rdde(), None, cl)
     }
 
     fn reduce<F>(&self, f: F) -> Result<Option<Self::Item>>
@@ -1920,7 +1642,10 @@ pub trait RddE: Rdd {
     {
         // cloned cause we will use `f` later.
         let cf = f.clone();
-        let reduce_partition = Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+        let reduce_partition = Fn!(move |(iter, _): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| {
             let acc = iter.reduce(&cf);
             match acc {
                 None => vec![],
@@ -1928,7 +1653,9 @@ pub trait RddE: Rdd {
             }
         });
         let now = Instant::now();
-        let results = self.get_context().run_job(self.get_rdde(), None, reduce_partition);
+        let results = self
+            .get_context()
+            .run_job(self.get_rdde(), None, reduce_partition);
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("mapper {:?}s", dur);
         let now = Instant::now();
@@ -1951,25 +1678,30 @@ pub trait RddE: Rdd {
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
         let cur_rdd_id = self.get_rdd_id();
-        let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+        let cl = Fn!(move |(_, iter): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| {
             let data = iter.collect::<Vec<Self::ItemE>>();
             let result_ptr = wrapper_action(data, cur_rdd_id, action_id, true);
-            let partial_res = get_encrypted_data::<UE>(
-                action_id, 
-                DepInfo::padding_new(4), 
-                result_ptr as *mut u8,
-            );
+            let partial_res =
+                get_encrypted_data::<UE>(action_id, DepInfo::padding_new(4), result_ptr as *mut u8);
             *partial_res
         });
-        let data = self.get_context().run_job(self.get_rdde(), Some(action_id), cl)?
-            .into_iter().flatten().collect::<Vec<UE>>();
+        let data = self
+            .get_context()
+            .run_job(self.get_rdde(), Some(action_id), cl)?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<UE>>();
         let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id, false);
-        let mut temp = get_encrypted_data::<UE>(
-            action_id, 
-            DepInfo::padding_new(3), 
-            result_ptr as *mut u8,
-        );
-        Ok(Text::new(temp.pop().unwrap(), Some(Box::new(fe)), Some(Box::new(fd))))
+        let mut temp =
+            get_encrypted_data::<UE>(action_id, DepInfo::padding_new(3), result_ptr as *mut u8);
+        Ok(Text::new(
+            temp.pop().unwrap(),
+            Some(Box::new(fe)),
+            Some(Box::new(fd)),
+        ))
     }
 
     /// Aggregate the elements of each partition, and then the results for all the partitions, using a
@@ -1998,14 +1730,24 @@ pub trait RddE: Rdd {
     {
         let cf = f.clone();
         let zero = init.clone();
-        let reduce_partition =
-            Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.fold(zero.clone(), &cf));
-        let results = self.get_context().run_job(self.get_rdde(), None, reduce_partition);
+        let reduce_partition = Fn!(move |(iter, _): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| iter.fold(zero.clone(), &cf));
+        let results = self
+            .get_context()
+            .run_job(self.get_rdde(), None, reduce_partition);
         Ok(results?.into_iter().fold(init, f))
     }
 
     #[track_caller]
-    fn secure_fold<F, UE, FE, FD>(&self, init: Self::Item, f: F, fe: FE, fd: FD) -> Result<CT<Self::Item, UE>> 
+    fn secure_fold<F, UE, FE, FD>(
+        &self,
+        init: Self::Item,
+        f: F,
+        fe: FE,
+        fd: FD,
+    ) -> Result<CT<Self::Item, UE>>
     where
         Self: Sized,
         UE: Data,
@@ -2017,28 +1759,32 @@ pub trait RddE: Rdd {
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
         let cur_rdd_id = self.get_rdd_id();
-        let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+        let cl = Fn!(move |(_, iter): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| {
             let data = iter.collect::<Vec<Self::ItemE>>();
             let result_ptr = wrapper_action(data, cur_rdd_id, action_id, true);
-            let partial_res = get_encrypted_data::<UE>(
-                action_id, 
-                DepInfo::padding_new(4), 
-                result_ptr as *mut u8,
-            );
+            let partial_res =
+                get_encrypted_data::<UE>(action_id, DepInfo::padding_new(4), result_ptr as *mut u8);
             *partial_res
         });
-        let data = self.get_context().run_job(self.get_rdde(), Some(action_id), cl)?
-            .into_iter().flatten().collect::<Vec<UE>>();
-       
-        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id, false);
-        let mut temp = get_encrypted_data::<UE>(
-            action_id, 
-            DepInfo::padding_new(3), 
-            result_ptr as *mut u8,
-        );
-        Ok(Text::new(temp.pop().unwrap(), Some(Box::new(fe)), Some(Box::new(fd))))
-    }
+        let data = self
+            .get_context()
+            .run_job(self.get_rdde(), Some(action_id), cl)?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<UE>>();
 
+        let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id, false);
+        let mut temp =
+            get_encrypted_data::<UE>(action_id, DepInfo::padding_new(3), result_ptr as *mut u8);
+        Ok(Text::new(
+            temp.pop().unwrap(),
+            Some(Box::new(fe)),
+            Some(Box::new(fd)),
+        ))
+    }
 
     /// Aggregate the elements of each partition, and then the results for all the partitions, using
     /// given combine functions and a neutral "initial value". This function can return a different result
@@ -2062,14 +1808,25 @@ pub trait RddE: Rdd {
         CF: SerFunc(U, U) -> U,
     {
         let zero = init.clone();
-        let reduce_partition =
-            Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.fold(zero.clone(), &seq_fn));
-        let results = self.get_context().run_job(self.get_rdde(), None, reduce_partition);
+        let reduce_partition = Fn!(move |(iter, _): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| iter.fold(zero.clone(), &seq_fn));
+        let results = self
+            .get_context()
+            .run_job(self.get_rdde(), None, reduce_partition);
         Ok(results?.into_iter().fold(init, comb_fn))
     }
 
     #[track_caller]
-    fn secure_aggregate<U, UE, SF, CF, FE, FD>(&self, init: U, seq_fn: SF, comb_fn: CF, fe: FE, fd: FD) -> Result<CT<U, UE>> 
+    fn secure_aggregate<U, UE, SF, CF, FE, FD>(
+        &self,
+        init: U,
+        seq_fn: SF,
+        comb_fn: CF,
+        fe: FE,
+        fd: FD,
+    ) -> Result<CT<U, UE>>
     where
         Self: Sized,
         U: Data,
@@ -2083,27 +1840,31 @@ pub trait RddE: Rdd {
         let loc = Location::caller();
         let action_id = ctx.new_op_id(loc);
         let cur_rdd_id = self.get_rdd_id();
-        let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+        let cl = Fn!(move |(_, iter): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| {
             let data = iter.collect::<Vec<Self::ItemE>>();
             let result_ptr = wrapper_action(data, cur_rdd_id, action_id, true);
-            let partial_res = get_encrypted_data::<UE>(
-                action_id, 
-                DepInfo::padding_new(4), 
-                result_ptr as *mut u8,
-            );
+            let partial_res =
+                get_encrypted_data::<UE>(action_id, DepInfo::padding_new(4), result_ptr as *mut u8);
             *partial_res
         });
-        
-        let data = ctx.run_job(self.get_rdde(), None, cl)?
-            .into_iter().flatten().collect::<Vec<UE>>();
-       
+
+        let data = ctx
+            .run_job(self.get_rdde(), None, cl)?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<UE>>();
+
         let result_ptr = wrapper_action(data, self.get_rdd_id(), action_id, false);
-        let mut temp = get_encrypted_data::<UE>(
-            action_id, 
-            DepInfo::padding_new(3), 
-            result_ptr as *mut u8,
-        );
-        Ok(Text::new(temp.pop().unwrap(), Some(Box::new(fe)), Some(Box::new(fd))))
+        let mut temp =
+            get_encrypted_data::<UE>(action_id, DepInfo::padding_new(3), result_ptr as *mut u8);
+        Ok(Text::new(
+            temp.pop().unwrap(),
+            Some(Box::new(fe)),
+            Some(Box::new(fd)),
+        ))
     }
 
     /// Return the Cartesian product of this RDD and another one, that is, the RDD of all pairs of
@@ -2128,7 +1889,10 @@ pub trait RddE: Rdd {
         });
         let fd = Fn!(move |v: (Self::ItemE, UE)| {
             let (vx, vy) = v;
-            (fd0)(vx).into_iter().zip((fd1)(vy).into_iter()).collect::<Vec<(Self::Item, U)>>()
+            (fd0)(vx)
+                .into_iter()
+                .zip((fd1)(vy).into_iter())
+                .collect::<Vec<(Self::Item, U)>>()
         });
         SerArc::new(CartesianRdd::new(self.get_rdd(), other.get_rdd(), fe, fd))
     }
@@ -2156,7 +1920,11 @@ pub trait RddE: Rdd {
     /// data distributed using a hash partitioner. The optional partition coalescer
     /// passed in must be serializable.
     #[track_caller]
-    fn coalesce(&self, num_partitions: usize, shuffle: bool) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
+    fn coalesce(
+        &self,
+        num_partitions: usize,
+        shuffle: bool,
+    ) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Sized,
     {
@@ -2185,14 +1953,21 @@ pub trait RddE: Rdd {
             });
             let fd_wrapper_mpp = Fn!(move |v: (Vec<usize>, Self::ItemE)| {
                 let (vx, vy) = v;
-                let pt_y = (fd)(vy); 
+                let pt_y = (fd)(vy);
                 vx.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
             });
-            let map_steep: SerArc<dyn RddE<Item = (usize, Self::Item), ItemE = (Vec<usize>, Self::ItemE)>> =
-                SerArc::new(MapPartitionsRdd::new(self.get_rdd(), distributed_partition, fe_wrapper_mpp, fd_wrapper_mpp));
+            let map_steep: SerArc<
+                dyn RddE<Item = (usize, Self::Item), ItemE = (Vec<usize>, Self::ItemE)>,
+            > = SerArc::new(MapPartitionsRdd::new(
+                self.get_rdd(),
+                distributed_partition,
+                fe_wrapper_mpp,
+                fd_wrapper_mpp,
+            ));
             let partitioner = Box::new(HashPartitioner::<usize>::new(num_partitions));
             self.get_context().add_num(1);
-            let map_steep_part = map_steep.partition_by_key(partitioner, self.get_fe(), self.get_fd());
+            let map_steep_part =
+                map_steep.partition_by_key(partitioner, self.get_fe(), self.get_fd());
             self.get_context().add_num(1);
             let coalesced = SerArc::new(CoalescedRdd::new(
                 Arc::new(map_steep_part),
@@ -2204,7 +1979,12 @@ pub trait RddE: Rdd {
             coalesced
         } else {
             self.get_context().add_num(4);
-            SerArc::new(CoalescedRdd::new(self.get_rdd(), num_partitions, self.get_fe(), self.get_fd()))
+            SerArc::new(CoalescedRdd::new(
+                self.get_rdd(),
+                num_partitions,
+                self.get_fe(),
+                self.get_fd(),
+            ))
         }
     }
 
@@ -2212,8 +1992,10 @@ pub trait RddE: Rdd {
     where
         Self: Sized,
     {
-        let cl =
-            Fn!(|(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::Item>>());
+        let cl = Fn!(|(iter, _): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| iter.collect::<Vec<Self::Item>>());
         let results = self.get_context().run_job(self.get_rdde(), None, cl)?;
         let size = results.iter().fold(0, |a, b: &Vec<Self::Item>| a + b.len());
         Ok(results
@@ -2229,10 +2011,14 @@ pub trait RddE: Rdd {
     where
         Self: Sized,
     {
-        let cl =
-            Fn!(|(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.collect::<Vec<Self::ItemE>>());
+        let cl = Fn!(|(_, iter): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| iter.collect::<Vec<Self::ItemE>>());
         let results = self.get_context().run_job(self.get_rdde(), None, cl)?;
-        let size = results.iter().fold(0, |a, b: &Vec<Self::ItemE>| a + b.len());
+        let size = results
+            .iter()
+            .fold(0, |a, b: &Vec<Self::ItemE>| a + b.len());
         let result = results
             .into_iter()
             .fold(Vec::with_capacity(size), |mut acc, v| {
@@ -2252,8 +2038,10 @@ pub trait RddE: Rdd {
         Self: Sized,
     {
         let context = self.get_context();
-        let counting_func =
-            Fn!(|(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| { iter.count() as u64 });
+        let counting_func = Fn!(|(iter, _): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| { iter.count() as u64 });
         Ok(context
             .run_job(self.get_rdde(), None, counting_func)?
             .into_iter()
@@ -2270,26 +2058,34 @@ pub trait RddE: Rdd {
         let action_id = ctx.new_op_id(loc);
         let action_id_c = action_id.clone();
         let cur_rdd_id = self.get_rdd_id();
-        let cl = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+        let cl = Fn!(move |(_, iter): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| {
             let data = iter.collect::<Vec<Self::ItemE>>();
             let result_ptr = wrapper_action(data, cur_rdd_id, action_id_c, true);
             let partial_res = get_encrypted_data::<u64>(
-                action_id, 
+                action_id,
                 DepInfo::padding_new(4),
                 result_ptr as *mut u8,
             );
             *partial_res
         });
-        let data = self.get_context().run_job(self.get_rdde(), None, cl)?
-            .into_iter().flatten().collect::<Vec<u64>>();
+        let data = self
+            .get_context()
+            .run_job(self.get_rdde(), None, cl)?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<u64>>();
         let res = data.into_iter().sum::<u64>();
         Ok(res)
-    }   
-
+    }
 
     /// Return the count of each unique value in this RDD as a dictionary of (value, count) pairs.
     #[track_caller]
-    fn count_by_value(&self) -> SerArc<dyn RddE<Item = (Self::Item, u64), ItemE = (Self::ItemE, Vec<u8>)>>
+    fn count_by_value(
+        &self,
+    ) -> SerArc<dyn RddE<Item = (Self::Item, u64), ItemE = (Self::ItemE, Vec<u8>)>>
     where
         Self: Sized,
         Self::Item: Data + Eq + Hash,
@@ -2304,7 +2100,7 @@ pub trait RddE: Rdd {
         let fd_c = self.get_fd();
         let fd_wrapper_mp = Fn!(move |v: (Self::ItemE, Vec<u64>)| {
             let (vx, vy) = v;
-            let pt_x = (fd_c)(vx); 
+            let pt_x = (fd_c)(vx);
             pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
         });
 
@@ -2326,7 +2122,7 @@ pub trait RddE: Rdd {
         let mapped = self.map(Fn!(|x| (x, 1u64)), fe_wrapper_mp, fd_wrapper_mp);
         self.get_context().add_num(1);
         mapped.reduce_by_key(
-            Box::new(Fn!(|(x, y)| x + y)) as Box<dyn Func((u64, u64))->u64>,
+            Box::new(Fn!(|(x, y)| x + y)) as Box<dyn Func((u64, u64)) -> u64>,
             self.number_of_splits(),
             fe_wrapper_rd,
             fd_wrapper_rd,
@@ -2389,10 +2185,11 @@ pub trait RddE: Rdd {
     {
         let fe_c = self.get_fe();
         let fe_wrapper_mp0 = Fn!(move |v: Vec<(Option<Self::Item>, Option<Self::Item>)>| {
-            let (vx, vy): (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
+            let (vx, vy): (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>) =
+                v.into_iter().unzip();
             let ct_x = (fe_c)(vx.into_iter().map(|x| x.unwrap()).collect::<Vec<_>>());
             (ct_x, vy)
-        }); 
+        });
         let fd_c = self.get_fd();
         let fd_wrapper_mp0 = Fn!(move |v: (Self::ItemE, Vec<Option<Self::Item>>)| {
             let (vx, vy) = v;
@@ -2401,7 +2198,7 @@ pub trait RddE: Rdd {
         });
         let fe_wrapper_rd = fe_wrapper_mp0.clone();
         let fd_wrapper_rd = fd_wrapper_mp0.clone();
-        let fe = self.get_fe();       
+        let fe = self.get_fe();
         let fe_wrapper_mp1 = Fn!(move |v: Vec<Self::Item>| {
             let ct = (fe)(v);
             ct
@@ -2412,24 +2209,23 @@ pub trait RddE: Rdd {
             pt
         });
 
-        let mapped = self.map(
-            Fn!(|x| (Some(x), None)), 
-            fe_wrapper_mp0, 
-            fd_wrapper_mp0
-        );
+        let mapped = self.map(Fn!(|x| (Some(x), None)), fe_wrapper_mp0, fd_wrapper_mp0);
         self.get_context().add_num(1);
-        let reduced_by_key = mapped.reduce_by_key(Fn!(|(_x, y)| y),
+        let reduced_by_key = mapped.reduce_by_key(
+            Fn!(|(_x, y)| y),
             num_partitions,
             fe_wrapper_rd,
-            fd_wrapper_rd);
+            fd_wrapper_rd,
+        );
         self.get_context().add_num(1);
-        reduced_by_key.map(Fn!(|x: (
-            Option<Self::Item>,
-            Option<Self::Item>
-        )| {
-            let (x, _y) = x;
-            x.unwrap()
-        }), fe_wrapper_mp1, fd_wrapper_mp1)
+        reduced_by_key.map(
+            Fn!(|x: (Option<Self::Item>, Option<Self::Item>)| {
+                let (x, _y) = x;
+                x.unwrap()
+            }),
+            fe_wrapper_mp1,
+            fd_wrapper_mp1,
+        )
     }
 
     /// Return a new RDD containing the distinct elements in this RDD.
@@ -2463,7 +2259,10 @@ pub trait RddE: Rdd {
     /// If you are decreasing the number of partitions in this RDD, consider using `coalesce`,
     /// which can avoid performing a shuffle.
     #[track_caller]
-    fn repartition(&self, num_partitions: usize) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
+    fn repartition(
+        &self,
+        num_partitions: usize,
+    ) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Sized,
     {
@@ -2512,9 +2311,11 @@ pub trait RddE: Rdd {
                 ..total_parts.min(parts_scanned + num_parts_to_try) as usize)
                 .collect();
             let num_partitions = partitions.len() as u32;
-            let take_from_partion = Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
-                iter.take(left).collect::<Vec<Self::Item>>()
-            });
+            let take_from_partion =
+                Fn!(move |(iter, _): (
+                    Box<dyn Iterator<Item = Self::Item>>,
+                    Box<dyn Iterator<Item = Self::ItemE>>
+                )| { iter.take(left).collect::<Vec<Self::Item>>() });
 
             let res = self.get_context().run_job_with_partitions(
                 self.get_rdde(),
@@ -2543,17 +2344,13 @@ pub trait RddE: Rdd {
         let fe = self.get_fe();
         let fd = self.get_fd();
         let op_id = self.get_op_id();
-        let bfe = Box::new(Fn!(move |data | {
-            batch_encrypt::<>(data, fe.clone())
-        }));
-    
-        let bfd = Box::new(Fn!(move |data_enc | {
-            batch_decrypt::<>(data_enc, fd.clone())
-        }));
+        let bfe = Box::new(Fn!(move |data| { batch_encrypt(data, fe.clone()) }));
+
+        let bfd = Box::new(Fn!(move |data_enc| { batch_decrypt(data_enc, fd.clone()) }));
         if num == 0 {
             return Ok(Text::new(vec![], Some(bfe), Some(bfd)));
         }
-        
+
         let mut buf = vec![];
         let mut count = 0;
         let total_parts = self.number_of_splits() as u32;
@@ -2576,7 +2373,10 @@ pub trait RddE: Rdd {
                 ..total_parts.min(parts_scanned + num_parts_to_try) as usize)
                 .collect();
             let num_partitions = partitions.len() as u32;
-            let take_from_partition = Fn!(move |(_, iter): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| {
+            let take_from_partition = Fn!(move |(_, iter): (
+                Box<dyn Iterator<Item = Self::Item>>,
+                Box<dyn Iterator<Item = Self::ItemE>>
+            )| {
                 let data = iter.collect::<Vec<Self::ItemE>>();
                 let (partial, _) = wrapper_take(op_id, &data, left);
                 partial
@@ -2635,7 +2435,8 @@ pub trait RddE: Rdd {
             });
         full_bounds.extend(bounds);
 
-        let mut splitted_rdds: Vec<SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>> = Vec::new();
+        let mut splitted_rdds: Vec<SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>> =
+            Vec::new();
 
         for bound in full_bounds.windows(2) {
             let (lower_bound, upper_bound) = (bound[0], bound[1]);
@@ -2650,7 +2451,12 @@ pub trait RddE: Rdd {
                 Box::new(sampler_func(partition).into_iter())
             });
             //TODO decide whether to add_num
-            let rdd = SerArc::new(MapPartitionsRdd::new(self.get_rdd(), func, self.get_fe(), self.get_fd()));
+            let rdd = SerArc::new(MapPartitionsRdd::new(
+                self.get_rdd(),
+                func,
+                self.get_fe(),
+                self.get_fd(),
+            ));
             splitted_rdds.push(rdd.clone());
         }
 
@@ -2674,7 +2480,11 @@ pub trait RddE: Rdd {
     /// Replacement requires extra allocations due to the nature of the used sampler (Poisson distribution).
     /// This implies a performance penalty but should be negligible unless fraction and the dataset are rather large.
     #[track_caller]
-    fn sample(&self, with_replacement: bool, fraction: f64) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
+    fn sample(
+        &self,
+        with_replacement: bool,
+        fraction: f64,
+    ) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Sized,
     {
@@ -2685,7 +2495,13 @@ pub trait RddE: Rdd {
         } else {
             Arc::new(BernoulliSampler::new(fraction)) as Arc<dyn RandomSampler<Self::Item>>
         };
-        let rdd = SerArc::new(PartitionwiseSampledRdd::new(self.get_rdd(), sampler, true, self.get_fe(), self.get_fd()));
+        let rdd = SerArc::new(PartitionwiseSampledRdd::new(
+            self.get_rdd(),
+            sampler,
+            true,
+            self.get_fe(),
+            self.get_fd(),
+        ));
         if rdd.get_secure() {
             wrapper_set_sampler(rdd.get_op_id(), with_replacement, fraction);
         }
@@ -2818,13 +2634,13 @@ pub trait RddE: Rdd {
                 initial_count,
                 with_replacement,
             );
-            
+
             let mut sample_rdd = self.sample(with_replacement, fraction);
             sample_rdd.cache();
             let mut samples_enc = sample_rdd.secure_collect()?;
             let mut len = sample_rdd.secure_count().unwrap();
             let mut num_iters = 0;
-            while len < num  && num_iters < REPETITION_GUARD {
+            while len < num && num_iters < REPETITION_GUARD {
                 log::warn!(
                     "Needed to re-sample due to insufficient sample size. Repeat #{}",
                     num_iters,
@@ -2840,7 +2656,8 @@ pub trait RddE: Rdd {
                 panic!("Repeated sampling {} times; aborting", REPETITION_GUARD)
             }
 
-            *samples_enc = wrapper_randomize_in_place(sample_rdd.get_op_id(), &samples_enc, seed, num);
+            *samples_enc =
+                wrapper_randomize_in_place(sample_rdd.get_op_id(), &samples_enc, seed, num);
             Ok(samples_enc)
         }
     }
@@ -2851,7 +2668,10 @@ pub trait RddE: Rdd {
         F: SerFunc(Self::Item),
         Self: Sized,
     {
-        let func = Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| iter.for_each(&func));
+        let func = Fn!(move |(iter, _): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| iter.for_each(&func));
         self.get_context().run_job(self.get_rdde(), None, func)
     }
 
@@ -2861,7 +2681,10 @@ pub trait RddE: Rdd {
         F: SerFunc(Box<dyn Iterator<Item = Self::Item>>),
         Self: Sized + 'static,
     {
-        let func = Fn!(move |(iter, _): (Box<dyn Iterator<Item = Self::Item>>, Box<dyn Iterator<Item = Self::ItemE>>)| (&func)(iter));
+        let func = Fn!(move |(iter, _): (
+            Box<dyn Iterator<Item = Self::Item>>,
+            Box<dyn Iterator<Item = Self::ItemE>>
+        )| (&func)(iter));
         self.get_context().run_job(self.get_rdde(), None, func)
     }
 
@@ -2902,7 +2725,10 @@ pub trait RddE: Rdd {
     }
 
     #[track_caller]
-    fn intersection<T>(&self, other: Arc<T>) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
+    fn intersection<T>(
+        &self,
+        other: Arc<T>,
+    ) -> SerArc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>>
     where
         Self: Clone,
         Self::Item: Data + Eq + Hash,
@@ -2925,7 +2751,7 @@ pub trait RddE: Rdd {
     {
         self.subtract_with_num_partition(other, self.number_of_splits())
     }
-  
+
     //Both should have consistent security guarantee (encrypted columns)
     #[track_caller]
     fn subtract_with_num_partition<T>(
@@ -2941,61 +2767,76 @@ pub trait RddE: Rdd {
     {
         let fe_c = self.get_fe();
         let fe_wrapper_mp0 = Fn!(move |v: Vec<(Self::Item, Option<Self::Item>)>| {
-            let (vx, vy): (Vec<Self::Item>, Vec<Option<Self::Item>>)= v.into_iter().unzip();
+            let (vx, vy): (Vec<Self::Item>, Vec<Option<Self::Item>>) = v.into_iter().unzip();
             let ct_x = (fe_c)(vx);
             (ct_x, vy)
         });
         let fd_c = self.get_fd();
         let fd_wrapper_mp0 = Fn!(move |v: (Self::ItemE, Vec<Option<Self::Item>>)| {
             let (vx, vy) = v;
-            let pt_x = (fd_c)(vx); 
+            let pt_x = (fd_c)(vx);
             pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
         });
 
         let fe_c = self.get_fe();
-        let fe_wrapper_jn = Fn!(move |v: Vec<(Self::Item, (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>))>| {
-            let (vx, vy): (Vec<Self::Item>, Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>) = v.into_iter().unzip();
-            let (vy, vz): (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>) = vy.into_iter().unzip();
+        let fe_wrapper_jn = Fn!(move |v: Vec<(
+            Self::Item,
+            (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)
+        )>| {
+            let (vx, vy): (
+                Vec<Self::Item>,
+                Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>,
+            ) = v.into_iter().unzip();
+            let (vy, vz): (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>) =
+                vy.into_iter().unzip();
             let ct_x = (fe_c)(vx);
             (ct_x, (vy, vz))
         });
         let fd_c = self.get_fd();
-        let fd_wrapper_jn = Fn!(move |v: (Self::ItemE, (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>))| {
+        let fd_wrapper_jn = Fn!(move |v: (
+            Self::ItemE,
+            (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>)
+        )| {
             let (vx, (vy, vz)) = v;
-            let pt_x = (fd_c)(vx); 
+            let pt_x = (fd_c)(vx);
             pt_x.into_iter()
-                .zip(vy.into_iter()
-                    .zip(vz.into_iter())
-                ).collect::<Vec<_>>()
-        }); 
+                .zip(vy.into_iter().zip(vz.into_iter()))
+                .collect::<Vec<_>>()
+        });
 
         //TODO may need to be revised
         let fe_wrapper_mp1 = Fn!(move |v: Vec<Option<Self::Item>>| {
-            encrypt::<>(bincode::serialize(&v).unwrap().as_ref())
+            encrypt(bincode::serialize(&v).unwrap().as_ref())
         });
         let fd_wrapper_mp1 = Fn!(move |v: Vec<u8>| {
-            bincode::deserialize::<Vec<Option<Self::Item>>>(decrypt::<>(v.as_ref()).as_ref()).unwrap()
+            bincode::deserialize::<Vec<Option<Self::Item>>>(decrypt(v.as_ref()).as_ref()).unwrap()
         });
 
         let other = other
-            .map(Box::new(Fn!(
-                |x: Self::Item| -> (Self::Item, Option<Self::Item>) { (x, None) }
-            )), fe_wrapper_mp0.clone(), fd_wrapper_mp0.clone())
+            .map(
+                Box::new(Fn!(|x: Self::Item| -> (Self::Item, Option<Self::Item>) {
+                    (x, None)
+                })),
+                fe_wrapper_mp0.clone(),
+                fd_wrapper_mp0.clone(),
+            )
             .clone();
         self.get_context().add_num(1);
-        let mapped = self
-            .map(Box::new(Fn!(
-                |x| -> (Self::Item, Option<Self::Item>) { (x, None) }
-            )), fe_wrapper_mp0, fd_wrapper_mp0);
+        let mapped = self.map(
+            Box::new(Fn!(|x| -> (Self::Item, Option<Self::Item>) { (x, None) })),
+            fe_wrapper_mp0,
+            fd_wrapper_mp0,
+        );
         self.get_context().add_num(1);
         let cogrouped = mapped.cogroup(
-                other,
-                fe_wrapper_jn,
-                fd_wrapper_jn,
-                Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
-            );
+            other,
+            fe_wrapper_jn,
+            fd_wrapper_jn,
+            Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
+        );
         self.get_context().add_num(1);
-        let mapped = cogrouped.map(Box::new(Fn!(|(x, (v1, v2)): (
+        let mapped = cogrouped.map(
+            Box::new(Fn!(|(x, (v1, v2)): (
                 Self::Item,
                 (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>)
             )|
@@ -3005,9 +2846,13 @@ pub trait RddE: Rdd {
                 } else {
                     None
                 }
-            })), fe_wrapper_mp1, fd_wrapper_mp1);
+            })),
+            fe_wrapper_mp1,
+            fd_wrapper_mp1,
+        );
         self.get_context().add_num(1);
-        let rdd = mapped.map_partitions(Box::new(Fn!(|iter: Box<
+        let rdd = mapped.map_partitions(
+            Box::new(Fn!(|iter: Box<
                 dyn Iterator<Item = Option<Self::Item>>,
             >|
              -> Box<
@@ -3015,7 +2860,10 @@ pub trait RddE: Rdd {
             > {
                 Box::new(iter.filter(|x| x.is_some()).map(|x| x.unwrap()))
                     as Box<dyn Iterator<Item = Self::Item>>
-            })), self.get_fe(), self.get_fd());
+            })),
+            self.get_fe(),
+            self.get_fd(),
+        );
         self.get_context().add_num(1);
         let subtraction = self.intersection(Arc::new(rdd));
         (&*subtraction).register_op_name("subtraction");
@@ -3043,54 +2891,69 @@ pub trait RddE: Rdd {
         let fd_c = self.get_fd();
         let fd_wrapper_mp0 = Fn!(move |v: (Self::ItemE, Vec<Option<Self::Item>>)| {
             let (vx, vy) = v;
-            let pt_x = (fd_c)(vx); 
+            let pt_x = (fd_c)(vx);
             pt_x.into_iter().zip(vy.into_iter()).collect::<Vec<_>>()
         });
 
         let fe_c = self.get_fe();
-        let fe_wrapper_jn = Fn!(move |v: Vec<(Self::Item, (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>))>| {
-            let (vx, vy): (Vec<Self::Item>, Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>) = v.into_iter().unzip();
-            let (vy, vz): (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>) = vy.into_iter().unzip();
+        let fe_wrapper_jn = Fn!(move |v: Vec<(
+            Self::Item,
+            (Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)
+        )>| {
+            let (vx, vy): (
+                Vec<Self::Item>,
+                Vec<(Vec<Option<Self::Item>>, Vec<Option<Self::Item>>)>,
+            ) = v.into_iter().unzip();
+            let (vy, vz): (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>) =
+                vy.into_iter().unzip();
             let ct_x = (fe_c)(vx);
             (ct_x, (vy, vz))
         });
         let fd_c = self.get_fd();
-        let fd_wrapper_jn = Fn!(move |v: (Self::ItemE, (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>))| {
+        let fd_wrapper_jn = Fn!(move |v: (
+            Self::ItemE,
+            (Vec<Vec<Option<Self::Item>>>, Vec<Vec<Option<Self::Item>>>)
+        )| {
             let (vx, (vy, vz)) = v;
-            let pt_x = (fd_c)(vx); 
+            let pt_x = (fd_c)(vx);
             pt_x.into_iter()
-                .zip(vy.into_iter()
-                    .zip(vz.into_iter())
-                ).collect::<Vec<_>>()
-        }); 
+                .zip(vy.into_iter().zip(vz.into_iter()))
+                .collect::<Vec<_>>()
+        });
 
         //TODO may need to be revised
         let fe_wrapper_mp1 = Fn!(move |v: Vec<Option<Self::Item>>| {
-            encrypt::<>(bincode::serialize(&v).unwrap().as_ref())
+            encrypt(bincode::serialize(&v).unwrap().as_ref())
         });
         let fd_wrapper_mp1 = Fn!(move |v: Vec<u8>| {
-            bincode::deserialize::<Vec<Option<Self::Item>>>(decrypt::<>(v.as_ref()).as_ref()).unwrap()
+            bincode::deserialize::<Vec<Option<Self::Item>>>(decrypt(v.as_ref()).as_ref()).unwrap()
         });
 
         let other = other
-            .map(Box::new(Fn!(
-                |x: Self::Item| -> (Self::Item, Option<Self::Item>) { (x, None) }
-            )), fe_wrapper_mp0.clone(), fd_wrapper_mp0.clone())
+            .map(
+                Box::new(Fn!(|x: Self::Item| -> (Self::Item, Option<Self::Item>) {
+                    (x, None)
+                })),
+                fe_wrapper_mp0.clone(),
+                fd_wrapper_mp0.clone(),
+            )
             .clone();
         self.get_context().add_num(1);
-        let mapped = self
-            .map(Box::new(Fn!(
-                |x| -> (Self::Item, Option<Self::Item>) { (x, None) }
-            )), fe_wrapper_mp0, fd_wrapper_mp0);
+        let mapped = self.map(
+            Box::new(Fn!(|x| -> (Self::Item, Option<Self::Item>) { (x, None) })),
+            fe_wrapper_mp0,
+            fd_wrapper_mp0,
+        );
         self.get_context().add_num(1);
         let cogrouped = mapped.cogroup(
-                other,
-                fe_wrapper_jn,
-                fd_wrapper_jn,
-                Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
-            );
+            other,
+            fe_wrapper_jn,
+            fd_wrapper_jn,
+            Box::new(HashPartitioner::<Self::Item>::new(num_splits)) as Box<dyn Partitioner>,
+        );
         self.get_context().add_num(1);
-        let mapped = cogrouped.map(Box::new(Fn!(|(x, (v1, v2)): (
+        let mapped = cogrouped.map(
+            Box::new(Fn!(|(x, (v1, v2)): (
                 Self::Item,
                 (Vec::<Option<Self::Item>>, Vec::<Option<Self::Item>>)
             )|
@@ -3100,9 +2963,13 @@ pub trait RddE: Rdd {
                 } else {
                     None
                 }
-            })), fe_wrapper_mp1, fd_wrapper_mp1);
+            })),
+            fe_wrapper_mp1,
+            fd_wrapper_mp1,
+        );
         self.get_context().add_num(1);
-        let rdd = mapped.map_partitions(Box::new(Fn!(|iter: Box<
+        let rdd = mapped.map_partitions(
+            Box::new(Fn!(|iter: Box<
                 dyn Iterator<Item = Option<Self::Item>>,
             >|
              -> Box<
@@ -3110,7 +2977,10 @@ pub trait RddE: Rdd {
             > {
                 Box::new(iter.filter(|x| x.is_some()).map(|x| x.unwrap()))
                     as Box<dyn Iterator<Item = Self::Item>>
-            })), self.get_fe(), self.get_fd());
+            })),
+            self.get_fe(),
+            self.get_fd(),
+        );
         (&*rdd).register_op_name("intersection");
         rdd
     }
@@ -3125,7 +2995,10 @@ pub trait RddE: Rdd {
     /// aggregation (such as a sum or average) over each key, using `aggregate_by_key`
     /// or `reduce_by_key` will provide much better performance.
     #[track_caller]
-    fn group_by<K, F>(&self, func: F) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Vec<u8>, Vec<Self::ItemE>)>>
+    fn group_by<K, F>(
+        &self,
+        func: F,
+    ) -> SerArc<dyn RddE<Item = (K, Vec<Self::Item>), ItemE = (Vec<u8>, Vec<Self::ItemE>)>>
     where
         Self: Sized,
         K: Data + Hash + Eq,
@@ -3191,10 +3064,14 @@ pub trait RddE: Rdd {
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
 
-        let mapped = self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
-            let key = (func)(&val);
-            (key, val)
-        })), fe_wrapper_mp, fd_wrapper_mp);
+        let mapped = self.map(
+            Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
+                let key = (func)(&val);
+                (key, val)
+            })),
+            fe_wrapper_mp,
+            fd_wrapper_mp,
+        );
         self.get_context().add_num(1);
         mapped.group_by_key(fe_wrapper_gb, fd_wrapper_gb, num_splits)
     }
@@ -3256,10 +3133,14 @@ pub trait RddE: Rdd {
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
 
-        let mapped = self.map(Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
-            let key = (func)(&val);
-            (key, val)
-        })), fe_wrapper_mp, fd_wrapper_mp);
+        let mapped = self.map(
+            Box::new(Fn!(move |val: Self::Item| -> (K, Self::Item) {
+                let key = (func)(&val);
+                (key, val)
+            })),
+            fe_wrapper_mp,
+            fd_wrapper_mp,
+        );
         self.get_context().add_num(1);
         mapped.group_by_key_using_partitioner(fe_wrapper_gb, fd_wrapper_gb, partitioner)
     }
@@ -3309,7 +3190,10 @@ pub trait RddE: Rdd {
 
     /// Creates tuples of the elements in this RDD by applying `f`.
     #[track_caller]
-    fn key_by<T, F>(&self, func: F) -> SerArc<dyn RddE<Item = (T, Self::Item), ItemE = (Vec<u8>, Self::ItemE)>>
+    fn key_by<T, F>(
+        &self,
+        func: F,
+    ) -> SerArc<dyn RddE<Item = (T, Self::Item), ItemE = (Vec<u8>, Self::ItemE)>>
     where
         Self: Sized,
         T: Data,
@@ -3332,11 +3216,15 @@ pub trait RddE: Rdd {
             assert_eq!(pt_x.len(), pt_y.len());
             pt_x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
-       
-        self.map(Fn!(move |k: Self::Item| -> (T, Self::Item) {
-            let t = (func)(&k);
-            (t, k)
-        }), fe_wrapper_mp, fd_wrapper_mp)
+
+        self.map(
+            Fn!(move |k: Self::Item| -> (T, Self::Item) {
+                let t = (func)(&k);
+                (t, k)
+            }),
+            fe_wrapper_mp,
+            fd_wrapper_mp,
+        )
     }
 
     /// Check if the RDD contains no elements at all. Note that an RDD may be empty even when it
@@ -3391,10 +3279,7 @@ pub trait RddE: Rdd {
 
         let mapped = self.map(Fn!(|x| Reverse(x)), fe_wrapper_mp, fd_wrapper_mp);
         self.get_context().add_num(1);
-        Ok(mapped.take_ordered(num)?
-            .into_iter()
-            .map(|x| x.0)
-            .collect())
+        Ok(mapped.take_ordered(num)?.into_iter().map(|x| x.0).collect())
     }
 
     /// Returns the first k (smallest) elements from this RDD as defined by the specified
@@ -3418,12 +3303,15 @@ pub trait RddE: Rdd {
                     Box::new(std::iter::once(queue))
             });
 
-            let fe_wrapper_mpp = Fn!( move |pt: Vec<BoundedPriorityQueue<Self::Item>>| {
-                encrypt::<>(bincode::serialize(&pt).unwrap().as_ref())
+            let fe_wrapper_mpp = Fn!(move |pt: Vec<BoundedPriorityQueue<Self::Item>>| {
+                encrypt(bincode::serialize(&pt).unwrap().as_ref())
             });
 
-            let fd_wrapper_mpp = Fn!( move |ct: Vec<u8>| {
-                bincode::deserialize::<Vec<BoundedPriorityQueue<Self::Item>>>(decrypt::<>(ct.as_ref()).as_ref()).unwrap()
+            let fd_wrapper_mpp = Fn!(move |ct: Vec<u8>| {
+                bincode::deserialize::<Vec<BoundedPriorityQueue<Self::Item>>>(
+                    decrypt(ct.as_ref()).as_ref(),
+                )
+                .unwrap()
             });
 
             let queue = self

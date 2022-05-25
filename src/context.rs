@@ -17,43 +17,43 @@ use crate::error::{Error, Result};
 use crate::executor::{Executor, Signal};
 use crate::io::ReaderConfiguration;
 use crate::partial::{ApproximateEvaluator, PartialResult};
-use crate::rdd::{ParallelCollection, Rdd, RddE, RddBase, OpId, UnionRdd, ser_encrypt, ser_decrypt};
+use crate::rdd::{
+    ser_decrypt, ser_encrypt, OpId, ParallelCollection, Rdd, RddBase, RddE, UnionRdd,
+};
 use crate::scheduler::{DistributedScheduler, LocalScheduler, NativeScheduler, TaskContext};
 use crate::serializable_traits::{Data, Func, SerFunc};
 use crate::serialized_data_capnp::serialized_data;
 use crate::{env, hosts, utils, Fn, SerArc};
 use log::error;
 use once_cell::sync::OnceCell;
+use sgx_types::*;
 use simplelog::*;
 use uuid::Uuid;
 use Schedulers::*;
-use sgx_types::*;
 
 extern "C" {
-    fn clear_cache(
-        eid: sgx_enclave_id_t, 
-    ) -> sgx_status_t;
-    fn pre_touching(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        zero: u8,
-    ) -> sgx_status_t;
+    fn clear_cache(eid: sgx_enclave_id_t) -> sgx_status_t;
+    fn pre_touching(eid: sgx_enclave_id_t, retval: *mut usize, zero: u8) -> sgx_status_t;
 }
 
 fn wrapper_clear_cache() {
-    let eid = env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
-    let sgx_status = unsafe {
-        clear_cache(eid)
-    };
+    let eid = env::Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
+    let sgx_status = unsafe { clear_cache(eid) };
     match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {},
+        sgx_status_t::SGX_SUCCESS => {}
         _ => {
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        },
+        }
     };
 }
 
-pub const PRI_KEY_LOC: &str =  "/home/lixiang/.ssh/124.9";
+pub const PRI_KEY_LOC: &str = "/home/lixiang/.ssh/124.9";
 // There is a problem with this approach since T needs to satisfy PartialEq, Eq for Range
 // No such restrictions are needed for Vec
 pub enum Sequence<T> {
@@ -83,16 +83,25 @@ impl Schedulers {
         allow_local: bool,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
     {
         let op_name = final_rdd.get_op_name();
         log::info!("starting `{}` job", op_name);
         let start = Instant::now();
         match self {
             Distributed(distributed) => {
-                let res = distributed
-                    .clone()
-                    .run_job(func, final_rdd, action_id, partitions, allow_local);
+                let res = distributed.clone().run_job(
+                    func,
+                    final_rdd,
+                    action_id,
+                    partitions,
+                    allow_local,
+                );
                 log::info!(
                     "`{}` job finished, took {}s",
                     op_name,
@@ -101,9 +110,10 @@ impl Schedulers {
                 res
             }
             Local(local) => {
-                let res = local
-                    .clone()
-                    .run_job(func, final_rdd, action_id, partitions, allow_local);
+                let res =
+                    local
+                        .clone()
+                        .run_job(func, final_rdd, action_id, partitions, allow_local);
                 log::info!(
                     "`{}` job finished, took {}s",
                     op_name,
@@ -123,7 +133,12 @@ impl Schedulers {
         timeout: Duration,
     ) -> Result<PartialResult<R>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
         R: Clone + Debug + Send + Sync + 'static,
     {
@@ -206,9 +221,7 @@ impl Context {
             .geteid();
         let child = thread::spawn(move || {
             let mut retval = 1;
-            let _sgx_status_t = unsafe {
-                pre_touching(eid, &mut retval, 0)
-            };
+            let _sgx_status_t = unsafe { pre_touching(eid, &mut retval, 0) };
         });
     }
     /// Sets a handler to receives any external signal to stop the process
@@ -248,7 +261,7 @@ impl Context {
             distributed_driver: false,
             work_dir: job_work_dir,
             last_loc_file: RwLock::new("null"),
-            last_loc_line: AtomicU32::new(0), 
+            last_loc_line: AtomicU32::new(0),
             num: AtomicUsize::new(0),
         }))
     }
@@ -284,12 +297,12 @@ impl Context {
             .into_string()
             .map_err(Error::OsStringToString)?;
 
-        let mut enclave_path  = PathBuf::from("");
+        let mut enclave_path = PathBuf::from("");
         if let Some(dir) = binary_path.parent() {
             enclave_path = dir.join("enclave.signed.so");
         }
         let enclave_path = enclave_path;
-        
+
         let enclave_path_str = enclave_path
             .to_str()
             .ok_or_else(|| Error::PathToString(enclave_path.clone()))?;
@@ -299,7 +312,7 @@ impl Context {
             .to_os_string()
             .into_string()
             .map_err(Error::OsStringToString)?;
-                    
+
         fs::create_dir_all(&leader_work_dir).unwrap();
         let conf_path = leader_work_dir.join("config.toml");
         let conf_path = conf_path.to_str().unwrap();
@@ -387,11 +400,11 @@ impl Context {
             distributed_driver: true,
             work_dir: leader_work_dir,
             last_loc_file: RwLock::new("null"),
-            last_loc_line: AtomicU32::new(0), 
+            last_loc_line: AtomicU32::new(0),
             num: AtomicUsize::new(0),
         }))
     }
-    
+
     fn init_distributed_worker() -> Result<!> {
         Context::launch_pre_touching();
         let mut work_dir = PathBuf::from("");
@@ -405,7 +418,7 @@ impl Context {
             }
             Err(err) => Context::worker_clean_up_directives(Err(err), work_dir)?,
         }
-        
+
         if (*env::Env::get().enclave).lock().unwrap().is_some() {
             log::debug!("worker inits enclave successfully");
         }
@@ -426,10 +439,11 @@ impl Context {
 
     fn worker_clean_up_directives(run_result: Result<Signal>, work_dir: PathBuf) -> Result<!> {
         wrapper_clear_cache();
-        env::SPEC_SHUFFLE_CACHE.free_data_enc();
         env::BOUNDED_MEM_CACHE.free_data_enc();
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
-        if let Some(enclave) = std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None) {
+        if let Some(enclave) =
+            std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None)
+        {
             enclave.destroy();
         }
         utils::clean_up_work_dir(&work_dir);
@@ -450,10 +464,11 @@ impl Context {
         // Give some time for the executors to shut down and clean up
         std::thread::sleep(std::time::Duration::from_millis(1_500));
         wrapper_clear_cache();
-        env::SPEC_SHUFFLE_CACHE.free_data_enc();
         env::BOUNDED_MEM_CACHE.free_data_enc();
         env::Env::get().shuffle_manager.clean_up_shuffle_data();
-        if let Some(enclave) = std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None) {
+        if let Some(enclave) =
+            std::mem::replace(&mut *(*env::Env::get().enclave).lock().unwrap(), None)
+        {
             enclave.destroy();
         }
         utils::clean_up_work_dir(work_dir);
@@ -518,8 +533,10 @@ impl Context {
         use Ordering::SeqCst;
         let file = loc.file();
         let line = loc.line();
-        
-        let num = if *self.last_loc_file.read().unwrap() != file || self.last_loc_line.load(SeqCst) != line {
+
+        let num = if *self.last_loc_file.read().unwrap() != file
+            || self.last_loc_line.load(SeqCst) != line
+        {
             *self.last_loc_file.write().unwrap() = file;
             self.last_loc_line.store(line, SeqCst);
             self.num.store(0, SeqCst);
@@ -527,13 +544,8 @@ impl Context {
         } else {
             self.num.load(SeqCst)
         };
-        
-        let op_id = 
-        OpId::new(
-            file,
-            line,
-            num,
-        );
+
+        let op_id = OpId::new(file, line, num);
         //println!("rdd, file = {:?}, line = {:?}, num = {:?}, op_id = {:?}", file, line, num, op_id);
         op_id
     }
@@ -572,12 +584,8 @@ impl Context {
     ) -> SerArc<dyn RddE<Item = u64, ItemE = Vec<u8>>> {
         // TODO: input validity check
         let seq = (start..=end).step_by(step);
-        let fe = Fn!(|v: Vec<u64>| {
-            ser_encrypt::<u64>(v)
-        });
-        let fd = Fn!(|v: Vec<u8>| {
-            ser_decrypt::<u64>(v)
-        });
+        let fe = Fn!(|v: Vec<u64>| { ser_encrypt::<u64>(v) });
+        let fd = Fn!(|v: Vec<u8>| { ser_decrypt::<u64>(v) });
 
         //no need to ensure privacy
         let rdd = self.parallelize(seq, Vec::new(), fe, fd, num_slices);
@@ -600,7 +608,14 @@ impl Context {
         FE: SerFunc(Vec<T>) -> TE,
         FD: SerFunc(TE) -> Vec<T>,
     {
-        SerArc::new(ParallelCollection::new(self.clone(), seq, seqe, fe, fd, num_slices))
+        SerArc::new(ParallelCollection::new(
+            self.clone(),
+            seq,
+            seqe,
+            fe,
+            fd,
+            num_slices,
+        ))
     }
 
     /// Load from a distributed source and turns it into a parallel collection.
@@ -608,8 +623,8 @@ impl Context {
     pub fn read_source<C, FE, FD, I: Data, O: Data + Default, OE: Data>(
         self: &Arc<Self>,
         config: C,
-        func: Option<Box<dyn Func(I) -> O >>,
-        sec_func: Option<Box<dyn Func(I) -> Vec<OE> >>,
+        func: Option<Box<dyn Func(I) -> O>>,
+        sec_func: Option<Box<dyn Func(I) -> Vec<OE>>>,
         fe: FE,
         fd: FD,
     ) -> SerArc<dyn RddE<Item = O, ItemE = OE>>
@@ -620,9 +635,14 @@ impl Context {
     {
         match func {
             Some(func) => config.make_reader(self.clone(), Some(func), sec_func, fe, fd),
-            None => config.make_reader(self.clone(), Some(Fn!(|_v: I| Default::default() )), sec_func, fe, fd),
+            None => config.make_reader(
+                self.clone(),
+                Some(Fn!(|_v: I| Default::default())),
+                sec_func,
+                fe,
+                fd,
+            ),
         }
-        
     }
 
     pub fn run_job<T: Data, TE: Data, U: Data, F>(
@@ -657,8 +677,13 @@ impl Context {
         P: IntoIterator<Item = usize>,
     {
         let cl = Fn!(move |(_task_context, iter)| (func)(iter));
-        self.scheduler
-            .run_job(Arc::new(cl), rdd, action_id, partitions.into_iter().collect(), false)
+        self.scheduler.run_job(
+            Arc::new(cl),
+            rdd,
+            action_id,
+            partitions.into_iter().collect(),
+            false,
+        )
     }
 
     pub fn run_job_with_context<T: Data, TE: Data, U: Data, F>(
@@ -668,7 +693,12 @@ impl Context {
         func: F,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
     {
         log::debug!("inside run job in context");
         let func = Arc::new(func);
@@ -693,7 +723,12 @@ impl Context {
         timeout: Duration,
     ) -> Result<PartialResult<R>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
         R: Clone + Debug + Send + Sync + 'static,
     {
@@ -713,7 +748,9 @@ impl Context {
     }
 
     #[track_caller]
-    pub fn union<T: Data, TE: Data>(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> impl RddE<Item = T, ItemE = TE> {
+    pub fn union<T: Data, TE: Data>(
+        rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>],
+    ) -> impl RddE<Item = T, ItemE = TE> {
         UnionRdd::new(rdds)
     }
 }

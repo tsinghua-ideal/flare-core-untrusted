@@ -1,5 +1,8 @@
 use std::net::Ipv4Addr;
-use std::sync::{Arc, mpsc::{sync_channel, TryRecvError ,SyncSender}};
+use std::sync::{
+    mpsc::{sync_channel, SyncSender, TryRecvError},
+    Arc,
+};
 use std::thread::JoinHandle;
 
 use itertools::{Itertools, MinMaxResult};
@@ -7,7 +10,7 @@ use serde_derive::{Deserialize, Serialize};
 
 use crate::context::Context;
 use crate::dependency::{Dependency, NarrowDependencyTrait, OneToOneDependency, RangeDependency};
-use crate::env::{BOUNDED_MEM_CACHE, RDDB_MAP, Env};
+use crate::env::{Env, BOUNDED_MEM_CACHE, RDDB_MAP};
 use crate::error::{Error, Result};
 use crate::partitioner::Partitioner;
 use crate::rdd::union_rdd::UnionVariants::{NonUniquePartitioner, PartitionerAware};
@@ -28,7 +31,7 @@ struct UnionSplit<T: 'static, TE: 'static> {
     parent_rdd_split_index: usize,
 }
 
-impl<T, TE> UnionSplit<T, TE> 
+impl<T, TE> UnionSplit<T, TE>
 where
     T: Data,
     TE: Data,
@@ -38,8 +41,8 @@ where
     }
 }
 
-impl<T, TE> Split for UnionSplit<T, TE> 
-where 
+impl<T, TE> Split for UnionSplit<T, TE>
+where
     T: Data,
     TE: Data,
 {
@@ -81,8 +84,19 @@ where
         UnionRdd(UnionVariants::new(rdds))
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+    fn secure_compute_prev(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
+        let eid = Env::get()
+            .enclave
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .geteid();
         match &self.0 {
             NonUniquePartitioner { rdds, .. } => {
                 let tx = tx.clone();
@@ -91,29 +105,24 @@ where
                     .or(Err(Error::DowncastFailure("UnionSplit")))?;
                 let split = part.parent_partition();
                 let parent = &rdds[part.parent_rdd_index];
-                let handles = parent.secure_compute(split, acc_arg, tx)?; 
+                let handles = parent.secure_compute(split, acc_arg, tx)?;
                 Ok(handles)
-            },
+            }
             PartitionerAware { rdds, .. } => {
                 let split = split
                     .downcast::<PartitionerAwareUnionSplit>()
                     .or(Err(Error::DowncastFailure("PartitionerAwareUnionSplit")))?;
-                let iter = rdds
-                    .iter()
-                    .zip(split.parents(&rdds))
-                    .collect::<Vec<_>>();
+                let iter = rdds.iter().zip(split.parents(&rdds)).collect::<Vec<_>>();
                 let mut handles = Vec::new();
                 for (rdd, p) in iter.into_iter() {
                     let rdd = rdd.clone();
                     let mut acc_arg = acc_arg.clone();
                     //refresh block_len, because parent rdds may have different lineage
                     let (tx_un, rx_un) = sync_channel(0);
-                    acc_arg.block_len.store(1, atomic::Ordering::SeqCst);
-                    acc_arg.cur_usage.store(0, atomic::Ordering::SeqCst);
-                    acc_arg.fresh_slope.store(true, atomic::Ordering::SeqCst);
                     let mut handle = rdd.secure_compute(p.clone(), &mut acc_arg, tx_un).unwrap();
-                    for (received, (time_comp, max_mem_usage, acc_captured_size)) in rx_un {
-                        tx.send((received, (time_comp, max_mem_usage, acc_captured_size))).unwrap();
+                    for received in rx_un {
+                        tx.send(received)
+                            .unwrap();
                     }
                     handles.append(&mut handle)
                 }
@@ -168,7 +177,7 @@ impl<T: Data, TE: Data> UnionVariants<T, TE> {
     #[track_caller]
     fn new(rdds: &[Arc<dyn RddE<Item = T, ItemE = TE>>]) -> Self {
         let context = rdds[0].get_context();
-        let secure = rdds[0].get_secure();  //temp
+        let secure = rdds[0].get_secure(); //temp
         let mut vals = RddVals::new(context, secure);
 
         let mut pos = 0;
@@ -182,7 +191,10 @@ impl<T: Data, TE: Data> UnionVariants<T, TE> {
                 vals,
             }
         } else {
-            let part = rdds[0].partitioner().ok_or(Error::LackingPartitioner).unwrap();
+            let part = rdds[0]
+                .partitioner()
+                .ok_or(Error::LackingPartitioner)
+                .unwrap();
             log::debug!("inside partition aware constructor");
             let vals = Arc::new(vals);
             PartitionerAware {
@@ -227,20 +239,19 @@ impl<T: Data, TE: Data> UnionVariants<T, TE> {
             .into_iter()
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<T>)->TE> {
+    fn get_fe(&self) -> Box<dyn Func(Vec<T>) -> TE> {
         match self {
             NonUniquePartitioner { rdds, .. } => rdds[0].get_fe(),
             PartitionerAware { rdds, .. } => rdds[0].get_fe(),
         }
     }
 
-    fn get_fd(&self) -> Box<dyn Func(TE)->Vec<T>> {
+    fn get_fd(&self) -> Box<dyn Func(TE) -> Vec<T>> {
         match self {
             NonUniquePartitioner { rdds, .. } => rdds[0].get_fd(),
             PartitionerAware { rdds, .. } => rdds[0].get_fd(),
         }
     }
-
 }
 
 impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
@@ -249,10 +260,7 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
             NonUniquePartitioner { vals, .. } => vals.cache(),
             PartitionerAware { vals, .. } => vals.cache(),
         }
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
+        RDDB_MAP.insert(self.get_rdd_id(), self.get_rdd_base());
     }
 
     fn should_cache(&self) -> bool {
@@ -263,9 +271,7 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
     }
 
     fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<TE>)
-        };
+        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<TE>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -301,10 +307,14 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
     fn get_dependencies(&self) -> Vec<Dependency> {
         let mut pos = 0;
         let rdds = match &self.0 {
-            NonUniquePartitioner { rdds, .. } => 
-                rdds.iter().map(|rdd| rdd.clone().into()).collect::<Vec<_>>(),
-            PartitionerAware { rdds, .. } => 
-                rdds.iter().map(|rdd| rdd.clone().into()).collect::<Vec<_>>(),
+            NonUniquePartitioner { rdds, .. } => rdds
+                .iter()
+                .map(|rdd| rdd.clone().into())
+                .collect::<Vec<_>>(),
+            PartitionerAware { rdds, .. } => rdds
+                .iter()
+                .map(|rdd| rdd.clone().into())
+                .collect::<Vec<_>>(),
         };
 
         if !UnionVariants::has_unique_partitioner(&rdds) {
@@ -322,7 +332,10 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
                 .collect();
             deps
         } else {
-            let part = rdds[0].partitioner().ok_or(Error::LackingPartitioner).unwrap();
+            let part = rdds[0]
+                .partitioner()
+                .ok_or(Error::LackingPartitioner)
+                .unwrap();
             log::debug!("inside partition aware constructor");
             let deps = rdds
                 .iter()
@@ -426,27 +439,18 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
         }
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let dep_info = DepInfo::padding_new(0);
-        let op_id = self.get_op_id();
-        let res = Box::new(data_ptr.into_iter()
-            .flat_map(move |data_ptr| get_encrypted_data::<TE>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
-            as Box<dyn Iterator<Item = _>>;
-        self.secure_shuffle_write(res, acc_arg, tx)
-    }
-
-    fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         log::debug!("inside iterator_any union_rdd",);
-        Ok(Box::new(
-            self.iterator(split)?.collect::<Vec<_>>()
-        ))
+        Ok(Box::new(self.iterator(split)?.collect::<Vec<_>>()))
     }
 
     fn partitioner(&self) -> Option<Box<dyn Partitioner>> {
@@ -491,33 +495,31 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
         acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
-        
+
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(
-                acc_arg, 
-                cur_rdd_id,
-                cur_part_id,
-                tx.clone(),
-            );
+            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
             }
-            Ok(handles)     
+            Ok(handles)
         } else {
             self.secure_compute_prev(split, acc_arg, tx)
         }
-
     }
-
 }
 
 impl<T, TE> RddE for UnionRdd<T, TE>
@@ -526,16 +528,16 @@ where
     TE: Data,
 {
     type ItemE = TE;
-    
+
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(UnionRdd(self.0.clone())) as Arc<dyn RddE<Item = T, ItemE = TE>>
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
         self.0.get_fe()
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
         self.0.get_fd()
     }
 }

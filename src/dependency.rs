@@ -1,22 +1,24 @@
 use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
-use crate::rdd::{default_hash, dynamic_subpart_meta, get_encrypted_data, free_res_enc, AccArg, OpId, RddBase, STAGE_LOCK};
+use crate::rdd::{
+    default_hash, free_res_enc, get_encrypted_data, AccArg, OpId, RddBase, STAGE_LOCK,
+};
 use crate::serializable_traits::Data;
-use dashmap::DashMap;
 use dashmap::mapref::one::RefMut;
+use dashmap::DashMap;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 use sgx_types::*;
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::forget;
-use std::sync::{Arc, atomic, mpsc};
+use std::sync::{atomic, mpsc, Arc};
 use std::time::{Duration, Instant};
 
 #[repr(C)]
@@ -25,13 +27,14 @@ pub struct DepInfo {
     pub is_shuffle: u8,
     pub identifier: usize,
     pub parent_rdd_id: usize,
-    pub child_rdd_id: usize, 
+    pub child_rdd_id: usize,
     parent_op_id: OpId,
     child_op_id: OpId,
 }
 
 impl DepInfo {
-    pub fn new(is_shuffle: u8,
+    pub fn new(
+        is_shuffle: u8,
         identifier: usize,
         parent_rdd_id: usize,
         child_rdd_id: usize,
@@ -42,7 +45,7 @@ impl DepInfo {
             is_shuffle,
             identifier,
             parent_rdd_id,
-            child_rdd_id, 
+            child_rdd_id,
             parent_op_id,
             child_op_id,
         }
@@ -54,7 +57,7 @@ impl DepInfo {
             is_shuffle,
             identifier: 0,
             parent_rdd_id: 0,
-            child_rdd_id: 0, 
+            child_rdd_id: 0,
             parent_op_id: Default::default(),
             child_op_id: Default::default(),
         }
@@ -174,9 +177,9 @@ impl Ord for dyn ShuffleDependencyTrait {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ShuffleDependency<K, V, C, KE, CE>
-where 
-    K: Data, 
-    V: Data, 
+where
+    K: Data,
+    V: Data,
     C: Data,
     KE: Data,
     CE: Data,
@@ -199,10 +202,10 @@ where
     _marker_ce: PhantomData<CE>,
 }
 
-impl<K, V, C, KE, CE> ShuffleDependency<K, V, C, KE, CE> 
+impl<K, V, C, KE, CE> ShuffleDependency<K, V, C, KE, CE>
 where
-    K: Data, 
-    V: Data, 
+    K: Data,
+    V: Data,
     C: Data,
     KE: Data,
     CE: Data,
@@ -237,10 +240,10 @@ where
     }
 }
 
-impl<K, V, C, KE, CE> ShuffleDependencyTrait for ShuffleDependency<K, V, C, KE, CE> 
-where 
-    K: Data + Eq + Hash, 
-    V: Data, 
+impl<K, V, C, KE, CE> ShuffleDependencyTrait for ShuffleDependency<K, V, C, KE, CE>
+where
+    K: Data + Eq + Hash,
+    V: Data,
     C: Data,
     KE: Data,
     CE: Data,
@@ -274,63 +277,56 @@ where
             self.shuffle_id,
             partition
         );
-        log::debug!("rdd id {:?}, secure: {:?}", rdd_base.get_rdd_id(), rdd_base.get_secure());
+        log::debug!(
+            "rdd id {:?}, secure: {:?}",
+            rdd_base.get_rdd_id(),
+            rdd_base.get_secure()
+        );
         if rdd_base.get_secure() {
-            let mut op_ids = vec![self.child_op_id]; 
+            let mut op_ids = vec![self.child_op_id];
             rdd_base.get_op_ids(&mut op_ids);
             let hash_ops = default_hash(&op_ids);
             let dep_info = self.get_dep_info();
-            let key = (
-                hash_ops,
-                partition,
-                dep_info.identifier
-            );
+            let key = (hash_ops, partition, dep_info.identifier);
 
             println!("in denepdency, key = {:?}, ops = {:?}", key, op_ids);
-            STAGE_LOCK.get_stage_lock((dep_info.child_rdd_id, dep_info.parent_rdd_id, dep_info.identifier));
-            
+            STAGE_LOCK.get_stage_lock((
+                dep_info.child_rdd_id,
+                dep_info.parent_rdd_id,
+                dep_info.identifier,
+            ));
+
             let now = Instant::now();
             let (tx, rx) = mpsc::sync_channel(0);
-            let mut acc_arg = AccArg::new(partition, 
-                dep_info, 
-                Some(self.partitioner.get_num_of_partitions()), 
+            let mut acc_arg = AccArg::new(
+                partition,
+                dep_info,
+                Some(self.partitioner.get_num_of_partitions()),
                 Arc::new(atomic::AtomicBool::new(false)),
-                Arc::new(atomic::AtomicUsize::new(1)),
-                Arc::new(atomic::AtomicUsize::new(0)),
-                Arc::new(atomic::AtomicBool::new(false)),
-                0,
             );
-            
-            //remove after get, otherwise it will causes the accumulation
-            let res = env::SPEC_SHUFFLE_CACHE.remove(&key);
-            let handles = match res {
-                Some((_key, item)) => {
-                    rdd_base.iterator_raw_spec(item.0, &mut acc_arg, tx).unwrap()
-                },
-                None => {
-                    let split = rdd_base.splits()[partition].clone();
-                    log::debug!("split index: {}", split.get_index());
-                    rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap()
-                },
-            };
+
+            let split = rdd_base.splits()[partition].clone();
+            log::debug!("split index: {}", split.get_index());
+            let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
 
             let num_output_splits = self.partitioner.get_num_of_partitions();
             let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
                 .map(|_| Vec::new())
                 .collect::<Vec<_>>();
-            let mut slopes = Vec::new();
-            let mut aggresive = true;
-            for (block_ptr, (time_comp, max_mem_usage, acc_captured_size)) in rx { 
-                let buckets_bls = get_encrypted_data::<Vec<Vec<(KE, CE)>>>(rdd_base.get_op_id(), dep_info, block_ptr as *mut u8);
-                dynamic_subpart_meta(time_comp, max_mem_usage, acc_captured_size as f64, &acc_arg.block_len, &mut slopes, &acc_arg.fresh_slope, STAGE_LOCK.get_parall_num(), &mut aggresive);
+            for block_ptr in rx {
+                let buckets_bls = get_encrypted_data::<Vec<Vec<(KE, CE)>>>(
+                    rdd_base.get_op_id(),
+                    dep_info,
+                    block_ptr as *mut u8,
+                );
                 acc_arg.free_enclave_lock();
 
                 for buckets_bl in buckets_bls.into_iter() {
                     for (i, bucket) in buckets_bl.into_iter().enumerate() {
-                        buckets[i].push(bucket); 
+                        buckets[i].push(bucket);
                     }
                 }
-            }                   
+            }
             for handle in handles {
                 handle.join().unwrap();
             }
@@ -342,8 +338,7 @@ where
                 env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
             }
 
-            env::Env::get().shuffle_manager.get_server_uri()  
-  
+            env::Env::get().shuffle_manager.get_server_uri()
         } else {
             let split = rdd_base.splits()[partition].clone();
             log::debug!("split index: {}", split.get_index());
@@ -354,7 +349,7 @@ where
             };
 
             let now = Instant::now();
-            
+
             let aggregator = self.aggregator.clone();
             let num_output_splits = self.partitioner.get_num_of_partitions();
             log::debug!("is cogroup rdd: {}", self.is_cogroup);
@@ -368,7 +363,14 @@ where
                 partition
             );
 
-            for (count, i) in iter.unwrap().into_any().downcast::<Vec<(K, V)>>().unwrap().into_iter().enumerate() {
+            for (count, i) in iter
+                .unwrap()
+                .into_any()
+                .downcast::<Vec<(K, V)>>()
+                .unwrap()
+                .into_iter()
+                .enumerate()
+            {
                 let (k, v) = i;
                 if count == 0 {
                     log::debug!(
@@ -414,18 +416,21 @@ where
 #[derive(Debug, Clone)]
 pub(crate) struct SpecShuffleCache {
     /// The key is: {op_ids}/{input_id(part_id)}/{identifier}
-    /// The value is : {res_ptr}/{final_op_id} 
+    /// The value is : {res_ptr}/{final_op_id}
     inner: Arc<DashMap<(u64, usize, usize), (Vec<usize>, OpId)>>,
 }
 
 impl SpecShuffleCache {
     pub fn new() -> Self {
         SpecShuffleCache {
-            inner: Arc::new(DashMap::new())
+            inner: Arc::new(DashMap::new()),
         }
     }
 
-    pub fn get_mut(&self, key: &(u64, usize, usize)) -> Option<RefMut<(u64, usize, usize), (Vec<usize>, OpId), RandomState>> {
+    pub fn get_mut(
+        &self,
+        key: &(u64, usize, usize),
+    ) -> Option<RefMut<(u64, usize, usize), (Vec<usize>, OpId), RandomState>> {
         self.inner.get_mut(key)
     }
 
@@ -433,27 +438,30 @@ impl SpecShuffleCache {
         self.inner.insert(key, value);
     }
 
-    pub fn remove(&self, key: &(u64, usize, usize)) -> Option<((u64, usize, usize), (Vec<usize>, OpId))> {
+    pub fn remove(
+        &self,
+        key: &(u64, usize, usize),
+    ) -> Option<((u64, usize, usize), (Vec<usize>, OpId))> {
         self.inner.remove(key)
     }
 
     //should be called in the end of program
     pub fn free_data_enc(&self) {
-        let eid = env::Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let eid = env::Env::get()
+            .enclave
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .geteid();
         let dep_info = DepInfo::padding_new(0);
         for (key, (ps, op_id)) in (*self.inner).clone() {
             println!("free op_id {:?}", op_id);
             for p_data_enc in ps {
-                let sgx_status = unsafe { 
-                    free_res_enc(
-                        eid,
-                        op_id,
-                        dep_info,
-                        p_data_enc as *mut u8,
-                    )
-                };
+                let sgx_status =
+                    unsafe { free_res_enc(eid, op_id, dep_info, p_data_enc as *mut u8) };
                 match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {},
+                    sgx_status_t::SGX_SUCCESS => {}
                     _ => {
                         panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
                     }
@@ -461,5 +469,4 @@ impl SpecShuffleCache {
             }
         }
     }
-
 }

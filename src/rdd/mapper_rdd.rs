@@ -1,12 +1,16 @@
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
-use std::sync::{atomic::{AtomicBool, Ordering::SeqCst}, Arc, mpsc::SyncSender};
+use std::sync::{
+    atomic::{AtomicBool, Ordering::SeqCst},
+    mpsc::SyncSender,
+    Arc,
+};
 use std::thread::JoinHandle;
 
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
+use crate::env::{Env, RDDB_MAP};
 use crate::error::Result;
-use crate::env::{RDDB_MAP, Env};
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
@@ -17,7 +21,7 @@ use serde_derive::{Deserialize, Serialize};
 pub struct MapperRdd<T: Data, U: Data, UE: Data, F, FE, FD>
 where
     F: Func(T) -> U + Clone,
-    FE: Func(Vec<U>) -> UE + Clone, 
+    FE: Func(Vec<U>) -> UE + Clone,
     FD: Func(UE) -> Vec<U> + Clone,
 {
     #[serde(skip_serializing, skip_deserializing)]
@@ -89,20 +93,15 @@ where
 {
     fn cache(&self) {
         self.vals.cache();
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
+        RDDB_MAP.insert(self.get_rdd_id(), self.get_rdd_base());
     }
-    
+
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
     }
 
     fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<UE>)
-        };
+        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<UE>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -162,34 +161,22 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let dep_info = DepInfo::padding_new(0);
-        let op_id = self.get_op_id();
-        let res = Box::new(data_ptr.into_iter()
-            .flat_map(move |data_ptr| get_encrypted_data::<UE>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
-            as Box<dyn Iterator<Item = _>>;
-        self.secure_shuffle_write(res, acc_arg, tx)
-    }
-
-    default fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    default fn cogroup_iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         self.iterator_any(split)
     }
 
-    default fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    default fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         log::debug!("inside iterator_any maprdd",);
-        Ok(Box::new(
-            self.iterator(split)?.collect::<Vec<_>>()
-        ))
+        Ok(Box::new(self.iterator(split)?.collect::<Vec<_>>()))
     }
 
     fn is_pinned(&self) -> bool {
@@ -201,14 +188,13 @@ impl<T, V, U, VE, UE, F, FE, FD> RddBase for MapperRdd<T, (V, U), (VE, UE), F, F
 where
     T: Data,
     V: Data,
-    U: Data, 
-    VE: Data, 
+    U: Data,
+    VE: Data,
     UE: Data,
     F: SerFunc(T) -> (V, U),
-    FE: SerFunc(Vec<(V, U)>) -> (VE, UE),  //need check
-    FD: SerFunc((VE, UE)) -> Vec<(V, U)>,  //need check
+    FE: SerFunc(Vec<(V, U)>) -> (VE, UE), //need check
+    FD: SerFunc((VE, UE)) -> Vec<(V, U)>, //need check
 {
-
 }
 
 impl<T: Data, U: Data, UE: Data, F, FE, FD> Rdd for MapperRdd<T, U, UE, F, FE, FD>
@@ -229,38 +215,36 @@ where
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         Ok(Box::new(self.prev.iterator(split)?.map(self.f.clone())))
     }
-    
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
         acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
-        let captured_vars = self.f.get_ser_captured_var(); 
+        let captured_vars = self.f.get_ser_captured_var();
         if !captured_vars.is_empty() {
-            acc_arg.acc_captured_size += captured_vars.get_size();
             acc_arg.captured_vars.insert(cur_rdd_id, captured_vars);
         }
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(
-                acc_arg, 
-                cur_rdd_id, 
-                cur_part_id,
-                tx.clone(),
-            );
+            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
             }
-            Ok(handles)     
+            Ok(handles)
         } else {
             self.prev.secure_compute(split, acc_arg, tx)
         }
     }
 }
-
 
 impl<T: Data, U: Data, UE: Data, F, FE, FD> RddE for MapperRdd<T, U, UE, F, FE, FD>
 where
@@ -273,12 +257,11 @@ where
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
-
 }

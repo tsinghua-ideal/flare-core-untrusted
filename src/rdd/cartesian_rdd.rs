@@ -1,17 +1,17 @@
 use itertools::{iproduct, Itertools};
 
-use crate::{context::Context};
+use crate::context::Context;
 use crate::dependency::Dependency;
 use crate::env::{Env, RDDB_MAP};
 use crate::error::{Error, Result};
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
+use parking_lot::Mutex;
 use serde_derive::{Deserialize, Serialize};
 use std::marker::PhantomData;
-use std::sync::{Arc, mpsc::SyncSender};
+use std::sync::{mpsc::SyncSender, Arc};
 use std::thread::JoinHandle;
-use parking_lot::Mutex;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct CartesianSplit {
@@ -31,8 +31,8 @@ impl Split for CartesianSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct CartesianRdd<T, U, TE, UE, FE, FD> 
-where 
+pub struct CartesianRdd<T, U, TE, UE, FE, FD>
+where
     T: Data,
     U: Data,
     TE: Data,
@@ -52,8 +52,8 @@ where
     _market_u: PhantomData<U>,
 }
 
-impl<T, U, TE, UE, FE, FD> CartesianRdd<T, U, TE, UE, FE, FD> 
-where 
+impl<T, U, TE, UE, FE, FD> CartesianRdd<T, U, TE, UE, FE, FD>
+where
     T: Data,
     U: Data,
     TE: Data,
@@ -83,7 +83,7 @@ where
     }
 }
 
-impl<T, U, TE, UE, FE, FD>  Clone for CartesianRdd<T, U, TE, UE, FE, FD> 
+impl<T, U, TE, UE, FE, FD> Clone for CartesianRdd<T, U, TE, UE, FE, FD>
 where
     T: Data,
     U: Data,
@@ -106,7 +106,7 @@ where
     }
 }
 
-impl<T, U, TE, UE, FE, FD> RddBase for CartesianRdd<T, U, TE, UE, FE, FD> 
+impl<T, U, TE, UE, FE, FD> RddBase for CartesianRdd<T, U, TE, UE, FE, FD>
 where
     T: Data,
     U: Data,
@@ -117,10 +117,7 @@ where
 {
     fn cache(&self) {
         self.vals.cache();
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
+        RDDB_MAP.insert(self.get_rdd_id(), self.get_rdd_base());
     }
 
     fn should_cache(&self) -> bool {
@@ -128,9 +125,7 @@ where
     }
 
     fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<(TE, UE)>)
-        };
+        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(TE, UE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -183,30 +178,21 @@ where
         array
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let dep_info = DepInfo::padding_new(0);
-        let op_id = self.get_op_id();
-        let res = Box::new(data_ptr.into_iter()
-            .flat_map(move |data_ptr| get_encrypted_data::<(TE, UE)>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
-            as Box<dyn Iterator<Item = _>>;
-        self.secure_shuffle_write(res, acc_arg, tx)
-    }
-
-    default fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
-        Ok(Box::new(
-            self.iterator(split)?.collect::<Vec<_>>()
-        ))
+    default fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
+        Ok(Box::new(self.iterator(split)?.collect::<Vec<_>>()))
     }
 }
 
-impl<T, U, TE, UE, FE, FD> Rdd for CartesianRdd<T, U, TE, UE, FE, FD> 
+impl<T, U, TE, UE, FE, FD> Rdd for CartesianRdd<T, U, TE, UE, FE, FD>
 where
     T: Data,
     U: Data,
@@ -238,14 +224,18 @@ where
         Ok(Box::new(iter1.cartesian_product(iter2.into_iter())))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         //TODO
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
     }
-
 }
 
-impl<T, U, TE, UE, FE, FD> RddE for CartesianRdd<T, U, TE, UE, FE, FD> 
+impl<T, U, TE, UE, FE, FD> RddE for CartesianRdd<T, U, TE, UE, FE, FD>
 where
     T: Data,
     U: Data,
@@ -259,11 +249,11 @@ where
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

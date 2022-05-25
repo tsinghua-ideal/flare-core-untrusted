@@ -1,16 +1,16 @@
 //! This module implements parallel collection RDD for dividing the input collection for parallel processing.
 use std::collections::HashMap;
-use std::sync::{Arc, mpsc::SyncSender, Weak};
+use std::sync::{mpsc::SyncSender, Arc, Weak};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
-use std::thread::{JoinHandle, self};
 
 use crate::context::Context;
 use crate::dependency::Dependency;
-use crate::env::{BOUNDED_MEM_CACHE, RDDB_MAP, Env};
+use crate::env::{Env, BOUNDED_MEM_CACHE, RDDB_MAP};
 use crate::error::{Error, Result};
 use crate::rdd::*;
-use crate::serialization_free::Construct;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
+use crate::serialization_free::Construct;
 use crate::split::Split;
 use parking_lot::Mutex;
 use serde_derive::{Deserialize, Serialize};
@@ -68,8 +68,8 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> JoinHandle<()> {
-        let data = self.values.clone();  
+    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> JoinHandle<()> {
+        let data = self.values.clone();
         let len = data.len();
         if len == 0 {
             return std::thread::spawn(|| {});
@@ -83,7 +83,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in parallel collection rdd, total {:?}***", dur);
         });
-        handle 
+        handle
     }
 }
 
@@ -97,7 +97,7 @@ pub struct ParallelCollectionVals<T, TE> {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ParallelCollection<T, TE, FE, FD> 
+pub struct ParallelCollection<T, TE, FE, FD>
 where
     FE: Func(Vec<T>) -> TE + Clone,
     FD: Func(TE) -> Vec<T> + Clone,
@@ -109,7 +109,7 @@ where
     fd: FD,
 }
 
-impl<T, TE, FE, FD> Clone for ParallelCollection<T, TE, FE, FD> 
+impl<T, TE, FE, FD> Clone for ParallelCollection<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
@@ -126,7 +126,7 @@ where
     }
 }
 
-impl<T, TE, FE, FD> ParallelCollection<T, TE, FE, FD> 
+impl<T, TE, FE, FD> ParallelCollection<T, TE, FE, FD>
 where
     T: Data,
     TE: Data,
@@ -134,7 +134,14 @@ where
     FD: Func(TE) -> Vec<T> + Clone,
 {
     #[track_caller]
-    pub fn new<I, IE>(context: Arc<Context>, data: I, data_enc: IE, fe: FE, fd: FD, num_slices: usize) -> Self
+    pub fn new<I, IE>(
+        context: Arc<Context>,
+        data: I,
+        data_enc: IE,
+        fe: FE,
+        fd: FD,
+        num_slices: usize,
+    ) -> Self
     where
         I: IntoIterator<Item = T>,
         IE: IntoIterator<Item = TE>,
@@ -233,19 +240,17 @@ where
             }
         }
     }
-
 }
 
-impl<K, V, KE, VE, FE, FD> RddBase for ParallelCollection<(K, V), (KE, VE), FE, FD> 
+impl<K, V, KE, VE, FE, FD> RddBase for ParallelCollection<(K, V), (KE, VE), FE, FD>
 where
     K: Data,
     V: Data,
     KE: Data,
     VE: Data,
     FE: SerFunc(Vec<(K, V)>) -> (KE, VE),
-    FD: SerFunc((KE, VE)) -> Vec<(K, V)>, 
+    FD: SerFunc((KE, VE)) -> Vec<(K, V)>,
 {
-
 }
 
 impl<T, TE, FE, FD> RddBase for ParallelCollection<T, TE, FE, FD>
@@ -253,14 +258,11 @@ where
     T: Data,
     TE: Data,
     FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>, 
+    FD: SerFunc(TE) -> Vec<T>,
 {
     fn cache(&self) {
         self.rdd_vals.vals.cache();
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
+        RDDB_MAP.insert(self.get_rdd_id(), self.get_rdd_base());
     }
 
     fn should_cache(&self) -> bool {
@@ -268,9 +270,7 @@ where
     }
 
     fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<TE>)
-        };
+        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<TE>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -301,7 +301,7 @@ where
     fn get_dependencies(&self) -> Vec<Dependency> {
         Vec::new()
     }
-    
+
     fn get_secure(&self) -> bool {
         self.rdd_vals.vals.secure
     }
@@ -315,8 +315,7 @@ where
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
         match self.rdd_vals.splits_.clone() {
-            DataForm::Plaintext(splits) => {
-                (0..self.rdd_vals.num_slices)
+            DataForm::Plaintext(splits) => (0..self.rdd_vals.num_slices)
                 .map(|i| {
                     Box::new(ParallelCollectionSplit::new(
                         self.rdd_vals.vals.id,
@@ -325,10 +324,8 @@ where
                         splits[i as usize].clone(),
                     )) as Box<dyn Split>
                 })
-                .collect::<Vec<Box<dyn Split>>>()
-            },
-            DataForm::Ciphertext(splits) => {
-                (0..self.rdd_vals.num_slices)
+                .collect::<Vec<Box<dyn Split>>>(),
+            DataForm::Ciphertext(splits) => (0..self.rdd_vals.num_slices)
                 .map(|i| {
                     Box::new(ParallelCollectionSplit::new(
                         self.rdd_vals.vals.id,
@@ -337,44 +334,30 @@ where
                         splits[i as usize].clone(),
                     )) as Box<dyn Split>
                 })
-                .collect::<Vec<Box<dyn Split>>>()
-            },
+                .collect::<Vec<Box<dyn Split>>>(),
         }
-
     }
 
     fn number_of_splits(&self) -> usize {
         self.rdd_vals.num_slices
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let dep_info = DepInfo::padding_new(0);
-        let op_id = self.get_op_id();
-        let res = Box::new(data_ptr.into_iter()
-            .flat_map(move |data_ptr| get_encrypted_data::<TE>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
-            as Box<dyn Iterator<Item = _>>;
-        self.secure_shuffle_write(res, acc_arg, tx)
-    }
-
-    default fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    default fn cogroup_iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         self.iterator_any(split)
     }
 
-    default fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    default fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         log::debug!("inside iterator_any parallel collection",);
-        Ok(Box::new(
-            self.iterator(split)?.collect::<Vec<_>>()
-        ))
+        Ok(Box::new(self.iterator(split)?.collect::<Vec<_>>()))
     }
 }
 
@@ -383,7 +366,7 @@ where
     T: Data,
     TE: Data,
     FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>, 
+    FD: SerFunc(TE) -> Vec<T>,
 {
     type Item = T;
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
@@ -407,7 +390,12 @@ where
         }
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
             let cur_rdd_id = self.get_rdd_id();
             let cur_op_id = self.get_op_id();
@@ -417,18 +405,14 @@ where
 
             let should_cache = self.should_cache();
             if should_cache {
-                let mut handles = secure_compute_cached(
-                    acc_arg, 
-                    cur_rdd_id,
-                    cur_part_id,
-                    tx.clone(),
-                );
-    
+                let mut handles =
+                    secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
+
                 if handles.is_empty() {
                     acc_arg.set_caching_rdd_id(cur_rdd_id);
                     handles.append(&mut vec![s.secure_iterator(acc_arg, tx)]);
                 }
-                Ok(handles)     
+                Ok(handles)
             } else {
                 Ok(vec![s.secure_iterator(acc_arg, tx)])
             }
@@ -436,7 +420,6 @@ where
             Err(Error::DowncastFailure("ParallelCollectionSplit<TE>"))
         }
     }
-
 }
 
 impl<T, TE, FE, FD> RddE for ParallelCollection<T, TE, FE, FD>
@@ -444,18 +427,18 @@ where
     T: Data,
     TE: Data,
     FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>, 
+    FD: SerFunc(TE) -> Vec<T>,
 {
     type ItemE = TE;
     fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>    
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
-    } 
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
+    }
 }

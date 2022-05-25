@@ -1,17 +1,17 @@
 use std::cmp::min;
 use std::marker::PhantomData;
-use std::sync::{Arc, mpsc::SyncSender};
+use std::sync::{mpsc::SyncSender, Arc};
 use std::thread::JoinHandle;
 
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
-use crate::env::{RDDB_MAP, Env};
+use crate::env::{Env, RDDB_MAP};
 use crate::error::{Error, Result};
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data};
 use crate::split::Split;
-use serde_derive::{Deserialize, Serialize};
 use parking_lot::Mutex;
+use serde_derive::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ZippedPartitionsSplit {
@@ -32,11 +32,11 @@ impl Split for ZippedPartitionsSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+pub struct ZippedPartitionsRdd<T, U, TE, UE, FE, FD>
 where
-    T: Data, 
-    U: Data, 
-    TE: Data, 
+    T: Data,
+    U: Data,
+    TE: Data,
     UE: Data,
     FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
     FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
@@ -51,11 +51,11 @@ where
     _marker_t: PhantomData<(TE, UE)>,
 }
 
-impl<T, U, TE, UE, FE, FD> Clone for ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+impl<T, U, TE, UE, FE, FD> Clone for ZippedPartitionsRdd<T, U, TE, UE, FE, FD>
 where
-    T: Data, 
-    U: Data, 
-    TE: Data, 
+    T: Data,
+    U: Data,
+    TE: Data,
     UE: Data,
     FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
     FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
@@ -72,17 +72,22 @@ where
     }
 }
 
-impl<T, U, TE, UE, FE, FD> ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
-where 
-    T: Data, 
-    U: Data, 
-    TE: Data, 
+impl<T, U, TE, UE, FE, FD> ZippedPartitionsRdd<T, U, TE, UE, FE, FD>
+where
+    T: Data,
+    U: Data,
+    TE: Data,
     UE: Data,
     FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
     FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
 {
     #[track_caller]
-    pub fn new(first: Arc<dyn RddE<Item = T, ItemE = TE>>, second: Arc<dyn RddE<Item = U, ItemE = UE>>, fe: FE, fd: FD) -> Self {
+    pub fn new(
+        first: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        second: Arc<dyn RddE<Item = U, ItemE = UE>>,
+        fe: FE,
+        fd: FD,
+    ) -> Self {
         let vals = RddVals::new(first.get_context(), first.get_secure()); //temp
         let vals = Arc::new(vals);
 
@@ -96,89 +101,79 @@ where
         }
     }
 
-    fn secure_compute_prev(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute_prev(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         let current_split = split
             .downcast::<ZippedPartitionsSplit>()
             .or(Err(Error::DowncastFailure("ZippedPartitionsSplit")))?;
 
         let dep_info = DepInfo::padding_new(0);
-        let fst = self.first.secure_iterator(current_split.fst_split.clone(), dep_info.clone(), None)?.collect::<Vec<_>>();
-        let sec = self.second.secure_iterator(current_split.sec_split.clone(), dep_info, None)?.collect::<Vec<_>>();
-        
+        let fst = self
+            .first
+            .secure_iterator(current_split.fst_split.clone(), dep_info.clone(), None)?
+            .collect::<Vec<_>>();
+        let sec = self
+            .second
+            .secure_iterator(current_split.sec_split.clone(), dep_info, None)?
+            .collect::<Vec<_>>();
+
         let data = self.secure_zip((fst, sec), acc_arg);
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
             let wait = start_execute(acc_arg, data, tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
-            println!("***in zipped rdd, compute, total {:?}***", dur);  
+            println!("***in zipped rdd, compute, total {:?}***", dur);
         });
         Ok(vec![handle])
     }
 
-    fn secure_zip(&self, 
-        data: (Vec<TE>, Vec<UE>),
-        acc_arg: &mut AccArg,
-    ) -> Vec<(TE, UE)> {
+    fn secure_zip(&self, data: (Vec<TE>, Vec<UE>), acc_arg: &mut AccArg) -> Vec<(TE, UE)> {
         acc_arg.get_enclave_lock();
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
         let cur_part_ids = vec![*acc_arg.part_ids.last().unwrap()];
-        let len_first = data.0.len();
-        let len_second = data.1.len();
         let dep_info = DepInfo::padding_new(2);
 
-        let now_comp = Instant::now();
-        let (result_ptr, (time_comp, mem_usage)) = wrapper_secure_execute(
+        let result_ptr = wrapper_secure_execute(
             &cur_rdd_ids,
             &cur_op_ids,
             &cur_part_ids,
             Default::default(),
             dep_info,
             &data,
-            &mut vec![0, 0],
-            &mut vec![len_first, len_second],
-            &mut vec![len_first, len_second],
-            std::cmp::max(len_first, len_second),
-            0,
             &acc_arg.captured_vars,
-            &None,
         );
-        let dur_comp = now_comp.elapsed().as_nanos() as f64 * 1e-9;
         let result = get_encrypted_data::<(TE, UE)>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
-        println!("***in zipped rdd, secure_zip, total {:?}***", dur_comp); 
-
         acc_arg.free_enclave_lock();
         *result
     }
-
 }
 
-impl<T, U, TE, UE, FE, FD> RddBase for ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+impl<T, U, TE, UE, FE, FD> RddBase for ZippedPartitionsRdd<T, U, TE, UE, FE, FD>
 where
-    T: Data, 
-    U: Data, 
-    TE: Data, 
+    T: Data,
+    U: Data,
+    TE: Data,
     UE: Data,
     FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
     FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
 {
     fn cache(&self) {
         self.vals.cache();
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
+        RDDB_MAP.insert(self.get_rdd_id(), self.get_rdd_base());
     }
-    
+
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
     }
-    
+
     fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<(TE, UE)>)
-        };
+        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(TE, UE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -198,12 +193,14 @@ where
     }
 
     fn get_dependencies(&self) -> Vec<Dependency> {
-        vec![Dependency::NarrowDependency(Arc::new(
-                OneToOneDependency::new(self.first.get_rdd_base()),
-            )), 
-            Dependency::NarrowDependency(Arc::new(
-                OneToOneDependency::new(self.second.get_rdd_base()),
-            ))]
+        vec![
+            Dependency::NarrowDependency(Arc::new(OneToOneDependency::new(
+                self.first.get_rdd_base(),
+            ))),
+            Dependency::NarrowDependency(Arc::new(OneToOneDependency::new(
+                self.second.get_rdd_base(),
+            ))),
+        ]
     }
 
     fn get_secure(&self) -> bool {
@@ -241,41 +238,29 @@ where
         self.splits().len()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let dep_info = DepInfo::padding_new(0);
-        let op_id = self.get_op_id();
-        let res = Box::new(data_ptr.into_iter()
-            .flat_map(move |data_ptr| get_encrypted_data::<(TE, UE)>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
-            as Box<dyn Iterator<Item = _>>;
-        self.secure_shuffle_write(res, acc_arg, tx)
+    fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
+        Ok(Box::new(self.iterator(split)?.collect::<Vec<_>>()))
     }
 
-    fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
-        Ok(Box::new(
-            self.iterator(split)?.collect::<Vec<_>>()
-        ))
-    }
-
-    fn cogroup_iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    fn cogroup_iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         self.iterator_any(split)
     }
 }
 
-impl<T, U, TE, UE, FE, FD> Rdd for ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+impl<T, U, TE, UE, FE, FD> Rdd for ZippedPartitionsRdd<T, U, TE, UE, FE, FD>
 where
-    T: Data, 
-    U: Data, 
-    TE: Data, 
+    T: Data,
+    U: Data,
+    TE: Data,
     UE: Data,
     FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
     FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
@@ -289,7 +274,7 @@ where
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
         Arc::new(self.clone()) as Arc<dyn RddBase>
     }
-    
+
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         let current_split = split
             .downcast::<ZippedPartitionsSplit>()
@@ -300,7 +285,12 @@ where
         Ok(Box::new(fst_iter.zip(sec_iter)))
     }
 
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_part_id = split.get_index();
@@ -309,18 +299,13 @@ where
 
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(
-                acc_arg, 
-                cur_rdd_id,
-                cur_part_id,
-                tx.clone(),
-            );
+            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
             }
-            Ok(handles)     
+            Ok(handles)
         } else {
             self.secure_compute_prev(split, acc_arg, tx)
         }
@@ -331,11 +316,11 @@ where
     }
 }
 
-impl<T, U, TE, UE, FE, FD> RddE for ZippedPartitionsRdd<T, U, TE, UE, FE, FD> 
+impl<T, U, TE, UE, FE, FD> RddE for ZippedPartitionsRdd<T, U, TE, UE, FE, FD>
 where
-    T: Data, 
-    U: Data, 
-    TE: Data, 
+    T: Data,
+    U: Data,
+    TE: Data,
     UE: Data,
     FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
     FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
@@ -346,11 +331,11 @@ where
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

@@ -3,8 +3,10 @@ use std::fs;
 use std::mem::forget;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, 
-    atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 use crate::cache::BoundedMemoryCache;
 use crate::cache_tracker::CacheTracker;
@@ -33,9 +35,8 @@ static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);
 
 pub(crate) static SHUFFLE_CACHE: Lazy<ShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
-pub(crate) static SPEC_SHUFFLE_CACHE: Lazy<SpecShuffleCache> = Lazy::new(SpecShuffleCache::new);
 pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(BoundedMemoryCache::new);
-pub(crate) static RDDB_MAP: Lazy<RddBMap> = Lazy::new(|| RddBMap::new()); 
+pub(crate) static RDDB_MAP: Lazy<RddBMap> = Lazy::new(|| RddBMap::new());
 
 pub(crate) struct RddBMap {
     map: Arc<DashMap<usize, Arc<dyn RddBase>>>, //rdd_id -> rddbase
@@ -43,7 +44,13 @@ pub(crate) struct RddBMap {
 
 impl RddBMap {
     pub fn new() -> Self {
-        let eid = Env::get().enclave.lock().unwrap().as_ref().unwrap().geteid();
+        let eid = Env::get()
+            .enclave
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .geteid();
         RddBMap {
             map: Arc::new(DashMap::new()),
         }
@@ -107,28 +114,29 @@ impl Env {
     fn new() -> Self {
         Env::run_in_async_rt(|| -> Self {
             let conf = Configuration::get();
-            let hosts = Hosts::get()
-                .expect("fatal error: failed loading host file");
+            let hosts = Hosts::get().expect("fatal error: failed loading host file");
             let master_addr = hosts.master;
             let map_output_tracker = MapOutputTracker::new(conf.is_driver, master_addr);
             let shuffle_manager =
                 ShuffleManager::new().expect("fatal error: failed creating shuffle manager");
 
-            let binary_path = std::env::current_exe()
-                .unwrap_or_else(|_| panic!("CurrentBinaryPath error"));
-            let mut enclave_path  = PathBuf::from("");
+            let binary_path =
+                std::env::current_exe().unwrap_or_else(|_| panic!("CurrentBinaryPath error"));
+            let mut enclave_path = PathBuf::from("");
             if let Some(dir) = binary_path.parent() {
                 enclave_path = dir.join("enclave.signed.so");
             }
-            if !enclave_path.exists(){
+            if !enclave_path.exists() {
                 log::debug!("enclave.signed.so not found");
                 panic!("enclave.signed.so not found!");
             }
             let enclave_path_str = enclave_path
                 .to_str()
                 .unwrap_or_else(|| panic!("env::Env enclave PathBuf2str error"));
-            let enclave = Arc::new(Mutex::new(Some(Env::init_enclave(&enclave_path_str)
-                        .unwrap_or_else(|x| panic!("[-] Init Enclave Failed {}!", x.as_str())))));
+            let enclave = Arc::new(Mutex::new(Some(
+                Env::init_enclave(&enclave_path_str)
+                    .unwrap_or_else(|x| panic!("[-] Init Enclave Failed {}!", x.as_str())),
+            )));
             Env {
                 map_output_tracker,
                 shuffle_manager,
@@ -153,12 +161,17 @@ impl Env {
         // call sgx_create_enclave to initialize an enclave instance
         // Debug Support: set 2nd parameter to 1
         let debug = 1;
-        let mut misc_attr = sgx_misc_attribute_t {secs_attr: sgx_attributes_t { flags:0, xfrm:0}, misc_select:0};
-        SgxEnclave::create(enclave_path_str,
-                           debug,
-                           &mut launch_token,
-                           &mut launch_token_updated,
-                           &mut misc_attr)
+        let mut misc_attr = sgx_misc_attribute_t {
+            secs_attr: sgx_attributes_t { flags: 0, xfrm: 0 },
+            misc_select: 0,
+        };
+        SgxEnclave::create(
+            enclave_path_str,
+            debug,
+            &mut launch_token,
+            &mut launch_token_updated,
+            &mut misc_attr,
+        )
     }
 }
 

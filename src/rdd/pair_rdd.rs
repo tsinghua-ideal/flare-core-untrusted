@@ -1,11 +1,11 @@
 use std::hash::Hash;
-use std::sync::{Arc, mpsc::SyncSender};
+use std::sync::{mpsc::SyncSender, Arc};
 use std::thread::JoinHandle;
 
 use crate::aggregator::Aggregator;
 use crate::context::Context;
 use crate::dependency::{Dependency, OneToOneDependency};
-use crate::env::{RDDB_MAP, Env};
+use crate::env::{Env, RDDB_MAP};
 use crate::error::Result;
 use crate::partitioner::{HashPartitioner, Partitioner};
 use crate::rdd::co_grouped_rdd::CoGroupedRdd;
@@ -13,16 +13,16 @@ use crate::rdd::shuffled_rdd::ShuffledRdd;
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
 use crate::split::Split;
+use parking_lot::Mutex;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
-use parking_lot::Mutex;
 
 // Trait containing pair rdd methods. No need of implicit conversion like in Spark version.
-pub trait PairRdd<K, V, KE, VE>: RddE<Item = (K, V), ItemE = (KE, VE)> + Send + Sync 
+pub trait PairRdd<K, V, KE, VE>: RddE<Item = (K, V), ItemE = (KE, VE)> + Send + Sync
 where
-    K: Data + Eq + Hash, 
-    V: Data, 
-    KE: Data + Eq + Hash, 
+    K: Data + Eq + Hash,
+    V: Data,
+    KE: Data + Eq + Hash,
     VE: Data,
 {
     #[track_caller]
@@ -35,7 +35,7 @@ where
     ) -> SerArc<dyn RddE<Item = (K, C), ItemE = (KE2, CE)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, C)>) -> (KE2, CE), 
+        FE: SerFunc(Vec<(K, C)>) -> (KE2, CE),
         FD: SerFunc((KE2, CE)) -> Vec<(K, C)>,
     {
         SerArc::new(ShuffledRdd::new(
@@ -48,7 +48,12 @@ where
     }
 
     #[track_caller]
-    fn group_by_key<CE, FE, FD>(&self, fe: FE, fd: FD, num_splits: usize) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, CE)>>
+    fn group_by_key<CE, FE, FD>(
+        &self,
+        fe: FE,
+        fd: FD,
+        num_splits: usize,
+    ) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, CE)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
         CE: Data,
@@ -58,7 +63,7 @@ where
         self.group_by_key_using_partitioner(
             fe,
             fd,
-            Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>
+            Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
         )
     }
 
@@ -79,20 +84,26 @@ where
     }
 
     #[track_caller]
-    fn reduce_by_key<KE2, VE2, F, FE, FD>(&self, func: F, num_splits: usize, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = (K, V), ItemE = (KE2, VE2)>>
+    fn reduce_by_key<KE2, VE2, F, FE, FD>(
+        &self,
+        func: F,
+        num_splits: usize,
+        fe: FE,
+        fd: FD,
+    ) -> SerArc<dyn RddE<Item = (K, V), ItemE = (KE2, VE2)>>
     where
         KE2: Data,
         VE2: Data,
         F: SerFunc((V, V)) -> V,
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, V)>) -> (KE2, VE2), 
-        FD: SerFunc((KE2, VE2)) -> Vec<(K, V)>,        
+        FE: SerFunc(Vec<(K, V)>) -> (KE2, VE2),
+        FD: SerFunc((KE2, VE2)) -> Vec<(K, V)>,
     {
         self.reduce_by_key_using_partitioner(
             func,
             Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
             fe,
-            fd
+            fd,
         )
     }
 
@@ -109,8 +120,8 @@ where
         VE2: Data,
         F: SerFunc((V, V)) -> V,
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, V)>) -> (KE2, VE2), 
-        FD: SerFunc((KE2, VE2)) -> Vec<(K, V)>,  
+        FE: SerFunc(Vec<(K, V)>) -> (KE2, VE2),
+        FD: SerFunc((KE2, VE2)) -> Vec<(K, V)>,
     {
         let create_combiner = Box::new(Fn!(|v: V| v));
         let f_clone = func.clone();
@@ -123,12 +134,12 @@ where
     #[track_caller]
     fn values<FE, FD>(
         &self,
-        fe: FE,  //the type corresponding to the encryption form is fixed
+        fe: FE, //the type corresponding to the encryption form is fixed
         fd: FD,
     ) -> SerArc<dyn RddE<Item = V, ItemE = VE>>
     where
         Self: Sized,
-        FE: SerFunc(Vec<V>) -> VE, 
+        FE: SerFunc(Vec<V>) -> VE,
         FD: SerFunc(VE) -> Vec<V>,
     {
         SerArc::new(ValuesRdd::new(self.get_rdd(), fe, fd))
@@ -146,7 +157,7 @@ where
         F: SerFunc(V) -> U + Clone,
         U: Data,
         UE: Data,
-        FE: SerFunc(Vec<(K, U)>) -> (KE, UE), 
+        FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
         FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
     {
         SerArc::new(MappedValuesRdd::new(self.get_rdd(), f, fe, fd))
@@ -164,8 +175,8 @@ where
         F: SerFunc(V) -> Box<dyn Iterator<Item = U>> + Clone,
         U: Data,
         UE: Data,
-        FE: SerFunc(Vec<(K, U)>) -> (KE, UE), 
-        FD: SerFunc((KE, UE)) -> Vec<(K, U)>, 
+        FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
+        FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
     {
         SerArc::new(FlatMappedValuesRdd::new(self.get_rdd(), f, fe, fd))
     }
@@ -177,12 +188,12 @@ where
         fe: FE,
         fd: FD,
         num_splits: usize,
-    ) -> SerArc<dyn RddE<Item = (K, (V, W)), ItemE = (KE, (VE, WE))>> 
+    ) -> SerArc<dyn RddE<Item = (K, (V, W)), ItemE = (KE, (VE, WE))>>
     where
         W: Data + Default,
         WE: Data + Default,
-        FE: SerFunc(Vec<(K, (V, W))>) -> (KE, (VE, WE)), 
-        FD: SerFunc((KE, (VE, WE))) -> Vec<(K, (V, W))>, 
+        FE: SerFunc(Vec<(K, (V, W))>) -> (KE, (VE, WE)),
+        FD: SerFunc((KE, (VE, WE))) -> Vec<(K, (V, W))>,
     {
         let f = Fn!(|v: (Vec<V>, Vec<W>)| {
             let (vs, ws) = v;
@@ -202,22 +213,18 @@ where
             let (v, w): (Vec<Vec<V>>, Vec<Vec<W>>) = vw.into_iter().unzip();
             let mut w_padding: Vec<W> = Vec::new();
             w_padding.resize_with(k.len(), Default::default);
-            let (ct_x, _) = (fe1)(k.into_iter()
-                .zip(w_padding.into_iter())
-                .collect::<Vec<_>>()
-            );
+            let (ct_x, _) = (fe1)(k.into_iter().zip(w_padding.into_iter()).collect::<Vec<_>>());
             (ct_x, (ser_encrypt(v), ser_encrypt(w)))
         });
         let fd_cg = Fn!(move |v: (KE, (Vec<u8>, Vec<u8>))| {
             let (ct_x, (ct_y, ct_z)) = v;
             let w_padding: WE = Default::default();
-            let (x, _): (Vec<K>, Vec<W>)= (fd1)((ct_x, w_padding)).into_iter().unzip();
+            let (x, _): (Vec<K>, Vec<W>) = (fd1)((ct_x, w_padding)).into_iter().unzip();
             let y = ser_decrypt(ct_y);
             let z = ser_decrypt(ct_z);
             x.into_iter()
-                .zip(y.into_iter()
-                    .zip(z.into_iter())
-                ).collect::<Vec<_>>()
+                .zip(y.into_iter().zip(z.into_iter()))
+                .collect::<Vec<_>>()
         });
 
         let cogrouped = self.cogroup(
@@ -237,23 +244,34 @@ where
         fe: FE,
         fd: FD,
         partitioner: Box<dyn Partitioner>,
-    ) -> SerArc<dyn RddE<Item = (K, (Vec<V>, Vec<W>)), ItemE = (KE, (CE, DE))>> 
+    ) -> SerArc<dyn RddE<Item = (K, (Vec<V>, Vec<W>)), ItemE = (KE, (CE, DE))>>
     where
         W: Data,
         WE: Data,
         CE: Data,
         DE: Data,
-        FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)), 
-        FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>, 
+        FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)),
+        FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
     {
-        SerArc::new(CoGroupedRdd::new(self.get_rdde(), other.get_rdde(), fe, fd, partitioner))
+        SerArc::new(CoGroupedRdd::new(
+            self.get_rdde(),
+            other.get_rdde(),
+            fe,
+            fd,
+            partitioner,
+        ))
     }
 
     #[track_caller]
-    fn partition_by_key<FE, FD>(&self, partitioner: Box<dyn Partitioner>, fe: FE, fd: FD) -> SerArc<dyn RddE<Item = V, ItemE = VE>>
-    where 
-        FE: SerFunc(Vec<V>) -> VE, 
-        FD: SerFunc(VE) -> Vec<V>, 
+    fn partition_by_key<FE, FD>(
+        &self,
+        partitioner: Box<dyn Partitioner>,
+        fe: FE,
+        fd: FD,
+    ) -> SerArc<dyn RddE<Item = V, ItemE = VE>>
+    where
+        FE: SerFunc(Vec<V>) -> VE,
+        FD: SerFunc(VE) -> Vec<V>,
     {
         // Guarantee the number of partitions by introducing a shuffle phase
         let fe_c = fe.clone();
@@ -271,7 +289,7 @@ where
             let mut pt_y = Vec::with_capacity(vy.len());
             for y in vy {
                 pt_y.push((fd_c)(y));
-            } 
+            }
             x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
         });
 
@@ -297,20 +315,22 @@ where
 impl<K, V, KE, VE, T> PairRdd<K, V, KE, VE> for T
 where
     T: RddE<Item = (K, V), ItemE = (KE, VE)>,
-    K: Data + Eq + Hash, 
-    V: Data, 
-    KE: Data + Eq + Hash, 
+    K: Data + Eq + Hash,
+    V: Data,
+    KE: Data + Eq + Hash,
     VE: Data,
-{}
+{
+}
 
 impl<K, V, KE, VE, T> PairRdd<K, V, KE, VE> for SerArc<T>
 where
     T: RddE<Item = (K, V), ItemE = (KE, VE)>,
-    K: Data + Eq + Hash, 
-    V: Data, 
-    KE: Data + Eq + Hash, 
+    K: Data + Eq + Hash,
+    V: Data,
+    KE: Data + Eq + Hash,
     VE: Data,
-{}
+{
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct ValuesRdd<K, V, VE, FE, FD>
@@ -327,7 +347,7 @@ where
     fe: FE,
     fd: FD,
 }
- 
+
 impl<K, V, VE, FE, FD> Clone for ValuesRdd<K, V, VE, FE, FD>
 where
     K: Data,
@@ -358,12 +378,7 @@ where
     fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, fe: FE, fd: FD) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         let vals = Arc::new(vals);
-        ValuesRdd {
-            prev,
-            vals,
-            fe,
-            fd,
-        }
+        ValuesRdd { prev, vals, fe, fd }
     }
 }
 
@@ -377,10 +392,7 @@ where
 {
     fn cache(&self) {
         self.vals.cache();
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
+        RDDB_MAP.insert(self.get_rdd_id(), self.get_rdd_base());
     }
 
     fn should_cache(&self) -> bool {
@@ -388,9 +400,7 @@ where
     }
 
     fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<VE>)
-        };
+        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<VE>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -432,27 +442,18 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let dep_info = DepInfo::padding_new(0);
-        let op_id = self.get_op_id();
-        let res = Box::new(data_ptr.into_iter()
-            .flat_map(move |data_ptr| get_encrypted_data::<VE>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
-            as Box<dyn Iterator<Item = _>>;
-        self.secure_shuffle_write(res, acc_arg, tx)
-    }
-
-    default fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    default fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         log::debug!("inside iterator_any flatmaprdd",);
-        Ok(Box::new(
-            self.iterator(split)?.collect::<Vec<_>>()
-        ))
+        Ok(Box::new(self.iterator(split)?.collect::<Vec<_>>()))
     }
 }
 
@@ -472,11 +473,14 @@ where
         Arc::new(self.clone())
     }
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
-        Ok(Box::new(
-            self.prev.iterator(split)?.map(|(k, v)| v)),
-        )
+        Ok(Box::new(self.prev.iterator(split)?.map(|(k, v)| v)))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_part_id = split.get_index();
@@ -484,18 +488,13 @@ where
         acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(
-                acc_arg, 
-                cur_rdd_id,
-                cur_part_id,
-                tx.clone(),
-            );
+            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
             }
-            Ok(handles)     
+            Ok(handles)
         } else {
             self.prev.secure_compute(split, acc_arg, tx)
         }
@@ -515,15 +514,14 @@ where
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }
-
 
 #[derive(Serialize, Deserialize)]
 pub struct MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
@@ -544,7 +542,7 @@ where
     fe: FE,
     fd: FD,
 }
- 
+
 impl<K, V, U, KE, UE, F, FE, FD> Clone for MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
 where
     K: Data,
@@ -605,10 +603,7 @@ where
 {
     fn cache(&self) {
         self.vals.cache();
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
+        RDDB_MAP.insert(self.get_rdd_id(), self.get_rdd_base());
     }
 
     fn should_cache(&self) -> bool {
@@ -616,9 +611,7 @@ where
     }
 
     fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<(KE, UE)>)
-        };
+        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(KE, UE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -660,28 +653,19 @@ where
         self.prev.number_of_splits()
     }
 
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let dep_info = DepInfo::padding_new(0);
-        let op_id = self.get_op_id();
-        let res = Box::new(data_ptr.into_iter()
-            .flat_map(move |data_ptr| get_encrypted_data::<(KE, UE)>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
-            as Box<dyn Iterator<Item = _>>;
-        self.secure_shuffle_write(res, acc_arg, tx)
-    }
-
     // TODO: Analyze the possible error in invariance here
-    fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         log::debug!("inside iterator_any mapvaluesrdd");
-        Ok(Box::new(
-            self.iterator(split)?.collect::<Vec<_>>()
-        ))
+        Ok(Box::new(self.iterator(split)?.collect::<Vec<_>>()))
     }
 }
 
@@ -709,31 +693,30 @@ where
             self.prev.iterator(split)?.map(move |(k, v)| (k, f(v))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
         acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
-        let captured_vars = self.f.get_ser_captured_var(); 
+        let captured_vars = self.f.get_ser_captured_var();
         if !captured_vars.is_empty() {
-            acc_arg.acc_captured_size += captured_vars.get_size();
             acc_arg.captured_vars.insert(cur_rdd_id, captured_vars);
         }
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(
-                acc_arg, 
-                cur_rdd_id,
-                cur_part_id,
-                tx.clone(),
-            );
+            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
             }
-            Ok(handles)     
+            Ok(handles)
         } else {
             self.prev.secure_compute(split, acc_arg, tx)
         }
@@ -756,12 +739,12 @@ where
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }
 
@@ -845,20 +828,15 @@ where
 {
     fn cache(&self) {
         self.vals.cache();
-        RDDB_MAP.insert(
-            self.get_rdd_id(), 
-            self.get_rdd_base()
-        );
+        RDDB_MAP.insert(self.get_rdd_id(), self.get_rdd_base());
     }
-    
+
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
     }
 
     fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe {
-            Box::from_raw(ptr as *mut Vec<(KE, UE)>)
-        };
+        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(KE, UE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -898,29 +876,20 @@ where
     fn number_of_splits(&self) -> usize {
         self.prev.number_of_splits()
     }
-    
-    fn iterator_raw(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+
+    fn iterator_raw(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(split, acc_arg, tx)
     }
 
-    fn iterator_raw_spec(&self, data_ptr: Vec<usize>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
-        let dep_info = DepInfo::padding_new(0);
-        let op_id = self.get_op_id();
-        let res = Box::new(data_ptr.into_iter()
-            .flat_map(move |data_ptr| get_encrypted_data::<(KE, UE)>(op_id, dep_info, data_ptr as *mut u8).into_iter()))
-            as Box<dyn Iterator<Item = _>>;
-        self.secure_shuffle_write(res, acc_arg, tx)
-    }
-
     // TODO: Analyze the possible error in invariance here
-    fn iterator_any(
-        &self,
-        split: Box<dyn Split>,
-    ) -> Result<Box<dyn AnyData>> {
+    fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         log::debug!("inside iterator_any flatmapvaluesrdd",);
-        Ok(Box::new(
-            self.iterator(split)?.collect::<Vec<_>>()
-        ))
+        Ok(Box::new(self.iterator(split)?.collect::<Vec<_>>()))
     }
 }
 
@@ -950,31 +919,30 @@ where
                 .flat_map(move |(k, v)| f(v).map(move |x| (k.clone(), x))),
         ))
     }
-    fn secure_compute(&self, split: Box<dyn Split>, acc_arg: &mut AccArg, tx: SyncSender<(usize, (f64, f64, usize))>) -> Result<Vec<JoinHandle<()>>> {
+    fn secure_compute(
+        &self,
+        split: Box<dyn Split>,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<usize>,
+    ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
         let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
         acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
-        let captured_vars = self.f.get_ser_captured_var(); 
+        let captured_vars = self.f.get_ser_captured_var();
         if !captured_vars.is_empty() {
-            acc_arg.acc_captured_size += captured_vars.get_size();
             acc_arg.captured_vars.insert(cur_rdd_id, captured_vars);
         }
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(
-                acc_arg, 
-                cur_rdd_id,
-                cur_part_id,
-                tx.clone(),
-            );
+            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
                 handles.append(&mut self.prev.secure_compute(split, acc_arg, tx)?);
             }
-            Ok(handles)     
+            Ok(handles)
         } else {
             self.prev.secure_compute(split, acc_arg, tx)
         }
@@ -997,11 +965,11 @@ where
         Arc::new(self.clone())
     }
 
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>)->Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>)->Self::ItemE>
+    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
+        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
     }
 
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE)->Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE)->Vec<Self::Item>>
+    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
+        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }
