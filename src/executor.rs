@@ -181,16 +181,20 @@ impl Executor {
             .await
             .map_err(NetworkError::TcpListener)?;
         let mut signal: Result<Signal> = Err(Error::ExecutorShutdown);
-        while let Some(Ok(stream)) = listener.incoming().next().await {
-            let stream = stream.compat();
-            let signal_data = capnp_serialize::read_message(stream, CAPNP_BUF_READ_OPTS)
-                .await?
-                .ok_or_else(|| NetworkError::NoMessageReceived)?;
-            let data = bincode::deserialize::<Signal>(
-                signal_data
-                    .get_root::<serialized_data::Reader>()?
-                    .get_msg()?,
-            )?;
+        while let Some(Ok(mut stream)) = listener.incoming().next().await {
+            let (reader, writer) = stream.split();
+            let reader = reader.compat();
+            let writer = writer.compat_write();
+            let data = {
+                let signal_data = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS)
+                    .await?
+                    .ok_or_else(|| NetworkError::NoMessageReceived)?;
+                bincode::deserialize::<Signal>(
+                    signal_data
+                        .get_root::<serialized_data::Reader>()?
+                        .get_msg()?,
+                )?
+            };
             match data {
                 Signal::ShutDownError => {
                     log::info!("received error shutdown signal @ {}", self.port);
@@ -208,6 +212,20 @@ impl Executor {
                     signal = Ok(Signal::ShutDownGracefully);
                     break;
                 }
+                Signal::Detect => {
+                    log::info!("received detection signal @ {}", self.port);
+                    let message = {
+                        let mut message = MsgBuilder::new_default();
+                        let mut data = message.init_root::<serialized_data::Builder>();
+                        let uri = env::Env::get().shuffle_manager.get_server_uri();
+                        data.set_msg(&bincode::serialize(&uri).unwrap());
+                        message
+                    };
+                    capnp_serialize::write_message(writer, message)
+                        .await
+                        .map_err(Error::CapnpDeserialization)
+                        .unwrap();
+                }
                 _ => {}
             }
         }
@@ -222,6 +240,7 @@ pub(crate) enum Signal {
     ShutDownError,
     ShutDownGracefully,
     Continue,
+    Detect,
 }
 
 #[cfg(test)]

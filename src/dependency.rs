@@ -152,7 +152,12 @@ pub trait ShuffleDependencyTrait: Serialize + Deserialize + Send + Sync {
     fn get_shuffle_id(&self) -> usize;
     fn get_rdd_base(&self) -> Arc<dyn RddBase>;
     fn is_shuffle(&self) -> bool;
-    fn do_shuffle_task(&self, rdd_base: Arc<dyn RddBase>, partition: usize) -> String;
+    fn do_shuffle_task(
+        &self,
+        stage_id: usize,
+        rdd_base: Arc<dyn RddBase>,
+        partition: usize,
+    ) -> String;
 }
 
 impl PartialOrd for dyn ShuffleDependencyTrait {
@@ -271,12 +276,18 @@ where
         self.rdd_base.clone()
     }
 
-    fn do_shuffle_task(&self, rdd_base: Arc<dyn RddBase>, partition: usize) -> String {
+    fn do_shuffle_task(
+        &self,
+        stage_id: usize,
+        rdd_base: Arc<dyn RddBase>,
+        partition: usize,
+    ) -> String {
         log::debug!(
             "executing shuffle task #{} for partition #{}",
             self.shuffle_id,
             partition
         );
+
         log::debug!(
             "rdd id {:?}, secure: {:?}",
             rdd_base.get_rdd_id(),
@@ -307,26 +318,20 @@ where
 
             let split = rdd_base.splits()[partition].clone();
             log::debug!("split index: {}", split.get_index());
-            let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
+            let handles = rdd_base
+                .iterator_raw(stage_id, split, &mut acc_arg, tx)
+                .unwrap();
 
             let num_output_splits = self.partitioner.get_num_of_partitions();
-            let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
-                .map(|_| Vec::new())
-                .collect::<Vec<_>>();
-            for block_ptr in rx {
-                let buckets_bls = get_encrypted_data::<Vec<Vec<(KE, CE)>>>(
-                    rdd_base.get_op_id(),
-                    dep_info,
-                    block_ptr as *mut u8,
-                );
-                acc_arg.free_enclave_lock();
+            let buckets_ptr = rx.recv().unwrap();
+            let mut buckets = get_encrypted_data::<Vec<(KE, CE)>>(
+                rdd_base.get_op_id(),
+                dep_info,
+                buckets_ptr as *mut u8,
+            );
+            acc_arg.free_enclave_lock();
+            buckets.resize(num_output_splits, Vec::new());
 
-                for buckets_bl in buckets_bls.into_iter() {
-                    for (i, bucket) in buckets_bl.into_iter().enumerate() {
-                        buckets[i].push(bucket);
-                    }
-                }
-            }
             for handle in handles {
                 handle.join().unwrap();
             }

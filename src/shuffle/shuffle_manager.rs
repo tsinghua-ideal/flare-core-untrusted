@@ -178,16 +178,20 @@ impl ShuffleService {
         let parts: Vec<_> = uri.path().split('/').collect();
         match parts.as_slice() {
             [_, endpoint] if *endpoint == "status" => Ok(ShuffleResponse::Status(StatusCode::OK)),
-            [_, endpoint, shuffle_id, input_id, reduce_id] if *endpoint == "shuffle" => Ok(
-                ShuffleResponse::CachedData(
-                    self.get_cached_data(uri, &[*shuffle_id, *input_id, *reduce_id])?,
-                ),
-            ),
+            [_, endpoint, s_id, input_id, reduce_id]
+                if *endpoint == "shuffle" || *endpoint == "sort" =>
+            {
+                Ok(ShuffleResponse::CachedData(self.get_cached_data(
+                    uri,
+                    &[*s_id, *input_id, *reduce_id],
+                    *endpoint == "sort",
+                )?))
+            }
             _ => Err(ShuffleError::UnexpectedUri(uri.path().to_string())),
         }
     }
 
-    fn get_cached_data(&self, uri: &Uri, parts: &[&str]) -> Result<Vec<u8>> {
+    fn get_cached_data(&self, uri: &Uri, parts: &[&str], is_sort: bool) -> Result<Vec<u8>> {
         // the path is: .../{shuffleid}/{inputid}/{reduceid}
         let parts: Vec<_> = match parts
             .iter()
@@ -200,15 +204,20 @@ impl ShuffleService {
             Ok(parts) => parts,
         };
         let params = &(parts[0], parts[1], parts[2]);
-        if let Some(cached_data) = env::SHUFFLE_CACHE.get(params) {
-            log::debug!(
-                "got a request @ `{}`, params: {:?}, returning data",
-                uri,
-                params
-            );
-            Ok(Vec::from(&cached_data[..]))
+        if is_sort {
+            if let Some(cached_data) = env::SORT_CACHE.get(params) {
+                log::debug!("got a request @ `{}`, params: {:?}", uri, params);
+                Ok(Vec::from(&cached_data[..]))
+            } else {
+                Err(ShuffleError::RequestedCacheNotFound)
+            }
         } else {
-            Err(ShuffleError::RequestedCacheNotFound)
+            if let Some(cached_data) = env::SHUFFLE_CACHE.get(params) {
+                log::debug!("got a request @ `{}`, params: {:?}", uri, params);
+                Ok(Vec::from(&cached_data[..]))
+            } else {
+                Err(ShuffleError::RequestedCacheNotFound)
+            }
         }
     }
 

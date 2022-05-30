@@ -26,51 +26,60 @@ pub(crate) trait NativeScheduler: Send + Sync {
         jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<Option<Vec<U>>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         L: JobListener,
     {
         if jt.final_stage.parents.is_empty() && (jt.num_output_parts == 1) {
             let final_rdd_id = jt.final_rdd.get_rdd_id();
             STAGE_LOCK.insert_stage((final_rdd_id, final_rdd_id, 0), 0);
-            STAGE_LOCK.set_num_splits((final_rdd_id, final_rdd_id, 0), jt.final_rdd.number_of_splits());
+            STAGE_LOCK.set_num_splits(
+                (final_rdd_id, final_rdd_id, 0),
+                jt.final_rdd.number_of_splits(),
+            );
             let split = (jt.final_rdd.splits()[jt.output_parts[0]]).clone();
             let task_context = TaskContext::new(jt.final_stage.id, jt.output_parts[0], 0);
             let now = Instant::now();
             let func = jt.func.clone();
+            let stage_id = jt.final_stage.id;
             let final_rdd = jt.final_rdd.clone();
             let action_id = jt.action_id.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let res = Ok(Some(vec![(&func)((
                     task_context,
                     match final_rdd.get_secure() {
-                        true => (
-                            Box::new(Vec::new().into_iter()),
-                            {    
-                                STAGE_LOCK.get_stage_lock((final_rdd_id, final_rdd_id, 0)); 
-                                let dep_info = DepInfo::padding_new(0);          
-                                let res = match final_rdd.secure_iterator(split, dep_info, action_id) {
-                                    Ok(r) => r,
-                                    Err(_) => Box::new(Vec::new().into_iter()),
-                                };
-                                STAGE_LOCK.free_stage_lock();
-                                res
-                            }
-                        ),
+                        true => (Box::new(Vec::new().into_iter()), {
+                            STAGE_LOCK.get_stage_lock((final_rdd_id, final_rdd_id, 0));
+                            let dep_info = DepInfo::padding_new(0);
+                            let res = match final_rdd
+                                .secure_iterator(stage_id, split, dep_info, action_id)
+                            {
+                                Ok(r) => r,
+                                Err(_) => Box::new(Vec::new().into_iter()),
+                            };
+                            STAGE_LOCK.free_stage_lock();
+                            res
+                        }),
                         false => (
                             match final_rdd.iterator(split.clone()) {
                                 Ok(r) => r,
                                 Err(_) => Box::new(Vec::new().into_iter()),
-                            }, 
-                            Box::new(Vec::new().into_iter()), 
+                            },
+                            Box::new(Vec::new().into_iter()),
                         ),
-                    }
+                    },
                 ))]));
-    
+
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9;
                 println!("result_task(allow local) {:?}s", dur);
-                
+
                 res
-            }).await?;
+            })
+            .await?;
             STAGE_LOCK.remove_stage((final_rdd_id, final_rdd_id, 0), 0);
             res
         } else {
@@ -127,8 +136,14 @@ pub(crate) trait NativeScheduler: Send + Sync {
             log::debug!("cache locs: {:?}", locs);
             // For entirely not cached rdd, locs == None
             // For partially not cached rdd, locs == Some(Vec<_>), some elements of the vec is empty
-            let rdd_has_uncached_partitions = locs.is_none() || 
-                locs.unwrap().into_iter().filter(|x| x.is_empty()).collect::<Vec<_>>().len() > 0;
+            let rdd_has_uncached_partitions = locs.is_none()
+                || locs
+                    .unwrap()
+                    .into_iter()
+                    .filter(|x| x.is_empty())
+                    .collect::<Vec<_>>()
+                    .len()
+                    > 0;
             if rdd_has_uncached_partitions {
                 for dep in rdd.get_dependencies() {
                     log::debug!("for dep in missing stages ");
@@ -214,7 +229,12 @@ pub(crate) trait NativeScheduler: Send + Sync {
         failed_vals: FetchFailedVals,
         stage_id: usize,
     ) where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         L: JobListener,
     {
         let FetchFailedVals {
@@ -230,6 +250,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
         jt.running.lock().await.remove(&failed_stage);
         jt.failed.lock().await.insert(failed_stage);
         // TODO: logging
+        assert_eq!(server_uri, self.unregister_executor(stage_id, map_id));
         self.remove_output_loc_from_stage(shuffle_id, map_id, &server_uri);
         self.unregister_map_output(shuffle_id, map_id, server_uri);
         jt.failed
@@ -246,7 +267,12 @@ pub(crate) trait NativeScheduler: Send + Sync {
         jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<()>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         L: JobListener,
     {
         // TODO: logging
@@ -384,7 +410,12 @@ pub(crate) trait NativeScheduler: Send + Sync {
         jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<()>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         L: JobListener,
     {
         log::debug!("submitting stage #{}", stage.id);
@@ -414,7 +445,12 @@ pub(crate) trait NativeScheduler: Send + Sync {
         jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<()>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         L: JobListener,
     {
         let mut pending_tasks = jt.pending_tasks.lock().await;
@@ -423,6 +459,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
             .or_insert_with(BTreeSet::new);
         if stage == jt.final_stage {
             log::debug!("final stage #{}", stage.id);
+            self.alloc_executor_map_entry(jt.final_stage.id, jt.num_output_parts);
             for (id_in_job, (id, part)) in jt
                 .output_parts
                 .iter()
@@ -444,6 +481,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
                 );
                 let task = Box::new(result_task.clone()) as Box<dyn TaskBase>;
                 let executor = self.next_executor_server(&*task);
+                self.register_executor(stage.id, *part, executor);
                 my_pending.insert(task);
                 self.submit_task::<T, TE, U, F>(
                     TaskOption::ResultTask(Box::new(result_task)),
@@ -452,6 +490,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
                 )
             }
         } else {
+            self.alloc_executor_map_entry(stage.id, stage.num_partitions);
             for p in 0..stage.num_partitions {
                 log::debug!("shuffle stage #{}", stage.id);
                 if stage.output_locs[p].is_empty() {
@@ -476,6 +515,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
                     );
                     let task = Box::new(shuffle_map_task.clone()) as Box<dyn TaskBase>;
                     let executor = self.next_executor_server(&*task);
+                    self.register_executor(stage.id, p, executor);
                     my_pending.insert(task);
                     self.submit_task::<T, TE, U, F>(
                         TaskOption::ShuffleMapTask(Box::new(shuffle_map_task)),
@@ -507,7 +547,12 @@ pub(crate) trait NativeScheduler: Send + Sync {
         id_in_job: usize,
         target_executor: SocketAddrV4,
     ) where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U;
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U;
 
     // mutators:
     fn add_output_loc_to_stage(&self, stage_id: usize, partition: usize, host: String);
@@ -518,6 +563,9 @@ pub(crate) trait NativeScheduler: Send + Sync {
     fn remove_output_loc_from_stage(&self, shuffle_id: usize, map_id: usize, server_uri: &str);
     async fn update_cache_locs(&self) -> Result<()>;
     fn unregister_map_output(&self, shuffle_id: usize, map_id: usize, server_uri: String);
+    fn alloc_executor_map_entry(&self, stage_id: usize, num_partitions: usize);
+    fn register_executor(&self, stage_id: usize, partition: usize, host: SocketAddrV4);
+    fn unregister_executor(&self, stage_id: usize, partition: usize) -> String;
 
     // getters:
     fn fetch_from_stage_cache(&self, id: usize) -> Stage;
@@ -528,6 +576,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
     fn get_next_job_id(&self) -> usize;
     fn get_next_stage_id(&self) -> usize;
     fn get_next_task_id(&self) -> usize;
+    fn get_shuffle_uri(&self, host: SocketAddrV4) -> String;
     fn next_executor_server(&self, rdd: &dyn TaskBase) -> SocketAddrV4;
 
     fn get_preferred_locs(&self, rdd: Arc<dyn RddBase>, partition: usize) -> Vec<Ipv4Addr> {
@@ -593,6 +642,27 @@ macro_rules! impl_common_scheduler_funcs {
         fn unregister_map_output(&self, shuffle_id: usize, map_id: usize, server_uri: String) {
             self.map_output_tracker
                 .unregister_map_output(shuffle_id, map_id, server_uri)
+        }
+
+        #[inline]
+        fn alloc_executor_map_entry(&self, stage_id: usize, num_partitions: usize) {
+            self.map_output_tracker
+                .alloc_executor_map_entry(stage_id, num_partitions)
+        }
+
+        #[inline]
+        fn register_executor(&self, stage_id: usize, partition: usize, host: SocketAddrV4) {
+            self.map_output_tracker.register_executor(
+                stage_id,
+                partition,
+                self.get_shuffle_uri(host),
+            )
+        }
+
+        #[inline]
+        fn unregister_executor(&self, stage_id: usize, partition: usize) -> String {
+            self.map_output_tracker
+                .unregister_executor(stage_id, partition)
         }
 
         #[inline]

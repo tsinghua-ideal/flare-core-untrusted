@@ -1,5 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
 use std::collections::LinkedList;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::thread;
@@ -65,12 +65,12 @@ pub(crate) enum CacheTrackerMessageReply {
 #[derive(Debug)]
 pub(crate) struct CacheTracker {
     is_master: bool,
-    locs: DashMap<usize, Vec<LinkedList<Ipv4Addr>>>,  //(rdd, partition) -> LinkedList
+    locs: DashMap<usize, Vec<LinkedList<Ipv4Addr>>>, //(rdd, partition) -> LinkedList
     slave_capacity: DashMap<Ipv4Addr, usize>,
     slave_usage: DashMap<Ipv4Addr, usize>,
     registered_rdd_ids: DashSet<usize>,
-    loading: DashSet<(usize, usize)>,   // (rdd, partition)
-    sloading: DashSet<(usize, usize)>,  // (cached_rdd_id, part_id)
+    loading: DashSet<(usize, usize)>,  // (rdd, partition)
+    sloading: DashSet<(usize, usize)>, // (cached_rdd_id, part_id)
     cache: KeySpace<'static>,
     master_addr: SocketAddr,
 }
@@ -335,12 +335,7 @@ impl CacheTracker {
         self.cache.sget(rdd_id, part_id)
     }
 
-    pub fn put_sdata(
-        &self,
-        key: (usize, usize),
-        value: *mut u8,
-        avoid_moving: usize,
-    ) {
+    pub fn put_sdata(&self, key: (usize, usize), value: *mut u8, avoid_moving: usize) {
         let (rdd_id, part_id) = key;
         let put_response = self.cache.sput(rdd_id, part_id, value, avoid_moving);
         if let CachePutResponse::CachePutSuccess(size) = put_response {

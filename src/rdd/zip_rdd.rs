@@ -103,6 +103,7 @@ where
 
     fn secure_compute_prev(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
@@ -114,11 +115,16 @@ where
         let dep_info = DepInfo::padding_new(0);
         let fst = self
             .first
-            .secure_iterator(current_split.fst_split.clone(), dep_info.clone(), None)?
+            .secure_iterator(
+                stage_id,
+                current_split.fst_split.clone(),
+                dep_info.clone(),
+                None,
+            )?
             .collect::<Vec<_>>();
         let sec = self
             .second
-            .secure_iterator(current_split.sec_split.clone(), dep_info, None)?
+            .secure_iterator(stage_id, current_split.sec_split.clone(), dep_info, None)?
             .collect::<Vec<_>>();
 
         let data = self.secure_zip((fst, sec), acc_arg);
@@ -240,11 +246,12 @@ where
 
     fn iterator_raw(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
-        self.secure_compute(split, acc_arg, tx)
+        self.secure_compute(stage_id, split, acc_arg, tx)
     }
 
     fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
@@ -287,6 +294,7 @@ where
 
     fn secure_compute(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
@@ -303,11 +311,11 @@ where
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
-                handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
+                handles.append(&mut self.secure_compute_prev(stage_id, split, acc_arg, tx)?);
             }
             Ok(handles)
         } else {
-            self.secure_compute_prev(split, acc_arg, tx)
+            self.secure_compute_prev(stage_id, split, acc_arg, tx)
         }
     }
 

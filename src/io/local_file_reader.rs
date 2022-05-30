@@ -463,11 +463,12 @@ macro_rules! impl_common_lfs_rddb_funcs {
 
         fn iterator_raw(
             &self,
+            stage_id: usize,
             split: Box<dyn Split>,
             acc_arg: &mut AccArg,
             tx: SyncSender<usize>,
         ) -> Result<Vec<JoinHandle<()>>> {
-            self.secure_compute(split, acc_arg, tx)
+            self.secure_compute(stage_id, split, acc_arg, tx)
         }
 
         default fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
@@ -580,6 +581,7 @@ where
 
     fn secure_compute(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
@@ -638,6 +640,7 @@ where
 
     fn secure_compute(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,

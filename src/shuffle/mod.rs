@@ -52,6 +52,12 @@ pub enum ShuffleError {
     #[error("failed fetching shuffle data uris")]
     FailFetchingShuffleUris { source: Box<crate::Error> },
 
+    #[error("failed checking other nodes ready")]
+    FailCheckingReady,
+
+    #[error("failed getting maximum cnt per partition")]
+    FailGettingMaxCnt,
+
     #[error("unrecognized error (todo!)")]
     Other,
 }

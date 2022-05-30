@@ -16,6 +16,7 @@ use crate::dependency::{
 };
 use crate::env::{Env, BOUNDED_MEM_CACHE, RDDB_MAP};
 use crate::error::Result;
+use crate::map_output_tracker::GetServerUriReq;
 use crate::partitioner::Partitioner;
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data};
@@ -145,13 +146,14 @@ where
 
     fn secure_compute_prev(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
         if let Ok(split) = split.downcast::<CoGroupSplit>() {
+            let mut has_shuffle = false;
             let mut deps = split.clone().deps;
-            let mut num_sub_part = vec![0, 0]; //kv, kw
             let mut kv = (Vec::new(), Vec::new());
             match deps.remove(0) {
                 //rdd0
@@ -164,72 +166,48 @@ where
                         None,
                         Arc::new(AtomicBool::new(false)),
                     );
-                    let caching = acc_arg_cg.is_caching_final_rdd();
-                    let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?; //TODO need sorted
-                    let mut kv_0 = Vec::new();
+                    let handles = rdd.iterator_raw(stage_id, split, &mut acc_arg_cg, tx)?;
 
-                    for received in rx {
-                        let result_bl = get_encrypted_data::<(KE, VE)>(
-                            rdd.get_op_id(),
-                            acc_arg_cg.dep_info,
-                            received as *mut u8,
-                        );
-                        acc_arg_cg.free_enclave_lock();
-                        kv_0.push(*result_bl);
-                    }
+                    let received = rx.recv().unwrap();
+                    kv.0 = *get_encrypted_data::<(KE, VE)>(
+                        rdd.get_op_id(),
+                        acc_arg_cg.dep_info,
+                        received as *mut u8,
+                    );
+                    acc_arg_cg.free_enclave_lock();
 
-                    if caching {
-                        let size = kv_0.get_size();
-                        let data_ptr = Box::into_raw(Box::new(kv_0.clone()));
+                    if acc_arg_cg.is_caching_final_rdd() {
+                        let size = kv.0.get_size();
+                        let data_ptr = Box::into_raw(Box::new(kv.0.clone()));
                         Env::get().cache_tracker.put_sdata(
                             (rdd.get_rdd_id(), part_id),
                             data_ptr as *mut u8,
                             size,
                         );
                     }
-                    //TODO: pre_merge
-
-                    for sub_part in kv_0 {
-                        let sub_part_len = sub_part.len();
-                        if sub_part_len > 0 {
-                            num_sub_part[0] += 1;
-                            kv.0.push(sub_part);
-                        }
-                    }
                     for handle in handles {
                         handle.join().unwrap();
                     }
+                    if kv.0.is_empty() {
+                        return Ok(Vec::new());
+                    }
+
+                    //TODO need to sort kv.0
+                    unimplemented!();
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
+                    has_shuffle = true;
                     //TODO need revision if fe & fd of group_by is passed
-                    let fut =
-                        ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
-                    let kv_1 = futures::executor::block_on(fut)?
+                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(
+                        GetServerUriReq::PrevStage(shuffle_id),
+                        split.get_index(),
+                        usize::MAX,
+                    );
+                    kv.1 = futures::executor::block_on(fut)?
                         .into_iter()
                         .collect::<Vec<_>>();
-                    //pre_merge
-                    let parent_rdd_id = self.rdd0.get_rdd_id();
-                    let parent_op_id = self.rdd0.get_op_id();
-                    let dep_info = DepInfo::new(
-                        1,
-                        0,
-                        parent_rdd_id,
-                        self.vals.id,
-                        parent_op_id,
-                        self.vals.op_id,
-                    );
-                    println!("bucket size before pre_merge: {:?}", kv_1.get_size());
-                    acc_arg.get_enclave_lock();
-                    let kv_1 = wrapper_pre_merge(parent_op_id, kv_1, dep_info);
-                    acc_arg.free_enclave_lock();
-                    println!("bucket size after pre_merge: {:?}", kv_1.get_size());
-                    //
-                    for sub_part in kv_1 {
-                        let sub_part_len = sub_part.len();
-                        if sub_part_len > 0 {
-                            num_sub_part[0] += 1;
-                            kv.1.push(sub_part);
-                        }
+                    if kv.1.iter().map(|x| x.len()).sum::<usize>() == 0 {
+                        return Ok(Vec::new());
                     }
                 }
             };
@@ -246,84 +224,62 @@ where
                         None,
                         Arc::new(AtomicBool::new(false)),
                     );
-                    let caching = acc_arg_cg.is_caching_final_rdd();
-                    let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?; //TODO need sorted
-                    let mut kw_0 = Vec::new();
+                    let handles = rdd.iterator_raw(stage_id, split, &mut acc_arg_cg, tx)?;
 
-                    for received in rx {
-                        let result_bl = get_encrypted_data::<(KE, WE)>(
-                            rdd.get_op_id(),
-                            acc_arg_cg.dep_info,
-                            received as *mut u8,
-                        );
-                        acc_arg_cg.free_enclave_lock();
-                        kw_0.push(*result_bl);
-                    }
+                    let received = rx.recv().unwrap();
+                    kw.0 = *get_encrypted_data::<(KE, WE)>(
+                        rdd.get_op_id(),
+                        acc_arg_cg.dep_info,
+                        received as *mut u8,
+                    );
+                    acc_arg_cg.free_enclave_lock();
 
-                    if caching {
-                        let size = kw_0.get_size();
-                        let data_ptr = Box::into_raw(Box::new(kw_0.clone()));
+                    if acc_arg_cg.is_caching_final_rdd() {
+                        let size = kw.0.get_size();
+                        let data_ptr = Box::into_raw(Box::new(kw.0.clone()));
                         Env::get().cache_tracker.put_sdata(
                             (rdd.get_rdd_id(), part_id),
                             data_ptr as *mut u8,
                             size,
                         );
                     }
-                    //TODO: pre_merge
-
-                    for sub_part in kw_0 {
-                        let sub_part_len = sub_part.len();
-                        if sub_part_len > 0 {
-                            num_sub_part[1] += 1;
-                            kw.0.push(sub_part);
-                        }
-                    }
                     for handle in handles {
                         handle.join().unwrap();
                     }
+                    if kw.0.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    //TODO need to sort kw.0
+                    unimplemented!();
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
+                    has_shuffle = true;
                     //TODO need revision if fe & fd of group_by is passed
-                    let fut =
-                        ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
-                    let kw_1 = futures::executor::block_on(fut)?
+                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(
+                        GetServerUriReq::PrevStage(shuffle_id),
+                        split.get_index(),
+                        usize::MAX,
+                    );
+                    kw.1 = futures::executor::block_on(fut)?
                         .into_iter()
                         .collect::<Vec<_>>();
-                    //pre_merge
-                    let parent_rdd_id = self.rdd1.get_rdd_id();
-                    let parent_op_id = self.rdd1.get_op_id();
-                    let dep_info = DepInfo::new(
-                        1,
-                        1,
-                        parent_rdd_id,
-                        self.vals.id,
-                        parent_op_id,
-                        self.vals.op_id,
-                    );
-                    println!("bucket size before pre_merge: {:?}", kw_1.get_size());
-                    acc_arg.get_enclave_lock();
-                    let kw_1 = wrapper_pre_merge(parent_op_id, kw_1, dep_info);
-                    acc_arg.free_enclave_lock();
-                    println!("bucket size after pre_merge: {:?}", kw_1.get_size());
-                    //
-                    for sub_part in kw_1 {
-                        let sub_part_len = sub_part.len();
-                        if sub_part_len > 0 {
-                            num_sub_part[1] += 1;
-                            kw.1.push(sub_part);
-                        }
+                    if kw.1.iter().map(|x| x.len()).sum::<usize>() == 0 {
+                        return Ok(Vec::new());
                     }
                 }
             }
             let data = (kv.0, kv.1, kw.0, kw.1);
-            if num_sub_part[0] == 0 || num_sub_part[1] == 0 {
-                return Ok(Vec::new());
-            }
-            //shuffle read
+            //column sort
             let now = Instant::now();
-            let data = self.secure_shuffle_read(data, acc_arg);
+            let data = self.secure_column_sort(stage_id, data, acc_arg);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("***in co grouped rdd, shuffle read, total {:?}***", dur);
+            println!("***in co grouped rdd, column sort, total {:?}***", dur);
+
+            //shuffle read
+            // let now = Instant::now();
+            // let data = self.secure_shuffle_read(data, acc_arg);
+            // let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            // println!("***in co grouped rdd, shuffle read, total {:?}***", dur);
 
             let acc_arg = acc_arg.clone();
             let handle = std::thread::spawn(move || {
@@ -338,6 +294,75 @@ where
                 "Got split object from different concrete type other than CoGroupSplit",
             ))
         }
+    }
+
+    fn secure_column_sort(
+        &self,
+        stage_id: usize,
+        buckets: (
+            Vec<(KE, VE)>,
+            Vec<Vec<(KE, Vec<u8>)>>,
+            Vec<(KE, WE)>,
+            Vec<Vec<(KE, Vec<u8>)>>,
+        ),
+        acc_arg: &mut AccArg,
+    ) -> Vec<(KE, (CE, DE))> {
+        //need split_num fix first
+        wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
+
+        let cur_rdd_ids = vec![self.vals.id];
+        let cur_op_ids = vec![self.vals.op_id];
+        let reduce_id = *acc_arg.part_ids.last().unwrap();
+        let cur_part_ids = vec![reduce_id];
+        //step 1: sort + step 2: shuffle (transpose)
+        let fetched_data = {
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(20);
+            let result_ptr = wrapper_secure_execute(
+                &cur_rdd_ids,
+                &cur_op_ids,
+                &cur_part_ids,
+                Default::default(),
+                dep_info,
+                &buckets,
+                &acc_arg.captured_vars,
+            );
+            let buckets = get_encrypted_data::<Vec<(KE, (CE, DE))>>(
+                cur_op_ids[0],
+                dep_info,
+                result_ptr as *mut u8,
+            );
+            acc_arg.free_enclave_lock();
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let ser_bytes = bincode::serialize(&bucket).unwrap();
+                log::debug!(
+                    "during step 2. bucket #{} in stage id #{}, partition #{}: {:?}",
+                    i,
+                    stage_id,
+                    reduce_id,
+                    bucket
+                );
+                env::SORT_CACHE.insert((stage_id, reduce_id, i), ser_bytes);
+            }
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 2))
+                .unwrap();
+            let fut = ShuffleFetcher::secure_fetch::<KE, (CE, DE)>(
+                GetServerUriReq::CurStage(stage_id),
+                reduce_id,
+                usize::MAX,
+            );
+            futures::executor::block_on(fut)
+                .unwrap()
+                .collect::<Vec<_>>()
+        };
+        log::debug!(
+            "step 2 finished. partition = {:?}, data = {:?}",
+            reduce_id,
+            fetched_data
+        );
+        //step 3 - 8
+        let data = ShuffleFetcher::fetch_sort::<KE, (CE, DE)>(fetched_data, stage_id, acc_arg);
+        data
     }
 
     fn secure_shuffle_read(
@@ -530,11 +555,12 @@ where
 
     fn iterator_raw(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
-        self.secure_compute(split, acc_arg, tx)
+        self.secure_compute(stage_id, split, acc_arg, tx)
     }
 
     fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
@@ -653,6 +679,7 @@ where
 
     fn secure_compute(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
@@ -669,11 +696,11 @@ where
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
-                handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
+                handles.append(&mut self.secure_compute_prev(stage_id, split, acc_arg, tx)?);
             }
             Ok(handles)
         } else {
-            self.secure_compute_prev(split, acc_arg, tx)
+            self.secure_compute_prev(stage_id, split, acc_arg, tx)
         }
     }
 }

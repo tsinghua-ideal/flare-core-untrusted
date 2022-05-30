@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::dependency::ShuffleDependencyTrait;
 use crate::map_output_tracker::MapOutputTracker;
 use crate::partial::{ApproximateActionListener, ApproximateEvaluator, PartialResult};
-use crate::rdd::{RddE, RddBase, OpId};
+use crate::rdd::{OpId, RddBase, RddE};
 use crate::scheduler::{
     listener::{JobEndListener, JobStartListener},
     CompletionEvent, EventQueue, Job, JobListener, JobTracker, LiveListenerBus, NativeScheduler,
@@ -96,7 +96,12 @@ impl LocalScheduler {
         timeout: Duration,
     ) -> Result<PartialResult<R>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
         R: Clone + Debug + Send + Sync + 'static,
     {
@@ -151,7 +156,12 @@ impl LocalScheduler {
         allow_local: bool,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
     {
         // acquiring lock so that only one job can run at same time this lock is just
         // a temporary patch for preventing multiple jobs to update cache locks which affects
@@ -181,12 +191,17 @@ impl LocalScheduler {
         jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         L: JobListener,
     {
         // TODO: update cache
         self.update_cache_locs().await?;
-        
+
         if allow_local {
             if let Some(result) = LocalScheduler::local_execution(jt.clone()).await? {
                 return Ok(result);
@@ -276,7 +291,12 @@ impl LocalScheduler {
         _id_in_job: usize,
         attempt_id: usize,
     ) where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
     {
         let now = Instant::now();
         let des_task: TaskOption = bincode::deserialize(&task).unwrap();
@@ -347,7 +367,12 @@ impl NativeScheduler for LocalScheduler {
         id_in_job: usize,
         _server_address: SocketAddrV4,
     ) where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
     {
         log::debug!("inside submit task");
         let my_attempt_id = self.attempt_id.fetch_add(1, Ordering::SeqCst);
@@ -360,6 +385,10 @@ impl NativeScheduler for LocalScheduler {
         tokio::task::spawn_blocking(move || {
             LocalScheduler::run_task::<T, TE, U, F>(event_queues, task, id_in_job, my_attempt_id)
         });
+    }
+
+    fn get_shuffle_uri(&self, _host: SocketAddrV4) -> String {
+        env::Env::get().shuffle_manager.get_server_uri()
     }
 
     fn next_executor_server(&self, _rdd: &dyn TaskBase) -> SocketAddrV4 {

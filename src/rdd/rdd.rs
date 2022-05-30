@@ -105,6 +105,16 @@ extern "C" {
         dep_info: DepInfo,
         input: Input,
     ) -> sgx_status_t;
+    pub fn get_cnt_per_partition(
+        eid: sgx_enclave_id_t,
+        retval: *mut usize,
+        op_id: OpId,
+    ) -> sgx_status_t;
+    pub fn set_cnt_per_partition(
+        eid: sgx_enclave_id_t,
+        op_id: OpId,
+        cnt_per_partition: usize,
+    ) -> sgx_status_t;
     pub fn free_res_enc(
         eid: sgx_enclave_id_t,
         op_id: OpId,
@@ -312,10 +322,47 @@ pub fn wrapper_pre_merge<T: Data>(
             panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
         }
     };
-    let mut data = get_encrypted_data::<Vec<Vec<T>>>(op_id, dep_info, result_ptr as *mut u8);
+    let mut data = get_encrypted_data::<Vec<T>>(op_id, dep_info, result_ptr as *mut u8);
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("pre_merge total {:?}s", dur);
-    data.remove(0)
+    *data
+}
+
+pub fn wrapper_get_cnt_per_partition(op_id: OpId) -> usize {
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
+    let mut cnt_per_partition: usize = 0;
+    let sgx_status = unsafe { get_cnt_per_partition(eid, &mut cnt_per_partition, op_id) };
+    match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {}
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        }
+    };
+    cnt_per_partition
+}
+
+pub fn wrapper_set_cnt_per_partition(op_id: OpId, cnt_per_partition: usize) {
+    let eid = Env::get()
+        .enclave
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .geteid();
+    let mut cnt_per_partition: usize = 0;
+    let sgx_status = unsafe { set_cnt_per_partition(eid, op_id, cnt_per_partition) };
+    match sgx_status {
+        sgx_status_t::SGX_SUCCESS => {}
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
+        }
+    };
 }
 
 pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, is_local: bool) -> usize {
@@ -879,7 +926,8 @@ impl AccArg {
     }
 
     pub fn is_caching_final_rdd(&self) -> bool {
-        self.rdd_ids.is_empty()
+        *self.part_ids.first().unwrap() != usize::MAX
+            && *self.rdd_ids.first().unwrap() == self.caching_rdd_id
     }
 
     pub fn get_enclave_lock(&self) {
@@ -1278,6 +1326,7 @@ pub trait RddBase: Send + Sync + Serialize + Deserialize {
     }
     fn iterator_raw(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
@@ -1348,11 +1397,14 @@ impl<I: RddE + ?Sized> RddBase for SerArc<I> {
     }
     fn iterator_raw(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
-        (**self).get_rdd_base().iterator_raw(split, acc_arg, tx)
+        (**self)
+            .get_rdd_base()
+            .iterator_raw(stage_id, split, acc_arg, tx)
     }
     fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
         (**self).get_rdd_base().iterator_any(split)
@@ -1378,11 +1430,12 @@ impl<I: RddE + ?Sized> Rdd for SerArc<I> {
     }
     fn secure_compute(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
-        (**self).secure_compute(split, acc_arg, tx)
+        (**self).secure_compute(stage_id, split, acc_arg, tx)
     }
 }
 
@@ -1432,6 +1485,7 @@ pub trait Rdd: RddBase + 'static {
 
     fn secure_compute(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
@@ -1457,6 +1511,7 @@ pub trait RddE: Rdd {
 
     fn secure_iterator(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         dep_info: DepInfo,
         action_id: Option<OpId>,
@@ -1469,22 +1524,17 @@ pub trait RddE: Rdd {
         if let Some(action_id) = action_id {
             acc_arg.insert_quadruple(rdd_id, action_id, usize::MAX, usize::MAX);
         }
-        let caching = acc_arg.is_caching_final_rdd();
-        let handles = self.secure_compute(split, &mut acc_arg, tx)?;
+        let handles = self.secure_compute(stage_id, split, &mut acc_arg, tx)?;
 
-        let mut result = Vec::new();
-        for received in rx {
-            let mut result_bl =
-                get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8);
-            acc_arg.free_enclave_lock();
-            result.append(result_bl.borrow_mut());
-        }
+        let received = rx.recv().unwrap();
+        let result = get_encrypted_data::<Self::ItemE>(op_id, dep_info, received as *mut u8);
+        acc_arg.free_enclave_lock();
 
         for handle in handles {
             handle.join().unwrap();
         }
 
-        if caching {
+        if acc_arg.is_caching_final_rdd() {
             let size = result.get_size();
             let data_ptr = Box::into_raw(Box::new(result.clone()));
             Env::get()

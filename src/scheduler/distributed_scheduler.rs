@@ -13,7 +13,7 @@ use crate::env;
 use crate::error::{Error, NetworkError, Result};
 use crate::map_output_tracker::MapOutputTracker;
 use crate::partial::{ApproximateActionListener, ApproximateEvaluator, PartialResult};
-use crate::rdd::{RddE, RddBase, OpId};
+use crate::rdd::{OpId, RddBase, RddE};
 use crate::scheduler::{
     listener::{JobEndListener, JobStartListener},
     CompletionEvent, EventQueue, Job, JobListener, JobTracker, LiveListenerBus, NativeScheduler,
@@ -61,6 +61,7 @@ pub(crate) struct DistributedScheduler {
     slaves_with_executors: HashSet<String>,
     server_uris: Arc<Mutex<VecDeque<SocketAddrV4>>>,
     port: u16,
+    shuffle_uris_map: HashMap<SocketAddrV4, String>,
     map_output_tracker: MapOutputTracker,
     // TODO: fix proper locking mechanism
     scheduler_lock: Arc<Mutex<bool>>,
@@ -72,6 +73,7 @@ impl DistributedScheduler {
         max_failures: usize,
         master: bool,
         servers: Option<Vec<SocketAddrV4>>,
+        shuffle_uris_map: HashMap<SocketAddrV4, String>,
         port: u16,
     ) -> Self {
         log::debug!(
@@ -109,6 +111,7 @@ impl DistributedScheduler {
                 Arc::new(Mutex::new(VecDeque::new()))
             },
             port,
+            shuffle_uris_map,
             map_output_tracker: env::Env::get().map_output_tracker.clone(),
             scheduler_lock: Arc::new(Mutex::new(true)),
             live_listener_bus,
@@ -126,7 +129,12 @@ impl DistributedScheduler {
         timeout: Duration,
     ) -> Result<PartialResult<R>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
         R: Clone + Debug + Send + Sync + 'static,
     {
@@ -181,7 +189,12 @@ impl DistributedScheduler {
         allow_local: bool,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
     {
         // acquiring lock so that only one job can run at same time this lock is just
         // a temporary patch for preventing multiple jobs to update cache locks which affects
@@ -211,7 +224,12 @@ impl DistributedScheduler {
         jt: Arc<JobTracker<F, U, T, TE, L>>,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         L: JobListener,
     {
         // TODO: update cache
@@ -304,7 +322,12 @@ impl DistributedScheduler {
         task: TaskOption,
         target_port: u16,
     ) where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
         R: futures::AsyncRead + std::marker::Unpin,
     {
         let result: TaskResult = {
@@ -392,7 +415,12 @@ impl NativeScheduler for DistributedScheduler {
         _id_in_job: usize,
         target_executor: SocketAddrV4,
     ) where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+            ),
+        ) -> U,
     {
         if !env::Configuration::get().is_driver {
             return;
@@ -443,7 +471,8 @@ impl NativeScheduler for DistributedScheduler {
                         break;
                     }
                     Err(_) => {
-                        if num_retries > 5000 { //100s
+                        if num_retries > 5000 {
+                            //100s
                             panic!("executor @{} not initialized", target_executor.port());
                         }
                         tokio::time::delay_for(Duration::from_millis(20)).await;
@@ -453,6 +482,10 @@ impl NativeScheduler for DistributedScheduler {
                 }
             }
         });
+    }
+
+    fn get_shuffle_uri(&self, host: SocketAddrV4) -> String {
+        self.shuffle_uris_map.get(&host).unwrap().clone()
     }
 
     fn next_executor_server(&self, task: &dyn TaskBase) -> SocketAddrV4 {

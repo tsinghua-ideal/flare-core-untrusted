@@ -86,6 +86,7 @@ where
 
     fn secure_compute_prev(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
@@ -105,28 +106,46 @@ where
                     .or(Err(Error::DowncastFailure("UnionSplit")))?;
                 let split = part.parent_partition();
                 let parent = &rdds[part.parent_rdd_index];
-                let handles = parent.secure_compute(split, acc_arg, tx)?;
+                let handles = parent.secure_compute(stage_id, split, acc_arg, tx)?;
                 Ok(handles)
             }
             PartitionerAware { rdds, .. } => {
                 let split = split
                     .downcast::<PartitionerAwareUnionSplit>()
                     .or(Err(Error::DowncastFailure("PartitionerAwareUnionSplit")))?;
+                let part_id = split.get_index();
+                let eenter_lock = Arc::new(AtomicBool::new(false));
                 let iter = rdds.iter().zip(split.parents(&rdds)).collect::<Vec<_>>();
-                let mut handles = Vec::new();
-                for (rdd, p) in iter.into_iter() {
-                    let rdd = rdd.clone();
-                    let mut acc_arg = acc_arg.clone();
-                    //refresh block_len, because parent rdds may have different lineage
-                    let (tx_un, rx_un) = sync_channel(0);
-                    let mut handle = rdd.secure_compute(p.clone(), &mut acc_arg, tx_un).unwrap();
-                    for received in rx_un {
-                        tx.send(received)
+                let results = iter
+                    .into_iter()
+                    .map(|(rdd, p)| {
+                        let rdd = rdd.clone();
+                        let dep_info = DepInfo::padding_new(0);
+                        let acc_arg = AccArg::new(part_id, dep_info, None, eenter_lock.clone());
+                        let (tx_un, rx_un) = sync_channel(0);
+                        let mut handle = rdd
+                            .secure_compute(stage_id, p.clone(), &mut acc_arg, tx_un)
                             .unwrap();
-                    }
-                    handles.append(&mut handle)
-                }
-                Ok(handles)
+                        let received = rx_un.recv().unwrap();
+                        let result = get_encrypted_data::<TE>(
+                            rdd.get_op_id(),
+                            dep_info,
+                            received as *mut u8,
+                        );
+                        acc_arg.free_enclave_lock();
+                        result.into_iter()
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>();
+                //start execution from union rdd
+                let acc_arg = acc_arg.clone();
+                let handle = thread::spawn(move || {
+                    let now = Instant::now();
+                    let wait = start_execute(acc_arg, results, tx);
+                    let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
+                    println!("***in union rdd, compute, total {:?}***", dur);
+                });
+                Ok(vec![handle])
             }
         }
     }
@@ -441,11 +460,12 @@ impl<T: Data, TE: Data> RddBase for UnionRdd<T, TE> {
 
     fn iterator_raw(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
-        self.secure_compute(split, acc_arg, tx)
+        self.secure_compute(stage_id, split, acc_arg, tx)
     }
 
     fn iterator_any(&self, split: Box<dyn Split>) -> Result<Box<dyn AnyData>> {
@@ -497,6 +517,7 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
 
     fn secure_compute(
         &self,
+        stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
@@ -513,11 +534,11 @@ impl<T: Data, TE: Data> Rdd for UnionRdd<T, TE> {
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
-                handles.append(&mut self.secure_compute_prev(split, acc_arg, tx)?);
+                handles.append(&mut self.secure_compute_prev(stage_id, split, acc_arg, tx)?);
             }
             Ok(handles)
         } else {
-            self.secure_compute_prev(split, acc_arg, tx)
+            self.secure_compute_prev(stage_id, split, acc_arg, tx)
         }
     }
 }

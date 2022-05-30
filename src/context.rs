@@ -1,4 +1,5 @@
 use core::panic::Location;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs;
 use std::io::Write;
@@ -24,12 +25,22 @@ use crate::scheduler::{DistributedScheduler, LocalScheduler, NativeScheduler, Ta
 use crate::serializable_traits::{Data, Func, SerFunc};
 use crate::serialized_data_capnp::serialized_data;
 use crate::{env, hosts, utils, Fn, SerArc};
+use capnp::{
+    message::{Builder as MsgBuilder, HeapAllocator, Reader as CpnpReader, ReaderOptions},
+    serialize::OwnedSegments,
+};
+
 use log::error;
 use once_cell::sync::OnceCell;
 use sgx_types::*;
 use simplelog::*;
 use uuid::Uuid;
 use Schedulers::*;
+
+const CAPNP_BUF_READ_OPTS: ReaderOptions = ReaderOptions {
+    traversal_limit_in_words: std::u64::MAX,
+    nesting_limit: 64,
+};
 
 extern "C" {
     fn clear_cache(eid: sgx_enclave_id_t) -> sgx_status_t;
@@ -387,6 +398,9 @@ impl Context {
             port += 5000;
         }
 
+        //the mapping from uri for task receiving to uri for
+        let shuffle_uris_map = Context::get_shuffle_uris(&address_map);
+
         Ok(Arc::new(Context {
             next_rdd_id: Arc::new(AtomicUsize::new(0)),
             next_shuffle_id: Arc::new(AtomicUsize::new(0)),
@@ -394,6 +408,7 @@ impl Context {
                 20,
                 true,
                 Some(address_map.clone()),
+                shuffle_uris_map,
                 10000,
             ))),
             address_map,
@@ -515,6 +530,53 @@ impl Context {
                 );
             }
         }
+    }
+
+    fn get_shuffle_uris(address_map: &[SocketAddrV4]) -> HashMap<SocketAddrV4, String> {
+        let mut uris = HashMap::new();
+        if env::Configuration::get().deployment_mode.is_local() {
+            return uris;
+        }
+
+        for socket_addr in address_map {
+            log::debug!(
+                "connect executor in {:?}:{:?} for shuffle uri",
+                socket_addr.ip(),
+                socket_addr.port()
+            );
+            loop {
+                if let Ok(mut stream) =
+                    TcpStream::connect(format!("{}:{}", socket_addr.ip(), socket_addr.port() + 10))
+                {
+                    let signal = bincode::serialize(&Signal::Detect).unwrap();
+                    let mut message = capnp::message::Builder::new_default();
+                    let mut task_data = message.init_root::<serialized_data::Builder>();
+                    task_data.set_msg(&signal);
+                    capnp::serialize::write_message(&mut stream, &message)
+                        .map_err(Error::OutputWrite)
+                        .unwrap();
+                    let uri = {
+                        let signal_data =
+                            capnp::serialize::read_message(&mut stream, CAPNP_BUF_READ_OPTS)
+                                .unwrap();
+                        bincode::deserialize::<String>(
+                            signal_data
+                                .get_root::<serialized_data::Reader>()
+                                .unwrap()
+                                .get_msg()
+                                .unwrap(),
+                        )
+                        .unwrap()
+                    };
+                    uris.insert(socket_addr.clone(), uri);
+                    break;
+                } else {
+                    let ten_millis = Duration::from_millis(20);
+                    std::thread::sleep(ten_millis);
+                }
+            }
+        }
+        uris
     }
 
     pub fn new_rdd_id(self: &Arc<Self>) -> usize {
