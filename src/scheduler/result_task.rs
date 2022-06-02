@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::dependency::DepInfo;
 use crate::env;
-use crate::rdd::{RddE, OpId, STAGE_LOCK};
+use crate::rdd::{ItemE, OpId, Rdd, STAGE_LOCK};
 use crate::scheduler::{Task, TaskBase, TaskContext};
 use crate::serializable_traits::{AnyData, Data};
 use crate::SerBox;
@@ -14,9 +14,14 @@ use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct ResultTask<T: Data, TE: Data, U: Data, F>
+pub(crate) struct ResultTask<T: Data, U: Data, F>
 where
-    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
+    F: Fn(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U
         + 'static
         + Send
         + Sync
@@ -29,7 +34,7 @@ where
     pub stage_id: usize,
     pinned: bool,
     #[serde(with = "serde_traitobject")]
-    pub rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+    pub rdd: Arc<dyn Rdd<Item = T>>,
     pub action_id: Option<OpId>,
     pub func: Arc<F>,
     pub partition: usize,
@@ -37,9 +42,14 @@ where
     pub output_id: usize,
 }
 
-impl<T: Data, TE: Data, U: Data, F> Display for ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> Display for ResultTask<T, U, F>
 where
-    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
+    F: Fn(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U
         + 'static
         + Send
         + Sync
@@ -52,9 +62,14 @@ where
     }
 }
 
-impl<T: Data, TE: Data, U: Data, F> ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> ResultTask<T, U, F>
 where
-    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
+    F: Fn(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U
         + 'static
         + Send
         + Sync
@@ -78,9 +93,14 @@ where
     }
 }
 
-impl<T: Data, TE: Data, U: Data, F> ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> ResultTask<T, U, F>
 where
-    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
+    F: Fn(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U
         + 'static
         + Send
         + Sync
@@ -92,7 +112,7 @@ where
         task_id: usize,
         run_id: usize,
         stage_id: usize,
-        rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        rdd: Arc<dyn Rdd<Item = T>>,
         action_id: Option<OpId>,
         func: Arc<F>,
         partition: usize,
@@ -114,9 +134,14 @@ where
     }
 }
 
-impl<T: Data, TE: Data, U: Data, F> TaskBase for ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> TaskBase for ResultTask<T, U, F>
 where
-    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
+    F: Fn(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U
         + 'static
         + Send
         + Sync
@@ -149,9 +174,14 @@ where
     }
 }
 
-impl<T: Data, TE: Data, U: Data, F> Task for ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> Task for ResultTask<T, U, F>
 where
-    F: Fn((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U
+    F: Fn(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U
         + 'static
         + Send
         + Sync
@@ -170,29 +200,30 @@ where
         let now = Instant::now();
 
         let res = SerBox::new((self.func)((
-            context, 
+            context,
             match self.rdd.get_secure() {
-                true => (
-                    Box::new(Vec::new().into_iter()),             
-                    {
-                        STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
-                        let dep_info = DepInfo::padding_new(0);
-                        let res = match self.rdd.secure_iterator(split, dep_info, self.action_id.clone()) {
+                true => (Box::new(Vec::new().into_iter()), {
+                    STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
+                    let dep_info = DepInfo::padding_new(0);
+                    let res =
+                        match self
+                            .rdd
+                            .secure_iterator(split, dep_info, self.action_id.clone())
+                        {
                             Ok(r) => r,
                             Err(_) => Box::new(Vec::new().into_iter()),
                         };
-                        STAGE_LOCK.free_stage_lock();
-                        res
-                    }
-                ),
+                    STAGE_LOCK.free_stage_lock();
+                    res
+                }),
                 false => (
                     match self.rdd.iterator(split.clone()) {
                         Ok(r) => r,
                         Err(_) => Box::new(Vec::new().into_iter()),
-                    }, 
-                    Box::new(Vec::new().into_iter()), 
+                    },
+                    Box::new(Vec::new().into_iter()),
                 ),
-            }
+            },
         ))) as SerBox<dyn AnyData>;
 
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;

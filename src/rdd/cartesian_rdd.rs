@@ -31,51 +31,34 @@ impl Split for CartesianSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct CartesianRdd<T, U, TE, UE, FE, FD>
+pub struct CartesianRdd<T, U>
 where
     T: Data,
     U: Data,
-    TE: Data,
-    UE: Data,
-    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
-    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
 {
     vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
     rdd1: Arc<dyn Rdd<Item = T>>,
     #[serde(with = "serde_traitobject")]
     rdd2: Arc<dyn Rdd<Item = U>>,
-    fe: FE,
-    fd: FD,
     num_partitions_in_rdd2: usize,
     _marker_t: PhantomData<T>,
     _market_u: PhantomData<U>,
 }
 
-impl<T, U, TE, UE, FE, FD> CartesianRdd<T, U, TE, UE, FE, FD>
+impl<T, U> CartesianRdd<T, U>
 where
     T: Data,
     U: Data,
-    TE: Data,
-    UE: Data,
-    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
-    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
 {
     #[track_caller]
-    pub(crate) fn new(
-        rdd1: Arc<dyn Rdd<Item = T>>,
-        rdd2: Arc<dyn Rdd<Item = U>>,
-        fe: FE,
-        fd: FD,
-    ) -> Self {
+    pub(crate) fn new(rdd1: Arc<dyn Rdd<Item = T>>, rdd2: Arc<dyn Rdd<Item = U>>) -> Self {
         let vals = Arc::new(RddVals::new(rdd1.get_context(), rdd1.get_secure()));
         let num_partitions_in_rdd2 = rdd2.number_of_splits();
         CartesianRdd {
             vals,
             rdd1,
             rdd2,
-            fe,
-            fd,
             num_partitions_in_rdd2,
             _marker_t: PhantomData,
             _market_u: PhantomData,
@@ -83,22 +66,16 @@ where
     }
 }
 
-impl<T, U, TE, UE, FE, FD> Clone for CartesianRdd<T, U, TE, UE, FE, FD>
+impl<T, U> Clone for CartesianRdd<T, U>
 where
     T: Data,
     U: Data,
-    TE: Data,
-    UE: Data,
-    FE: Func(Vec<(T, U)>) -> (TE, UE) + Clone,
-    FD: Func((TE, UE)) -> Vec<(T, U)> + Clone,
 {
     fn clone(&self) -> Self {
         CartesianRdd {
             vals: self.vals.clone(),
             rdd1: self.rdd1.clone(),
             rdd2: self.rdd2.clone(),
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
             num_partitions_in_rdd2: self.num_partitions_in_rdd2,
             _marker_t: PhantomData,
             _market_u: PhantomData,
@@ -106,14 +83,10 @@ where
     }
 }
 
-impl<T, U, TE, UE, FE, FD> RddBase for CartesianRdd<T, U, TE, UE, FE, FD>
+impl<T, U> RddBase for CartesianRdd<T, U>
 where
     T: Data,
     U: Data,
-    TE: Data,
-    UE: Data,
-    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
-    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -122,10 +95,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(TE, UE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -150,13 +119,6 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
-    }
-
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<(TE, UE)>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -192,14 +154,10 @@ where
     }
 }
 
-impl<T, U, TE, UE, FE, FD> Rdd for CartesianRdd<T, U, TE, UE, FE, FD>
+impl<T, U> Rdd for CartesianRdd<T, U>
 where
     T: Data,
     U: Data,
-    TE: Data,
-    UE: Data,
-    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
-    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
 {
     type Item = (T, U);
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>>
@@ -232,28 +190,5 @@ where
     ) -> Result<Vec<JoinHandle<()>>> {
         //TODO
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
-    }
-}
-
-impl<T, U, TE, UE, FE, FD> RddE for CartesianRdd<T, U, TE, UE, FE, FD>
-where
-    T: Data,
-    U: Data,
-    TE: Data,
-    UE: Data,
-    FE: SerFunc(Vec<(T, U)>) -> (TE, UE),
-    FD: SerFunc((TE, UE)) -> Vec<(T, U)>,
-{
-    type ItemE = (TE, UE);
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

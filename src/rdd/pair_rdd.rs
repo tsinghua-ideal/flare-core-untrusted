@@ -18,182 +18,114 @@ use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 
 // Trait containing pair rdd methods. No need of implicit conversion like in Spark version.
-pub trait PairRdd<K, V, KE, VE>: RddE<Item = (K, V), ItemE = (KE, VE)> + Send + Sync
+pub trait PairRdd<K, V>: Rdd<Item = (K, V)> + Send + Sync
 where
     K: Data + Eq + Hash,
     V: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
 {
     #[track_caller]
-    fn combine_by_key<KE2: Data, C: Data, CE: Data, FE, FD>(
+    fn combine_by_key<C: Data>(
         &self,
         aggregator: Aggregator<K, V, C>,
         partitioner: Box<dyn Partitioner>,
-        fe: FE,
-        fd: FD,
-    ) -> SerArc<dyn RddE<Item = (K, C), ItemE = (KE2, CE)>>
+    ) -> SerArc<dyn Rdd<Item = (K, C)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, C)>) -> (KE2, CE),
-        FD: SerFunc((KE2, CE)) -> Vec<(K, C)>,
     {
         SerArc::new(ShuffledRdd::new(
             self.get_rdd(),
             Arc::new(aggregator),
             partitioner,
-            fe,
-            fd,
         ))
     }
 
     #[track_caller]
-    fn group_by_key<CE, FE, FD>(
-        &self,
-        fe: FE,
-        fd: FD,
-        num_splits: usize,
-    ) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, CE)>>
+    fn group_by_key(&self, num_splits: usize) -> SerArc<dyn Rdd<Item = (K, Vec<V>)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
-        CE: Data,
-        FE: SerFunc(Vec<(K, Vec<V>)>) -> (KE, CE),
-        FD: SerFunc((KE, CE)) -> Vec<(K, Vec<V>)>,
     {
         self.group_by_key_using_partitioner(
-            fe,
-            fd,
-            Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
+            Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>
         )
     }
 
     #[track_caller]
-    fn group_by_key_using_partitioner<CE, FE, FD>(
+    fn group_by_key_using_partitioner(
         &self,
-        fe: FE,
-        fd: FD,
         partitioner: Box<dyn Partitioner>,
-    ) -> SerArc<dyn RddE<Item = (K, Vec<V>), ItemE = (KE, CE)>>
+    ) -> SerArc<dyn Rdd<Item = (K, Vec<V>)>>
     where
         Self: Sized + Serialize + Deserialize + 'static,
-        CE: Data,
-        FE: SerFunc(Vec<(K, Vec<V>)>) -> (KE, CE),
-        FD: SerFunc((KE, CE)) -> Vec<(K, Vec<V>)>,
     {
-        self.combine_by_key(Aggregator::<K, V, _>::default(), partitioner, fe, fd)
+        self.combine_by_key(Aggregator::<K, V, _>::default(), partitioner)
     }
 
     #[track_caller]
-    fn reduce_by_key<KE2, VE2, F, FE, FD>(
-        &self,
-        func: F,
-        num_splits: usize,
-        fe: FE,
-        fd: FD,
-    ) -> SerArc<dyn RddE<Item = (K, V), ItemE = (KE2, VE2)>>
+    fn reduce_by_key<F>(&self, func: F, num_splits: usize) -> SerArc<dyn Rdd<Item = (K, V)>>
     where
-        KE2: Data,
-        VE2: Data,
         F: SerFunc((V, V)) -> V,
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, V)>) -> (KE2, VE2),
-        FD: SerFunc((KE2, VE2)) -> Vec<(K, V)>,
     {
         self.reduce_by_key_using_partitioner(
             func,
             Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
-            fe,
-            fd,
         )
     }
 
     #[track_caller]
-    fn reduce_by_key_using_partitioner<KE2, VE2, F, FE, FD>(
+    fn reduce_by_key_using_partitioner<F>(
         &self,
         func: F,
         partitioner: Box<dyn Partitioner>,
-        fe: FE,
-        fd: FD,
-    ) -> SerArc<dyn RddE<Item = (K, V), ItemE = (KE2, VE2)>>
+    ) -> SerArc<dyn Rdd<Item = (K, V)>>
     where
-        KE2: Data,
-        VE2: Data,
         F: SerFunc((V, V)) -> V,
         Self: Sized + Serialize + Deserialize + 'static,
-        FE: SerFunc(Vec<(K, V)>) -> (KE2, VE2),
-        FD: SerFunc((KE2, VE2)) -> Vec<(K, V)>,
     {
         let create_combiner = Box::new(Fn!(|v: V| v));
         let f_clone = func.clone();
         let merge_value = Box::new(Fn!(move |(buf, v)| { (f_clone)((buf, v)) }));
         let merge_combiners = Box::new(Fn!(move |(b1, b2)| { (func)((b1, b2)) }));
         let aggregator = Aggregator::new(create_combiner, merge_value, merge_combiners);
-        self.combine_by_key(aggregator, partitioner, fe, fd)
+        self.combine_by_key(aggregator, partitioner)
     }
 
     #[track_caller]
-    fn values<FE, FD>(
-        &self,
-        fe: FE, //the type corresponding to the encryption form is fixed
-        fd: FD,
-    ) -> SerArc<dyn RddE<Item = V, ItemE = VE>>
+    fn values(&self) -> SerArc<dyn Rdd<Item = V>>
     where
         Self: Sized,
-        FE: SerFunc(Vec<V>) -> VE,
-        FD: SerFunc(VE) -> Vec<V>,
     {
-        SerArc::new(ValuesRdd::new(self.get_rdd(), fe, fd))
+        SerArc::new(ValuesRdd::new(self.get_rdd()))
     }
 
     #[track_caller]
-    fn map_values<U, UE, F, FE, FD>(
-        &self,
-        f: F,
-        fe: FE,
-        fd: FD,
-    ) -> SerArc<dyn RddE<Item = (K, U), ItemE = (KE, UE)>>
+    fn map_values<U, F>(&self, f: F) -> SerArc<dyn Rdd<Item = (K, U)>>
     where
         Self: Sized,
         F: SerFunc(V) -> U + Clone,
         U: Data,
-        UE: Data,
-        FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
-        FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
     {
-        SerArc::new(MappedValuesRdd::new(self.get_rdd(), f, fe, fd))
+        SerArc::new(MappedValuesRdd::new(self.get_rdd(), f))
     }
 
     #[track_caller]
-    fn flat_map_values<U, UE, F, FE, FD>(
-        &self,
-        f: F,
-        fe: FE,
-        fd: FD,
-    ) -> SerArc<dyn RddE<Item = (K, U), ItemE = (KE, UE)>>
+    fn flat_map_values<U, F>(&self, f: F) -> SerArc<dyn Rdd<Item = (K, U)>>
     where
         Self: Sized,
         F: SerFunc(V) -> Box<dyn Iterator<Item = U>> + Clone,
         U: Data,
-        UE: Data,
-        FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
-        FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
     {
-        SerArc::new(FlatMappedValuesRdd::new(self.get_rdd(), f, fe, fd))
+        SerArc::new(FlatMappedValuesRdd::new(self.get_rdd(), f))
     }
 
     #[track_caller]
-    fn join<W, WE, FE, FD>(
+    fn join<W>(
         &self,
-        other: SerArc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
-        fe: FE,
-        fd: FD,
+        other: SerArc<dyn Rdd<Item = (K, W)>>,
         num_splits: usize,
-    ) -> SerArc<dyn RddE<Item = (K, (V, W)), ItemE = (KE, (VE, WE))>>
+    ) -> SerArc<dyn Rdd<Item = (K, (V, W))>>
     where
         W: Data + Default,
-        WE: Data + Default,
-        FE: SerFunc(Vec<(K, (V, W))>) -> (KE, (VE, WE)),
-        FD: SerFunc((KE, (VE, WE))) -> Vec<(K, (V, W))>,
     {
         let f = Fn!(|v: (Vec<V>, Vec<W>)| {
             let (vs, ws) = v;
@@ -203,102 +135,37 @@ where
             Box::new(combine) as Box<dyn Iterator<Item = (V, W)>>
         });
 
-        let fe0 = self.get_fe();
-        let fd0 = self.get_fd();
-        let fe1 = other.get_fe();
-        let fd1 = other.get_fd();
-        //temporarily built
-        let fe_cg = Fn!(move |v: Vec<(K, (Vec<V>, Vec<W>))>| {
-            let (k, vw): (Vec<K>, Vec<(Vec<V>, Vec<W>)>) = v.into_iter().unzip();
-            let (v, w): (Vec<Vec<V>>, Vec<Vec<W>>) = vw.into_iter().unzip();
-            let mut w_padding: Vec<W> = Vec::new();
-            w_padding.resize_with(k.len(), Default::default);
-            let (ct_x, _) = (fe1)(k.into_iter().zip(w_padding.into_iter()).collect::<Vec<_>>());
-            (ct_x, (ser_encrypt(v), ser_encrypt(w)))
-        });
-        let fd_cg = Fn!(move |v: (KE, (Vec<u8>, Vec<u8>))| {
-            let (ct_x, (ct_y, ct_z)) = v;
-            let w_padding: WE = Default::default();
-            let (x, _): (Vec<K>, Vec<W>) = (fd1)((ct_x, w_padding)).into_iter().unzip();
-            let y = ser_decrypt(ct_y);
-            let z = ser_decrypt(ct_z);
-            x.into_iter()
-                .zip(y.into_iter().zip(z.into_iter()))
-                .collect::<Vec<_>>()
-        });
-
         let cogrouped = self.cogroup(
             other,
-            fe_cg,
-            fd_cg,
             Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
         );
         self.get_context().add_num(1);
-        cogrouped.flat_map_values(Box::new(f), fe, fd)
+        cogrouped.flat_map_values(Box::new(f))
     }
 
     #[track_caller]
-    fn cogroup<W, WE, CE, DE, FE, FD>(
+    fn cogroup<W>(
         &self,
-        other: SerArc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
-        fe: FE,
-        fd: FD,
+        other: SerArc<dyn Rdd<Item = (K, W)>>,
         partitioner: Box<dyn Partitioner>,
-    ) -> SerArc<dyn RddE<Item = (K, (Vec<V>, Vec<W>)), ItemE = (KE, (CE, DE))>>
+    ) -> SerArc<dyn Rdd<Item = (K, (Vec<V>, Vec<W>))>>
     where
         W: Data,
-        WE: Data,
-        CE: Data,
-        DE: Data,
-        FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)),
-        FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
     {
         SerArc::new(CoGroupedRdd::new(
-            self.get_rdde(),
-            other.get_rdde(),
-            fe,
-            fd,
+            self.get_rdd(),
+            other.get_rdd(),
             partitioner,
         ))
     }
 
     #[track_caller]
-    fn partition_by_key<FE, FD>(
-        &self,
-        partitioner: Box<dyn Partitioner>,
-        fe: FE,
-        fd: FD,
-    ) -> SerArc<dyn RddE<Item = V, ItemE = VE>>
-    where
-        FE: SerFunc(Vec<V>) -> VE,
-        FD: SerFunc(VE) -> Vec<V>,
-    {
+    fn partition_by_key(&self, partitioner: Box<dyn Partitioner>) -> SerArc<dyn Rdd<Item = V>> {
         // Guarantee the number of partitions by introducing a shuffle phase
-        let fe_c = fe.clone();
-        let fd_c = fd.clone();
-        let fe_wrapper_sf = Fn!(move |v: Vec<(K, Vec<V>)>| {
-            let (x, vy): (Vec<K>, Vec<Vec<V>>) = v.into_iter().unzip();
-            let mut ct_y = Vec::with_capacity(vy.len());
-            for y in vy {
-                ct_y.push((fe_c)(y));
-            }
-            (x, ct_y)
-        });
-        let fd_wrapper_sf = Fn!(move |v: (Vec<K>, Vec<VE>)| {
-            let (x, vy) = v;
-            let mut pt_y = Vec::with_capacity(vy.len());
-            for y in vy {
-                pt_y.push((fd_c)(y));
-            }
-            x.into_iter().zip(pt_y.into_iter()).collect::<Vec<_>>()
-        });
-
         let shuffle_steep = ShuffledRdd::new(
             self.get_rdd(),
             Arc::new(Aggregator::<K, V, _>::default()),
             partitioner,
-            fe_wrapper_sf,
-            fd_wrapper_sf,
         );
         // Flatten the results of the combined partitions
         let flattener = Fn!(|grouped: (K, Vec<V>)| {
@@ -307,88 +174,68 @@ where
             iter
         });
         self.get_context().add_num(1);
-        shuffle_steep.flat_map(flattener, fe, fd)
+        shuffle_steep.flat_map(flattener)
     }
 }
 
 // Implementing the PairRdd trait for all types which implements Rdd
-impl<K, V, KE, VE, T> PairRdd<K, V, KE, VE> for T
+impl<K, V, T> PairRdd<K, V> for T
 where
-    T: RddE<Item = (K, V), ItemE = (KE, VE)>,
+    T: Rdd<Item = (K, V)>,
     K: Data + Eq + Hash,
     V: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
 {
 }
 
-impl<K, V, KE, VE, T> PairRdd<K, V, KE, VE> for SerArc<T>
+impl<K, V, T> PairRdd<K, V> for SerArc<T>
 where
-    T: RddE<Item = (K, V), ItemE = (KE, VE)>,
+    T: Rdd<Item = (K, V)>,
     K: Data + Eq + Hash,
     V: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
 {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ValuesRdd<K, V, VE, FE, FD>
+pub struct ValuesRdd<K, V>
 where
     K: Data,
     V: Data,
-    VE: Data,
-    FE: Func(Vec<V>) -> VE + Clone,
-    FD: Func(VE) -> Vec<V> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = (K, V)>>,
     vals: Arc<RddVals>,
-    fe: FE,
-    fd: FD,
 }
 
-impl<K, V, VE, FE, FD> Clone for ValuesRdd<K, V, VE, FE, FD>
+impl<K, V> Clone for ValuesRdd<K, V>
 where
     K: Data,
     V: Data,
-    VE: Data,
-    FE: Func(Vec<V>) -> VE + Clone,
-    FD: Func(VE) -> Vec<V> + Clone,
 {
     fn clone(&self) -> Self {
         ValuesRdd {
             prev: self.prev.clone(),
             vals: self.vals.clone(),
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
         }
     }
 }
 
-impl<K, V, VE, FE, FD> ValuesRdd<K, V, VE, FE, FD>
+impl<K, V> ValuesRdd<K, V>
 where
     K: Data,
     V: Data,
-    VE: Data,
-    FE: Func(Vec<V>) -> VE + Clone,
-    FD: Func(VE) -> Vec<V> + Clone,
 {
     #[track_caller]
-    fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, fe: FE, fd: FD) -> Self {
+    fn new(prev: Arc<dyn Rdd<Item = (K, V)>>) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         let vals = Arc::new(vals);
-        ValuesRdd { prev, vals, fe, fd }
+        ValuesRdd { prev, vals }
     }
 }
 
-impl<K, V, VE, FE, FD> RddBase for ValuesRdd<K, V, VE, FE, FD>
+impl<K, V> RddBase for ValuesRdd<K, V>
 where
     K: Data,
     V: Data,
-    VE: Data,
-    FE: SerFunc(Vec<V>) -> VE + Clone,
-    FD: SerFunc(VE) -> Vec<V> + Clone,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -397,10 +244,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<VE>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -428,13 +271,6 @@ where
         self.vals.secure
     }
 
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<VE>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
-    }
-
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()
     }
@@ -457,13 +293,10 @@ where
     }
 }
 
-impl<K, V, VE, FE, FD> Rdd for ValuesRdd<K, V, VE, FE, FD>
+impl<K, V> Rdd for ValuesRdd<K, V>
 where
     K: Data,
     V: Data,
-    VE: Data,
-    FE: SerFunc(Vec<V>) -> VE + Clone,
-    FD: SerFunc(VE) -> Vec<V> + Clone,
 {
     type Item = V;
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -501,105 +334,57 @@ where
     }
 }
 
-impl<K, V, VE, FE, FD> RddE for ValuesRdd<K, V, VE, FE, FD>
-where
-    K: Data,
-    V: Data,
-    VE: Data,
-    FE: SerFunc(Vec<V>) -> VE + Clone,
-    FD: SerFunc(VE) -> Vec<V> + Clone,
-{
-    type ItemE = VE;
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
-    }
-}
-
 #[derive(Serialize, Deserialize)]
-pub struct MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+pub struct MappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: Func(V) -> U + Clone,
-    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
-    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = (K, V)>>,
     vals: Arc<RddVals>,
     f: F,
-    fe: FE,
-    fd: FD,
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> Clone for MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+impl<K, V, U, F> Clone for MappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: Func(V) -> U + Clone,
-    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
-    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     fn clone(&self) -> Self {
         MappedValuesRdd {
             prev: self.prev.clone(),
             vals: self.vals.clone(),
             f: self.f.clone(),
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
         }
     }
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+impl<K, V, U, F> MappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: Func(V) -> U + Clone,
-    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
-    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     #[track_caller]
-    fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F, fe: FE, fd: FD) -> Self {
+    fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         let vals = Arc::new(vals);
-        MappedValuesRdd {
-            prev,
-            vals,
-            f,
-            fe,
-            fd,
-        }
+        MappedValuesRdd { prev, vals, f }
     }
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> RddBase for MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+impl<K, V, U, F> RddBase for MappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: SerFunc(V) -> U,
-    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
-    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -608,10 +393,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(KE, UE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -639,13 +420,6 @@ where
         self.vals.secure
     }
 
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<(KE, UE)>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
-    }
-
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()
     }
@@ -669,16 +443,12 @@ where
     }
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> Rdd for MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+impl<K, V, U, F> Rdd for MappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: SerFunc(V) -> U,
-    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
-    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     type Item = (K, U);
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -723,108 +493,57 @@ where
     }
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> RddE for MappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
-where
-    K: Data,
-    V: Data,
-    U: Data,
-    KE: Data,
-    UE: Data,
-    F: SerFunc(V) -> U,
-    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
-    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
-{
-    type ItemE = (KE, UE);
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
-    }
-}
-
 #[derive(Serialize, Deserialize)]
-pub struct FlatMappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+pub struct FlatMappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: Func(V) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
-    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = (K, V)>>,
     vals: Arc<RddVals>,
     f: F,
-    fe: FE,
-    fd: FD,
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> Clone for FlatMappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+impl<K, V, U, F> Clone for FlatMappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: Func(V) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
-    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     fn clone(&self) -> Self {
         FlatMappedValuesRdd {
             prev: self.prev.clone(),
             vals: self.vals.clone(),
             f: self.f.clone(),
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
         }
     }
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> FlatMappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+impl<K, V, U, F> FlatMappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: Func(V) -> Box<dyn Iterator<Item = U>> + Clone,
-    FE: Func(Vec<(K, U)>) -> (KE, UE) + Clone,
-    FD: Func((KE, UE)) -> Vec<(K, U)> + Clone,
 {
     #[track_caller]
-    fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F, fe: FE, fd: FD) -> Self {
+    fn new(prev: Arc<dyn Rdd<Item = (K, V)>>, f: F) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         let vals = Arc::new(vals);
-        FlatMappedValuesRdd {
-            prev,
-            vals,
-            f,
-            fe,
-            fd,
-        }
+        FlatMappedValuesRdd { prev, vals, f }
     }
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> RddBase for FlatMappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+impl<K, V, U, F> RddBase for FlatMappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: SerFunc(V) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
-    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -833,10 +552,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(KE, UE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -863,13 +578,6 @@ where
         self.vals.secure
     }
 
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<(KE, UE)>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
-    }
-
     fn splits(&self) -> Vec<Box<dyn Split>> {
         self.prev.splits()
     }
@@ -893,16 +601,12 @@ where
     }
 }
 
-impl<K, V, U, KE, UE, F, FE, FD> Rdd for FlatMappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
+impl<K, V, U, F> Rdd for FlatMappedValuesRdd<K, V, U, F>
 where
     K: Data,
     V: Data,
     U: Data,
-    KE: Data,
-    UE: Data,
     F: SerFunc(V) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
-    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
 {
     type Item = (K, U);
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -946,30 +650,5 @@ where
         } else {
             self.prev.secure_compute(split, acc_arg, tx)
         }
-    }
-}
-
-impl<K, V, U, KE, UE, F, FE, FD> RddE for FlatMappedValuesRdd<K, V, U, KE, UE, F, FE, FD>
-where
-    K: Data,
-    V: Data,
-    U: Data,
-    KE: Data,
-    UE: Data,
-    F: SerFunc(V) -> Box<dyn Iterator<Item = U>>,
-    FE: SerFunc(Vec<(K, U)>) -> (KE, UE),
-    FD: SerFunc((KE, UE)) -> Vec<(K, U)>,
-{
-    type ItemE = (KE, UE);
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

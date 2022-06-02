@@ -2,7 +2,7 @@ use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
 use crate::rdd::{
-    default_hash, free_res_enc, get_encrypted_data, AccArg, OpId, RddBase, STAGE_LOCK,
+    default_hash, free_res_enc, get_encrypted_data, AccArg, ItemE, OpId, RddBase, STAGE_LOCK,
 };
 use crate::serializable_traits::Data;
 use dashmap::mapref::one::RefMut;
@@ -176,13 +176,11 @@ impl Ord for dyn ShuffleDependencyTrait {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct ShuffleDependency<K, V, C, KE, CE>
+pub(crate) struct ShuffleDependency<K, V, C>
 where
     K: Data,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
 {
     pub shuffle_id: usize,
     pub is_cogroup: bool,
@@ -198,17 +196,13 @@ where
     child_rdd_id: usize,
     parent_op_id: OpId,
     child_op_id: OpId,
-    _marker_ke: PhantomData<KE>,
-    _marker_ce: PhantomData<CE>,
 }
 
-impl<K, V, C, KE, CE> ShuffleDependency<K, V, C, KE, CE>
+impl<K, V, C> ShuffleDependency<K, V, C>
 where
     K: Data,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
 {
     pub fn new(
         shuffle_id: usize,
@@ -234,19 +228,15 @@ where
             child_rdd_id,
             parent_op_id,
             child_op_id,
-            _marker_ke: PhantomData,
-            _marker_ce: PhantomData,
         }
     }
 }
 
-impl<K, V, C, KE, CE> ShuffleDependencyTrait for ShuffleDependency<K, V, C, KE, CE>
+impl<K, V, C> ShuffleDependencyTrait for ShuffleDependency<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
 {
     fn get_dep_info(&self) -> DepInfo {
         DepInfo::new(
@@ -299,7 +289,6 @@ where
             let now = Instant::now();
             let (tx, rx) = mpsc::sync_channel(0);
             let mut acc_arg = AccArg::new(
-                partition,
                 dep_info,
                 Some(self.partitioner.get_num_of_partitions()),
                 Arc::new(atomic::AtomicBool::new(false)),
@@ -310,11 +299,11 @@ where
             let handles = rdd_base.iterator_raw(split, &mut acc_arg, tx).unwrap();
 
             let num_output_splits = self.partitioner.get_num_of_partitions();
-            let mut buckets: Vec<Vec<Vec<(KE, CE)>>> = (0..num_output_splits)
+            let mut buckets: Vec<Vec<Vec<ItemE>>> = (0..num_output_splits)
                 .map(|_| Vec::new())
                 .collect::<Vec<_>>();
             for block_ptr in rx {
-                let buckets_bls = get_encrypted_data::<Vec<Vec<(KE, CE)>>>(
+                let buckets_bls = get_encrypted_data::<Vec<Vec<ItemE>>>(
                     rdd_base.get_op_id(),
                     dep_info,
                     block_ptr as *mut u8,

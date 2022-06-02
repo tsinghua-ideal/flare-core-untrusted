@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::dependency::ShuffleDependencyTrait;
 use crate::map_output_tracker::MapOutputTracker;
 use crate::partial::{ApproximateActionListener, ApproximateEvaluator, PartialResult};
-use crate::rdd::{RddE, RddBase, OpId};
+use crate::rdd::{ItemE, OpId, Rdd, RddBase};
 use crate::scheduler::{
     listener::{JobEndListener, JobStartListener},
     CompletionEvent, EventQueue, Job, JobListener, JobTracker, LiveListenerBus, NativeScheduler,
@@ -87,16 +87,21 @@ impl LocalScheduler {
 
     /// Run an approximate job on the given RDD and pass all the results to an ApproximateEvaluator
     /// as they arrive. Returns a partial result object from the evaluator.
-    pub fn run_approximate_job<T: Data, TE: Data, U: Data, R, F, E>(
+    pub fn run_approximate_job<T: Data, U: Data, R, F, E>(
         self: Arc<Self>,
         func: Arc<F>,
-        final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        final_rdd: Arc<dyn Rdd<Item = T>>,
         action_id: Option<OpId>,
         evaluator: E,
         timeout: Duration,
     ) -> Result<PartialResult<R>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
         R: Clone + Debug + Send + Sync + 'static,
     {
@@ -142,16 +147,21 @@ impl LocalScheduler {
         })
     }
 
-    pub fn run_job<T: Data, TE: Data, U: Data, F>(
+    pub fn run_job<T: Data, U: Data, F>(
         self: Arc<Self>,
         func: Arc<F>,
-        final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        final_rdd: Arc<dyn Rdd<Item = T>>,
         action_id: Option<OpId>,
         partitions: Vec<usize>,
         allow_local: bool,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U,
     {
         // acquiring lock so that only one job can run at same time this lock is just
         // a temporary patch for preventing multiple jobs to update cache locks which affects
@@ -175,18 +185,23 @@ impl LocalScheduler {
     }
 
     /// Start the event processing loop for a given job.
-    async fn event_process_loop<T: Data, TE: Data, U: Data, F, L>(
+    async fn event_process_loop<T: Data, U: Data, F, L>(
         self: Arc<Self>,
         allow_local: bool,
-        jt: Arc<JobTracker<F, U, T, TE, L>>,
+        jt: Arc<JobTracker<F, U, T, L>>,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U,
         L: JobListener,
     {
         // TODO: update cache
         self.update_cache_locs().await?;
-        
+
         if allow_local {
             if let Some(result) = LocalScheduler::local_execution(jt.clone()).await? {
                 return Ok(result);
@@ -270,13 +285,18 @@ impl LocalScheduler {
             .collect())
     }
 
-    fn run_task<T: Data, TE: Data, U: Data, F>(
+    fn run_task<T: Data, U: Data, F>(
         event_queues: Arc<DashMap<usize, VecDeque<CompletionEvent>>>,
         task: Vec<u8>,
         _id_in_job: usize,
         attempt_id: usize,
     ) where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U,
     {
         let now = Instant::now();
         let des_task: TaskOption = bincode::deserialize(&task).unwrap();
@@ -289,7 +309,7 @@ impl LocalScheduler {
                     TaskResult::ResultTask(r) => r,
                     _ => panic!("wrong result type"),
                 };
-                if let Ok(task_final) = tsk.downcast::<ResultTask<T, TE, U, F>>() {
+                if let Ok(task_final) = tsk.downcast::<ResultTask<T, U, F>>() {
                     let task_final = task_final as Box<dyn TaskBase>;
                     LocalScheduler::task_ended(
                         event_queues,
@@ -341,13 +361,18 @@ impl LocalScheduler {
 #[async_trait::async_trait]
 impl NativeScheduler for LocalScheduler {
     /// Every single task is run in the local thread pool
-    fn submit_task<T: Data, TE: Data, U: Data, F>(
+    fn submit_task<T: Data, U: Data, F>(
         &self,
         task: TaskOption,
         id_in_job: usize,
         _server_address: SocketAddrV4,
     ) where
-        F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+        F: SerFunc(
+            (
+                TaskContext,
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            ),
+        ) -> U,
     {
         log::debug!("inside submit task");
         let my_attempt_id = self.attempt_id.fetch_add(1, Ordering::SeqCst);
@@ -358,7 +383,7 @@ impl NativeScheduler for LocalScheduler {
         println!("local_scheduler serialize task time: {:?} s", dur);
 
         tokio::task::spawn_blocking(move || {
-            LocalScheduler::run_task::<T, TE, U, F>(event_queues, task, id_in_job, my_attempt_id)
+            LocalScheduler::run_task::<T, U, F>(event_queues, task, id_in_job, my_attempt_id)
         });
     }
 

@@ -36,15 +36,11 @@ impl Split for ShuffledRddSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ShuffledRdd<K, V, C, KE, CE, FE, FD>
+pub struct ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
-    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     parent: Arc<dyn Rdd<Item = (K, V)>>,
@@ -54,19 +50,13 @@ where
     #[serde(with = "serde_traitobject")]
     part: Box<dyn Partitioner>,
     shuffle_id: usize,
-    fe: FE,
-    fd: FD,
 }
 
-impl<K, V, C, KE, CE, FE, FD> Clone for ShuffledRdd<K, V, C, KE, CE, FE, FD>
+impl<K, V, C> Clone for ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
-    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone,
 {
     fn clone(&self) -> Self {
         ShuffledRdd {
@@ -75,29 +65,21 @@ where
             vals: self.vals.clone(),
             part: self.part.clone(),
             shuffle_id: self.shuffle_id,
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
         }
     }
 }
 
-impl<K, V, C, KE, CE, FE, FD> ShuffledRdd<K, V, C, KE, CE, FE, FD>
+impl<K, V, C> ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
-    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone,
 {
     #[track_caller]
     pub(crate) fn new(
         parent: Arc<dyn Rdd<Item = (K, V)>>,
         aggregator: Arc<Aggregator<K, V, C>>,
         part: Box<dyn Partitioner>,
-        fe: FE,
-        fd: FD,
     ) -> Self {
         let ctx = parent.get_context();
         let secure = parent.get_secure(); //temp
@@ -111,8 +93,6 @@ where
             vals,
             part,
             shuffle_id,
-            fe,
-            fd,
         }
     }
 
@@ -123,8 +103,8 @@ where
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
-        let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
-        let buckets: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?
+        let fut = ShuffleFetcher::secure_fetch(self.shuffle_id, part_id);
+        let buckets: Vec<Vec<ItemE>> = futures::executor::block_on(fut)?
             .into_iter()
             .filter(|sub_part| sub_part.len() > 0)
             .collect(); // bucket per subpartition
@@ -160,11 +140,7 @@ where
         Ok(vec![handle])
     }
 
-    fn secure_shuffle_read(
-        &self,
-        buckets: Vec<Vec<(KE, CE)>>,
-        acc_arg: &mut AccArg,
-    ) -> Vec<(KE, CE)> {
+    fn secure_shuffle_read(&self, buckets: Vec<Vec<ItemE>>, acc_arg: &mut AccArg) -> Vec<ItemE> {
         acc_arg.get_enclave_lock();
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
@@ -182,22 +158,18 @@ where
         );
 
         let mut result =
-            get_encrypted_data::<(KE, CE)>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
 
         acc_arg.free_enclave_lock();
         *result
     }
 }
 
-impl<K, V, C, KE, CE, FE, FD> RddBase for ShuffledRdd<K, V, C, KE, CE, FE, FD>
+impl<K, V, C> RddBase for ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
-    FD: SerFunc((KE, CE)) -> Vec<(K, C)>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -206,10 +178,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(KE, CE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -232,7 +200,7 @@ where
         let cur_rdd_id = self.vals.id;
         let cur_op_id = self.vals.op_id;
         vec![Dependency::ShuffleDependency(Arc::new(
-            ShuffleDependency::<_, _, _, KE, CE>::new(
+            ShuffleDependency::new(
                 self.shuffle_id,
                 false,
                 self.parent.get_rdd_base(),
@@ -247,13 +215,6 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
-    }
-
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<(KE, CE)>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -285,15 +246,11 @@ where
     }
 }
 
-impl<K, V, C, KE, CE, FE, FD> Rdd for ShuffledRdd<K, V, C, KE, CE, FE, FD>
+impl<K, V, C> Rdd for ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
-    FD: SerFunc((KE, CE)) -> Vec<(K, C)>,
 {
     type Item = (K, C);
 
@@ -352,30 +309,5 @@ where
         } else {
             self.secure_compute_prev(split, acc_arg, tx)
         }
-    }
-}
-
-impl<K, V, C, KE, CE, FE, FD> RddE for ShuffledRdd<K, V, C, KE, CE, FE, FD>
-where
-    K: Data + Eq + Hash,
-    V: Data,
-    C: Data,
-    KE: Data,
-    CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
-    FD: SerFunc((KE, CE)) -> Vec<(K, C)>,
-{
-    type ItemE = (KE, CE);
-
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

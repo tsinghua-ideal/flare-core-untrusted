@@ -118,50 +118,37 @@ impl NarrowDependencyTrait for CoalescedSplitDep {
 /// the preferred location of each new partition overlaps with as many preferred locations of its
 /// parent partitions
 #[derive(Serialize, Deserialize, Clone)]
-pub struct CoalescedRdd<T, TE, FE, FD>
+pub struct CoalescedRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: Func(Vec<T>) -> TE + Clone,
-    FD: Func(TE) -> Vec<T> + Clone,
 {
     vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
     parent: Arc<dyn Rdd<Item = T>>,
     max_partitions: usize,
-    fe: FE,
-    fd: FD,
 }
 
-impl<T, TE, FE, FD> CoalescedRdd<T, TE, FE, FD>
+impl<T> CoalescedRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: Func(Vec<T>) -> TE + Clone,
-    FD: Func(TE) -> Vec<T> + Clone,
 {
     /// ## Arguments
     ///
     /// max_partitions: number of desired partitions in the coalesced RDD
     #[track_caller]
-    pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, max_partitions: usize, fe: FE, fd: FD) -> Self {
+    pub(crate) fn new(prev: Arc<dyn Rdd<Item = T>>, max_partitions: usize) -> Self {
         let vals = RddVals::new(prev.get_context(), prev.get_secure());
         CoalescedRdd {
             vals: Arc::new(vals),
             parent: prev,
             max_partitions,
-            fe,
-            fd,
         }
     }
 }
 
-impl<T, TE, FE, FD> RddBase for CoalescedRdd<T, TE, FE, FD>
+impl<T> RddBase for CoalescedRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -170,10 +157,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<TE>) };
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -226,13 +209,6 @@ where
         self.vals.secure
     }
 
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<TE>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
-    }
-
     /// Returns the preferred machine for the partition. If split is of type CoalescedRddSplit,
     /// then the preferred machine will be one which most parent splits prefer too.
     fn preferred_locations(&self, split: Box<dyn Split>) -> Vec<Ipv4Addr> {
@@ -258,12 +234,9 @@ where
     }
 }
 
-impl<T, TE, FE, FD> Rdd for CoalescedRdd<T, TE, FE, FD>
+impl<T> Rdd for CoalescedRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
 {
     type Item = T;
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>>
@@ -301,27 +274,6 @@ where
     ) -> Result<Vec<JoinHandle<()>>> {
         //TODO need revision
         Err(Error::UnsupportedOperation("Unsupported secure_compute"))
-    }
-}
-
-impl<T, TE, FE, FD> RddE for CoalescedRdd<T, TE, FE, FD>
-where
-    T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
-{
-    type ItemE = TE;
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }
 

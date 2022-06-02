@@ -69,49 +69,31 @@ impl Split for CoGroupSplit {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
+pub struct CoGroupedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)) + Clone,
-    FD: Func((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone,
 {
     pub(crate) vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
-    pub(crate) rdd0: Arc<dyn RddE<Item = (K, V), ItemE = (KE, VE)>>,
+    pub(crate) rdd0: Arc<dyn Rdd<Item = (K, V)>>,
     #[serde(with = "serde_traitobject")]
-    pub(crate) rdd1: Arc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
-    pub(crate) fe: FE,
-    pub(crate) fd: FD,
+    pub(crate) rdd1: Arc<dyn Rdd<Item = (K, W)>>,
     #[serde(with = "serde_traitobject")]
     pub(crate) part: Box<dyn Partitioner>,
 }
 
-impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
+impl<K, V, W> CoGroupedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)) + Clone,
-    FD: Func((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone,
 {
     #[track_caller]
     pub fn new(
-        rdd0: Arc<dyn RddE<Item = (K, V), ItemE = (KE, VE)>>,
-        rdd1: Arc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
-        fe: FE,
-        fd: FD,
+        rdd0: Arc<dyn Rdd<Item = (K, V)>>,
+        rdd1: Arc<dyn Rdd<Item = (K, W)>>,
         part: Box<dyn Partitioner>,
     ) -> Self {
         let context = rdd0.get_context();
@@ -137,8 +119,6 @@ where
             vals,
             rdd0,
             rdd1,
-            fe,
-            fd,
             part,
         }
     }
@@ -159,7 +139,6 @@ where
                     let (tx, rx) = mpsc::sync_channel(0);
                     let part_id = split.get_index();
                     let mut acc_arg_cg = AccArg::new(
-                        part_id,
                         DepInfo::padding_new(0),
                         None,
                         Arc::new(AtomicBool::new(false)),
@@ -169,7 +148,7 @@ where
                     let mut kv_0 = Vec::new();
 
                     for received in rx {
-                        let result_bl = get_encrypted_data::<(KE, VE)>(
+                        let result_bl = get_encrypted_data::<ItemE>(
                             rdd.get_op_id(),
                             acc_arg_cg.dep_info,
                             received as *mut u8,
@@ -202,8 +181,7 @@ where
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     //TODO need revision if fe & fd of group_by is passed
-                    let fut =
-                        ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
+                    let fut = ShuffleFetcher::secure_fetch(shuffle_id, split.get_index());
                     let kv_1 = futures::executor::block_on(fut)?
                         .into_iter()
                         .collect::<Vec<_>>();
@@ -241,7 +219,6 @@ where
                     let (tx, rx) = mpsc::sync_channel(0);
                     let part_id = split.get_index();
                     let mut acc_arg_cg = AccArg::new(
-                        part_id,
                         DepInfo::padding_new(0),
                         None,
                         Arc::new(AtomicBool::new(false)),
@@ -251,7 +228,7 @@ where
                     let mut kw_0 = Vec::new();
 
                     for received in rx {
-                        let result_bl = get_encrypted_data::<(KE, WE)>(
+                        let result_bl = get_encrypted_data::<ItemE>(
                             rdd.get_op_id(),
                             acc_arg_cg.dep_info,
                             received as *mut u8,
@@ -284,8 +261,7 @@ where
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     //TODO need revision if fe & fd of group_by is passed
-                    let fut =
-                        ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(shuffle_id, split.get_index());
+                    let fut = ShuffleFetcher::secure_fetch(shuffle_id, split.get_index());
                     let kw_1 = futures::executor::block_on(fut)?
                         .into_iter()
                         .collect::<Vec<_>>();
@@ -343,13 +319,13 @@ where
     fn secure_shuffle_read(
         &self,
         buckets: (
-            Vec<Vec<(KE, VE)>>,
-            Vec<Vec<(KE, Vec<u8>)>>,
-            Vec<Vec<(KE, WE)>>,
-            Vec<Vec<(KE, Vec<u8>)>>,
+            Vec<Vec<ItemE>>,
+            Vec<Vec<ItemE>>,
+            Vec<Vec<ItemE>>,
+            Vec<Vec<ItemE>>,
         ),
         acc_arg: &mut AccArg,
-    ) -> Vec<(KE, (CE, DE))> {
+    ) -> Vec<ItemE> {
         acc_arg.get_enclave_lock();
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
@@ -367,25 +343,17 @@ where
         );
 
         let mut result =
-            get_encrypted_data::<(KE, (CE, DE))>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
         acc_arg.free_enclave_lock();
         *result
     }
 }
 
-impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> RddBase
-    for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
+impl<K, V, W> RddBase for CoGroupedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)),
-    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -394,10 +362,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(KE, (CE, DE))>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -439,7 +403,7 @@ where
             log::debug!("creating aggregator inside cogrouprdd");
             deps.push(Dependency::ShuffleDependency(
                 //TODO need revision if fe & fd of group_by is passed
-                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
+                Arc::new(ShuffleDependency::new(
                     shuffle_ids.remove(0),
                     true,
                     rdd_base,
@@ -466,7 +430,7 @@ where
             log::debug!("creating aggregator inside cogrouprdd");
             deps.push(Dependency::ShuffleDependency(
                 //TODO need revision if fe & fd of group_by is passed
-                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
+                Arc::new(ShuffleDependency::new(
                     shuffle_ids.remove(0),
                     true,
                     rdd_base,
@@ -483,13 +447,6 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
-    }
-
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<(KE, (CE, DE))>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -548,18 +505,11 @@ where
     }
 }
 
-impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> Rdd for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
+impl<K, V, W> Rdd for CoGroupedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)),
-    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
 {
     type Item = (K, (Vec<V>, Vec<W>));
     //type Item = (K, Vec<Vec<Box<dyn AnyData>>>);
@@ -675,32 +625,5 @@ where
         } else {
             self.secure_compute_prev(split, acc_arg, tx)
         }
-    }
-}
-
-impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> RddE for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
-where
-    K: Data + Eq + Hash,
-    V: Data,
-    W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)),
-    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
-{
-    type ItemE = (KE, (CE, DE));
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

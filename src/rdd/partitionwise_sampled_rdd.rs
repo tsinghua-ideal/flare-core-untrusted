@@ -14,12 +14,9 @@ use std::sync::{mpsc::SyncSender, Arc};
 use std::thread::JoinHandle;
 
 #[derive(Serialize, Deserialize)]
-pub struct PartitionwiseSampledRdd<T, TE, FE, FD>
+pub struct PartitionwiseSampledRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: Func(Vec<T>) -> TE + Clone,
-    FD: Func(TE) -> Vec<T> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     prev: Arc<dyn Rdd<Item = T>>,
@@ -27,24 +24,17 @@ where
     #[serde(with = "serde_traitobject")]
     sampler: Arc<dyn RandomSampler<T>>,
     preserves_partitioning: bool,
-    fe: FE,
-    fd: FD,
 }
 
-impl<T, TE, FE, FD> PartitionwiseSampledRdd<T, TE, FE, FD>
+impl<T> PartitionwiseSampledRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: Func(Vec<T>) -> TE + Clone,
-    FD: Func(TE) -> Vec<T> + Clone,
 {
     #[track_caller]
     pub(crate) fn new(
         prev: Arc<dyn Rdd<Item = T>>,
         sampler: Arc<dyn RandomSampler<T>>,
         preserves_partitioning: bool,
-        fe: FE,
-        fd: FD,
     ) -> Self {
         let mut vals = RddVals::new(prev.get_context(), prev.get_secure());
         let vals = Arc::new(vals);
@@ -54,18 +44,13 @@ where
             vals,
             sampler,
             preserves_partitioning,
-            fe,
-            fd,
         }
     }
 }
 
-impl<T, TE, FE, FD> Clone for PartitionwiseSampledRdd<T, TE, FE, FD>
+impl<T> Clone for PartitionwiseSampledRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: Func(Vec<T>) -> TE + Clone,
-    FD: Func(TE) -> Vec<T> + Clone,
 {
     fn clone(&self) -> Self {
         PartitionwiseSampledRdd {
@@ -73,18 +58,13 @@ where
             vals: self.vals.clone(),
             sampler: self.sampler.clone(),
             preserves_partitioning: self.preserves_partitioning,
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
         }
     }
 }
 
-impl<T, TE, FE, FD> RddBase for PartitionwiseSampledRdd<T, TE, FE, FD>
+impl<T> RddBase for PartitionwiseSampledRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -93,10 +73,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<TE>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -126,13 +102,6 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
-    }
-
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<TE>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -170,23 +139,16 @@ where
     }
 }
 
-impl<T, V, TE, VE, FE, FD> RddBase for PartitionwiseSampledRdd<(T, V), (TE, VE), FE, FD>
+impl<T, V> RddBase for PartitionwiseSampledRdd<(T, V)>
 where
     T: Data,
     V: Data,
-    TE: Data,
-    VE: Data,
-    FE: SerFunc(Vec<(T, V)>) -> (TE, VE),
-    FD: SerFunc((TE, VE)) -> Vec<(T, V)>,
 {
 }
 
-impl<T, TE, FE, FD> Rdd for PartitionwiseSampledRdd<T, TE, FE, FD>
+impl<T> Rdd for PartitionwiseSampledRdd<T>
 where
     T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
 {
     type Item = T;
     fn get_rdd_base(&self) -> Arc<dyn RddBase> {
@@ -226,26 +188,5 @@ where
         } else {
             self.prev.secure_compute(split, acc_arg, tx)
         }
-    }
-}
-
-impl<T, TE, FE, FD> RddE for PartitionwiseSampledRdd<T, TE, FE, FD>
-where
-    T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
-{
-    type ItemE = TE;
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

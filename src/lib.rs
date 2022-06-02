@@ -36,8 +36,8 @@ pub mod partitioner;
 #[path = "rdd/rdd.rs"]
 pub mod rdd;
 mod scheduler;
-mod serialization_free;
 mod serializable_traits;
+mod serialization_free;
 mod shuffle;
 mod split;
 pub use env::DeploymentMode;
@@ -58,6 +58,9 @@ pub use context::Context;
 pub use error::*;
 pub use io::LocalFsReaderConfig;
 pub use partial::BoundedDouble;
+pub use rdd::{
+    batch_decrypt, batch_encrypt, decrypt, encrypt, ser_decrypt, ser_encrypt, wrapper_tail_compute,
+    ItemE, OpId, PairRdd, Rdd, TailCompInfo, Text, MAX_ENC_BL,
+};
 pub use serializable_traits::Data;
 pub use serialization_free::Construct;
-pub use rdd::{PairRdd, Rdd, RddE, TailCompInfo, Text, OpId, OText, wrapper_tail_compute, encrypt, decrypt, ser_encrypt, ser_decrypt, batch_encrypt, batch_decrypt, MAX_ENC_BL};

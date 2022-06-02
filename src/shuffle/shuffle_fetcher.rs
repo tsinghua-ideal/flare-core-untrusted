@@ -3,6 +3,7 @@ use std::convert::TryFrom;
 use std::sync::{atomic, atomic::AtomicBool, Arc};
 
 use crate::env;
+use crate::rdd::ItemE;
 use crate::serializable_traits::Data;
 use crate::shuffle::*;
 use futures::future;
@@ -118,10 +119,10 @@ impl ShuffleFetcher {
         Ok(results.into_iter())
     }
 
-    pub async fn secure_fetch<K: Data, V: Data>(
+    pub async fn secure_fetch(
         shuffle_id: usize,
         reduce_id: usize,
-    ) -> Result<impl Iterator<Item = Vec<(K, V)>>> {
+    ) -> Result<impl Iterator<Item = Vec<ItemE>>> {
         log::debug!("inside fetch function");
         let mut inputs_by_uri = HashMap::new();
         let server_uris = env::Env::get()
@@ -187,18 +188,21 @@ impl ShuffleFetcher {
                             hyper::body::to_bytes(res.into_body()).await
                         };
                         if let Ok(bytes) = data_bytes {
-                            let deser_data = bincode::deserialize::<Vec<Vec<(K, V)>>>(&bytes.to_vec())?;
+                            let deser_data =
+                                bincode::deserialize::<Vec<Vec<ItemE>>>(&bytes.to_vec())?;
                             shuffle_chunks.push(deser_data);
                         } else {
                             failure.store(true, atomic::Ordering::Release);
                             return Err(ShuffleError::FailedFetchOp);
                         }
                     }
-                    Ok::<Box<dyn Iterator<Item = Vec<(K, V)>> + Send>, _>(Box::new(
+                    Ok::<Box<dyn Iterator<Item = Vec<ItemE>> + Send>, _>(Box::new(
                         shuffle_chunks.into_iter().flatten(),
                     ))
                 } else {
-                    Ok::<Box<dyn Iterator<Item = Vec<(K, V)>> + Send>, _>(Box::new(std::iter::empty()))
+                    Ok::<Box<dyn Iterator<Item = Vec<ItemE>> + Send>, _>(Box::new(
+                        std::iter::empty(),
+                    ))
                 }
             };
             tasks.push(tokio::spawn(task));
@@ -206,7 +210,7 @@ impl ShuffleFetcher {
         log::debug!("total_results fetch results: {}", total_results);
         let task_results = future::join_all(tasks.into_iter()).await;
         let results = task_results.into_iter().fold(
-            Ok(Vec::<Vec<(K, V)>>::with_capacity(total_results)),
+            Ok(Vec::<Vec<ItemE>>::with_capacity(total_results)),
             |curr, res| {
                 if let Ok(mut curr) = curr {
                     if let Ok(Ok(res)) = res {
