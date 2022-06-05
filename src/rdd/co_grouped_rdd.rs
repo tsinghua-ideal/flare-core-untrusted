@@ -21,7 +21,7 @@ use crate::partitioner::Partitioner;
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data};
 use crate::serialization_free::Construct;
-use crate::shuffle::ShuffleFetcher;
+use crate::shuffle::{ShuffleError, ShuffleFetcher};
 use crate::split::Split;
 use serde_derive::{Deserialize, Serialize};
 use sgx_types::*;
@@ -70,49 +70,31 @@ impl Split for CoGroupSplit {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
+pub struct CoGroupedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)) + Clone,
-    FD: Func((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone,
 {
     pub(crate) vals: Arc<RddVals>,
     #[serde(with = "serde_traitobject")]
-    pub(crate) rdd0: Arc<dyn RddE<Item = (K, V), ItemE = (KE, VE)>>,
+    pub(crate) rdd0: Arc<dyn Rdd<Item = (K, V)>>,
     #[serde(with = "serde_traitobject")]
-    pub(crate) rdd1: Arc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
-    pub(crate) fe: FE,
-    pub(crate) fd: FD,
+    pub(crate) rdd1: Arc<dyn Rdd<Item = (K, W)>>,
     #[serde(with = "serde_traitobject")]
     pub(crate) part: Box<dyn Partitioner>,
 }
 
-impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
+impl<K, V, W> CoGroupedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: Func(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)) + Clone,
-    FD: Func((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))> + Clone,
 {
     #[track_caller]
     pub fn new(
-        rdd0: Arc<dyn RddE<Item = (K, V), ItemE = (KE, VE)>>,
-        rdd1: Arc<dyn RddE<Item = (K, W), ItemE = (KE, WE)>>,
-        fe: FE,
-        fd: FD,
+        rdd0: Arc<dyn Rdd<Item = (K, V)>>,
+        rdd1: Arc<dyn Rdd<Item = (K, W)>>,
         part: Box<dyn Partitioner>,
     ) -> Self {
         let context = rdd0.get_context();
@@ -138,8 +120,6 @@ where
             vals,
             rdd0,
             rdd1,
-            fe,
-            fd,
             part,
         }
     }
@@ -161,21 +141,18 @@ where
                     let (tx, rx) = mpsc::sync_channel(0);
                     let part_id = split.get_index();
                     let mut acc_arg_cg = AccArg::new(
-                        part_id,
                         DepInfo::padding_new(0),
                         None,
                         Arc::new(AtomicBool::new(false)),
                     );
                     let handles = rdd.iterator_raw(stage_id, split, &mut acc_arg_cg, tx)?;
-
                     let received = rx.recv().unwrap();
-                    kv.0 = *get_encrypted_data::<(KE, VE)>(
+                    kv.0 = *get_encrypted_data::<ItemE>(
                         rdd.get_op_id(),
                         acc_arg_cg.dep_info,
                         received as *mut u8,
                     );
                     acc_arg_cg.free_enclave_lock();
-
                     if acc_arg_cg.is_caching_final_rdd() {
                         let size = kv.0.get_size();
                         let data_ptr = Box::into_raw(Box::new(kv.0.clone()));
@@ -198,7 +175,7 @@ where
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     has_shuffle = true;
                     //TODO need revision if fe & fd of group_by is passed
-                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(
+                    let fut = ShuffleFetcher::secure_fetch(
                         GetServerUriReq::PrevStage(shuffle_id),
                         split.get_index(),
                         usize::MAX,
@@ -219,7 +196,6 @@ where
                     let (tx, rx) = mpsc::sync_channel(0);
                     let part_id = split.get_index();
                     let mut acc_arg_cg = AccArg::new(
-                        part_id,
                         DepInfo::padding_new(0),
                         None,
                         Arc::new(AtomicBool::new(false)),
@@ -227,7 +203,7 @@ where
                     let handles = rdd.iterator_raw(stage_id, split, &mut acc_arg_cg, tx)?;
 
                     let received = rx.recv().unwrap();
-                    kw.0 = *get_encrypted_data::<(KE, WE)>(
+                    kw.0 = *get_encrypted_data::<ItemE>(
                         rdd.get_op_id(),
                         acc_arg_cg.dep_info,
                         received as *mut u8,
@@ -255,7 +231,7 @@ where
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     has_shuffle = true;
                     //TODO need revision if fe & fd of group_by is passed
-                    let fut = ShuffleFetcher::secure_fetch::<KE, Vec<u8>>(
+                    let fut = ShuffleFetcher::secure_fetch(
                         GetServerUriReq::PrevStage(shuffle_id),
                         split.get_index(),
                         usize::MAX,
@@ -268,18 +244,25 @@ where
                     }
                 }
             }
+            //TODO: what if has_shuffle is false?
             let data = (kv.0, kv.1, kw.0, kw.1);
             //column sort
             let now = Instant::now();
-            let data = self.secure_column_sort(stage_id, data, acc_arg);
+            let data = self.secure_column_sort_first(stage_id, data, acc_arg);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("***in co grouped rdd, column sort, total {:?}***", dur);
 
-            //shuffle read
-            // let now = Instant::now();
-            // let data = self.secure_shuffle_read(data, acc_arg);
-            // let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            // println!("***in co grouped rdd, shuffle read, total {:?}***", dur);
+            //aggregate, exchange info, and aggregate again
+            let now = Instant::now();
+            let data = self.secure_shuffle_read(stage_id, data, acc_arg);
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("***in co grouped rdd, shuffle read, total {:?}***", dur);
+
+            // column sort again to filter
+            let now = Instant::now();
+            let data = self.secure_column_sort_second(stage_id, data, acc_arg);
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+            println!("***in co grouped rdd, column sort, total {:?}***", dur);
 
             let acc_arg = acc_arg.clone();
             let handle = std::thread::spawn(move || {
@@ -296,17 +279,12 @@ where
         }
     }
 
-    fn secure_column_sort(
+    fn secure_column_sort_first(
         &self,
         stage_id: usize,
-        buckets: (
-            Vec<(KE, VE)>,
-            Vec<Vec<(KE, Vec<u8>)>>,
-            Vec<(KE, WE)>,
-            Vec<Vec<(KE, Vec<u8>)>>,
-        ),
+        buckets: (Vec<ItemE>, Vec<Vec<ItemE>>, Vec<ItemE>, Vec<Vec<ItemE>>),
         acc_arg: &mut AccArg,
-    ) -> Vec<(KE, (CE, DE))> {
+    ) -> Vec<ItemE> {
         //need split_num fix first
         wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
 
@@ -327,11 +305,8 @@ where
                 &buckets,
                 &acc_arg.captured_vars,
             );
-            let buckets = get_encrypted_data::<Vec<(KE, (CE, DE))>>(
-                cur_op_ids[0],
-                dep_info,
-                result_ptr as *mut u8,
-            );
+            let buckets =
+                get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
@@ -346,7 +321,7 @@ where
             }
             futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 2))
                 .unwrap();
-            let fut = ShuffleFetcher::secure_fetch::<KE, (CE, DE)>(
+            let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(stage_id),
                 reduce_id,
                 usize::MAX,
@@ -361,56 +336,184 @@ where
             fetched_data
         );
         //step 3 - 8
-        let data = ShuffleFetcher::fetch_sort::<KE, (CE, DE)>(fetched_data, stage_id, acc_arg);
+        let data = ShuffleFetcher::fetch_sort(fetched_data, stage_id, acc_arg, vec![21, 22, 23]);
+        data
+    }
+
+    //similar to secure_column_sort_first
+    fn secure_column_sort_second(
+        &self,
+        stage_id: usize,
+        data: Vec<ItemE>,
+        acc_arg: &mut AccArg,
+    ) -> Vec<ItemE> {
+        let cur_rdd_ids = vec![self.vals.id];
+        let cur_op_ids = vec![self.vals.op_id];
+        let reduce_id = *acc_arg.part_ids.last().unwrap();
+        let cur_part_ids = vec![reduce_id];
+        //step 1: sort + step 2: shuffle (transpose)
+        let fetched_data = {
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(25);
+            let result_ptr = wrapper_secure_execute(
+                &cur_rdd_ids,
+                &cur_op_ids,
+                &cur_part_ids,
+                Default::default(),
+                dep_info,
+                &data,
+                &acc_arg.captured_vars,
+            );
+            let buckets =
+                get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            acc_arg.free_enclave_lock();
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let ser_bytes = bincode::serialize(&bucket).unwrap();
+                log::debug!(
+                    "during step 2. bucket #{} in stage id #{}, partition #{}: {:?}",
+                    i,
+                    stage_id,
+                    reduce_id,
+                    bucket
+                );
+                env::SORT_CACHE.insert((stage_id, reduce_id, i), ser_bytes);
+            }
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 2))
+                .unwrap();
+            let fut = ShuffleFetcher::secure_fetch(
+                GetServerUriReq::CurStage(stage_id),
+                reduce_id,
+                usize::MAX,
+            );
+            futures::executor::block_on(fut)
+                .unwrap()
+                .collect::<Vec<_>>()
+        };
+        log::debug!(
+            "step 2 finished. partition = {:?}, data = {:?}",
+            reduce_id,
+            fetched_data
+        );
+        //step 3 - 8
+        let data = ShuffleFetcher::fetch_sort(fetched_data, stage_id, acc_arg, vec![26, 27, 28]);
         data
     }
 
     fn secure_shuffle_read(
         &self,
-        buckets: (
-            Vec<Vec<(KE, VE)>>,
-            Vec<Vec<(KE, Vec<u8>)>>,
-            Vec<Vec<(KE, WE)>>,
-            Vec<Vec<(KE, Vec<u8>)>>,
-        ),
+        stage_id: usize,
+        data: Vec<ItemE>,
         acc_arg: &mut AccArg,
-    ) -> Vec<(KE, (CE, DE))> {
-        acc_arg.get_enclave_lock();
+    ) -> Vec<ItemE> {
+        //the current implementation is not fully oblivious
+        //because Opaque doe not design for general oblivious join
+        let reduce_id = *acc_arg.part_ids.last().unwrap();
+        let num_splits = *acc_arg.split_nums.last().unwrap();
+
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
-        let cur_part_ids = vec![*acc_arg.part_ids.last().unwrap()];
-        let dep_info = DepInfo::padding_new(2);
+        let cur_part_ids = vec![reduce_id];
 
-        let result_ptr = wrapper_secure_execute(
-            &cur_rdd_ids,
-            &cur_op_ids,
-            &cur_part_ids,
-            Default::default(),
-            dep_info,
-            &buckets,
-            &acc_arg.captured_vars,
-        );
+        //first aggregate
+        let mut agg_data = {
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(2);
+            let result_ptr = wrapper_secure_execute(
+                &cur_rdd_ids,
+                &cur_op_ids,
+                &cur_part_ids,
+                Default::default(),
+                dep_info,
+                &data,
+                &acc_arg.captured_vars,
+            );
 
-        let mut result =
-            get_encrypted_data::<(KE, (CE, DE))>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
-        acc_arg.free_enclave_lock();
-        *result
+            let result =
+                get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            acc_arg.free_enclave_lock();
+            *result
+        };
+
+        if reduce_id != 0 {
+            let fut = ShuffleFetcher::secure_fetch(
+                GetServerUriReq::CurStage(stage_id),
+                reduce_id,
+                (reduce_id + num_splits - 1) % num_splits,
+            );
+            let mut fut_res = futures::executor::block_on(fut);
+            //the aggregate info may not be prepared
+            while fut_res.is_err() {
+                match fut_res {
+                    Ok(_) => unreachable!(),
+                    Err(ShuffleError::RequestedCacheNotFound) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        fut_res = futures::executor::block_on(ShuffleFetcher::secure_fetch(
+                            GetServerUriReq::CurStage(stage_id),
+                            reduce_id,
+                            (reduce_id + num_splits - 1) % num_splits,
+                        ));
+                    }
+                    _ => break,
+                }
+            }
+            let mut received_agg_info = fut_res.unwrap().collect::<Vec<_>>();
+            //aggregate again
+            if !received_agg_info.is_empty() {
+                let sup_data = received_agg_info.remove(0);
+                assert!(received_agg_info.is_empty());
+                let mut tmp_captured_var = HashMap::new();
+                tmp_captured_var.insert(cur_rdd_ids[0], sup_data);
+
+                acc_arg.get_enclave_lock();
+                let dep_info = DepInfo::padding_new(24);
+                let result_ptr = wrapper_secure_execute(
+                    &cur_rdd_ids,
+                    &cur_op_ids,
+                    &cur_part_ids,
+                    Default::default(),
+                    dep_info,
+                    &agg_data,
+                    &tmp_captured_var,
+                );
+
+                let mut result =
+                    get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+                acc_arg.free_enclave_lock();
+                //insert result in the front
+                assert!(result.len() <= 2);
+                agg_data[0] = result.pop().unwrap();
+                if !result.is_empty() {
+                    agg_data.insert(0, result.remove(0));
+                }
+            }
+        }
+
+        //send aggregate info to the next worker
+        if reduce_id != num_splits - 1 {
+            let last_kc = agg_data.pop();
+            if last_kc.is_some() {
+                let ser_bytes = bincode::serialize(&vec![last_kc.unwrap()]).unwrap();
+                env::SORT_CACHE.insert(
+                    (stage_id, reduce_id, (reduce_id + 1) % num_splits),
+                    ser_bytes,
+                );
+            } else {
+                env::SORT_CACHE.insert(
+                    (stage_id, reduce_id, (reduce_id + 1) % num_splits),
+                    bincode::serialize(&Vec::<ItemE>::new()).unwrap(),
+                );
+            }
+        }
+
+        agg_data
     }
 }
 
-impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> RddBase
-    for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
+impl<K, V, W> RddBase for CoGroupedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)),
-    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -419,10 +522,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(KE, (CE, DE))>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -464,7 +563,7 @@ where
             log::debug!("creating aggregator inside cogrouprdd");
             deps.push(Dependency::ShuffleDependency(
                 //TODO need revision if fe & fd of group_by is passed
-                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
+                Arc::new(ShuffleDependency::new(
                     shuffle_ids.remove(0),
                     true,
                     rdd_base,
@@ -491,7 +590,7 @@ where
             log::debug!("creating aggregator inside cogrouprdd");
             deps.push(Dependency::ShuffleDependency(
                 //TODO need revision if fe & fd of group_by is passed
-                Arc::new(ShuffleDependency::<_, _, _, KE, Vec<u8>>::new(
+                Arc::new(ShuffleDependency::new(
                     shuffle_ids.remove(0),
                     true,
                     rdd_base,
@@ -508,13 +607,6 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
-    }
-
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<(KE, (CE, DE))>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -574,18 +666,11 @@ where
     }
 }
 
-impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> Rdd for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
+impl<K, V, W> Rdd for CoGroupedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)),
-    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
 {
     type Item = (K, (Vec<V>, Vec<W>));
     //type Item = (K, Vec<Vec<Box<dyn AnyData>>>);
@@ -702,32 +787,5 @@ where
         } else {
             self.secure_compute_prev(stage_id, split, acc_arg, tx)
         }
-    }
-}
-
-impl<K, V, W, KE, VE, WE, CE, DE, FE, FD> RddE for CoGroupedRdd<K, V, W, KE, VE, WE, CE, DE, FE, FD>
-where
-    K: Data + Eq + Hash,
-    V: Data,
-    W: Data,
-    KE: Data + Eq + Hash,
-    VE: Data,
-    CE: Data,
-    WE: Data,
-    DE: Data,
-    FE: SerFunc(Vec<(K, (Vec<V>, Vec<W>))>) -> (KE, (CE, DE)),
-    FD: SerFunc((KE, (CE, DE))) -> Vec<(K, (Vec<V>, Vec<W>))>,
-{
-    type ItemE = (KE, (CE, DE));
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

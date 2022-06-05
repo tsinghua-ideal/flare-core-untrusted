@@ -33,9 +33,9 @@ where
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-enum DataForm<T, TE> {
+enum DataForm<T> {
     Plaintext(Vec<Arc<Vec<T>>>),
-    Ciphertext(Vec<Arc<Vec<TE>>>),
+    Ciphertext(Vec<Arc<Vec<ItemE>>>),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -88,63 +88,42 @@ impl<T: Data> ParallelCollectionSplit<T> {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ParallelCollectionVals<T, TE> {
+pub struct ParallelCollectionVals<T> {
     vals: Arc<RddVals>,
     #[serde(skip_serializing, skip_deserializing)]
     context: Weak<Context>,
-    splits_: DataForm<T, TE>,
+    splits_: DataForm<T>,
     num_slices: usize,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ParallelCollection<T, TE, FE, FD>
-where
-    FE: Func(Vec<T>) -> TE + Clone,
-    FD: Func(TE) -> Vec<T> + Clone,
-{
+pub struct ParallelCollection<T> {
     #[serde(skip_serializing, skip_deserializing)]
     name: Mutex<String>,
-    rdd_vals: Arc<ParallelCollectionVals<T, TE>>,
-    fe: FE,
-    fd: FD,
+    rdd_vals: Arc<ParallelCollectionVals<T>>,
 }
 
-impl<T, TE, FE, FD> Clone for ParallelCollection<T, TE, FE, FD>
+impl<T> Clone for ParallelCollection<T>
 where
     T: Data,
-    TE: Data,
-    FE: Func(Vec<T>) -> TE + Clone,
-    FD: Func(TE) -> Vec<T> + Clone,
 {
     fn clone(&self) -> Self {
         ParallelCollection {
             name: Mutex::new(self.name.lock().clone()),
             rdd_vals: self.rdd_vals.clone(),
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
         }
     }
 }
 
-impl<T, TE, FE, FD> ParallelCollection<T, TE, FE, FD>
+impl<T> ParallelCollection<T>
 where
     T: Data,
-    TE: Data,
-    FE: Func(Vec<T>) -> TE + Clone,
-    FD: Func(TE) -> Vec<T> + Clone,
 {
     #[track_caller]
-    pub fn new<I, IE>(
-        context: Arc<Context>,
-        data: I,
-        data_enc: IE,
-        fe: FE,
-        fd: FD,
-        num_slices: usize,
-    ) -> Self
+    pub fn new<I, IE>(context: Arc<Context>, data: I, data_enc: IE, num_slices: usize) -> Self
     where
         I: IntoIterator<Item = T>,
-        IE: IntoIterator<Item = TE>,
+        IE: IntoIterator<Item = ItemE>,
     {
         let data: Vec<_> = data.into_iter().collect();
         let data_len = data.len();
@@ -162,11 +141,9 @@ where
             rdd_vals: Arc::new(ParallelCollectionVals {
                 context: Arc::downgrade(&context),
                 vals: Arc::new(RddVals::new(context.clone(), secure)), //chain of security
-                splits_: ParallelCollection::<T, TE, FE, FD>::slice(data, data_enc, num_slices),
+                splits_: ParallelCollection::<T>::slice(data, data_enc, num_slices),
                 num_slices, //field init shorthand
             }),
-            fe,
-            fd,
         }
     }
 
@@ -190,7 +167,7 @@ where
     }
     */
 
-    fn slice(data: Vec<T>, data_enc: Vec<TE>, num_slices: usize) -> DataForm<T, TE> {
+    fn slice(data: Vec<T>, data_enc: Vec<ItemE>, num_slices: usize) -> DataForm<T> {
         if num_slices < 1 {
             panic!("Number of slices should be greater than or equal to 1");
         } else {
@@ -242,23 +219,16 @@ where
     }
 }
 
-impl<K, V, KE, VE, FE, FD> RddBase for ParallelCollection<(K, V), (KE, VE), FE, FD>
+impl<K, V> RddBase for ParallelCollection<(K, V)>
 where
     K: Data,
     V: Data,
-    KE: Data,
-    VE: Data,
-    FE: SerFunc(Vec<(K, V)>) -> (KE, VE),
-    FD: SerFunc((KE, VE)) -> Vec<(K, V)>,
 {
 }
 
-impl<T, TE, FE, FD> RddBase for ParallelCollection<T, TE, FE, FD>
+impl<T> RddBase for ParallelCollection<T>
 where
     T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
 {
     fn cache(&self) {
         self.rdd_vals.vals.cache();
@@ -267,10 +237,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.rdd_vals.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<TE>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -304,13 +270,6 @@ where
 
     fn get_secure(&self) -> bool {
         self.rdd_vals.vals.secure
-    }
-
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<TE>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -362,20 +321,15 @@ where
     }
 }
 
-impl<T, TE, FE, FD> Rdd for ParallelCollection<T, TE, FE, FD>
+impl<T> Rdd for ParallelCollection<T>
 where
     T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
 {
     type Item = T;
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
         Arc::new(ParallelCollection {
             name: Mutex::new(self.name.lock().clone()),
             rdd_vals: self.rdd_vals.clone(),
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
         })
     }
 
@@ -398,7 +352,7 @@ where
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
-        if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<TE>>() {
+        if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<ItemE>>() {
             let cur_rdd_id = self.get_rdd_id();
             let cur_op_id = self.get_op_id();
             let cur_part_id = split.get_index();
@@ -421,26 +375,5 @@ where
         } else {
             Err(Error::DowncastFailure("ParallelCollectionSplit<TE>"))
         }
-    }
-}
-
-impl<T, TE, FE, FD> RddE for ParallelCollection<T, TE, FE, FD>
-where
-    T: Data,
-    TE: Data,
-    FE: SerFunc(Vec<T>) -> TE,
-    FD: SerFunc(TE) -> Vec<T>,
-{
-    type ItemE = TE;
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

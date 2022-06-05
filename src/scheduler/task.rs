@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::net::Ipv4Addr;
 
+use crate::rdd::ItemE;
 use crate::scheduler::ResultTask;
 use crate::serializable_traits::{AnyData, Data, SerFunc};
 use crate::shuffle::ShuffleMapTask;
@@ -81,11 +82,16 @@ pub(crate) enum TaskOption {
     ShuffleMapTask(Box<dyn TaskBox>),
 }
 
-impl<T: Data, TE: Data, U: Data, F> From<ResultTask<T, TE, U, F>> for TaskOption
+impl<T: Data, U: Data, F> From<ResultTask<T, U, F>> for TaskOption
 where
-    F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+    F: SerFunc(
+        (
+            TaskContext,
+            (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+        ),
+    ) -> U,
 {
-    fn from(t: ResultTask<T, TE, U, F>) -> Self {
+    fn from(t: ResultTask<T, U, F>) -> Self {
         TaskOption::ResultTask(Box::new(t) as Box<dyn TaskBox>)
     }
 }

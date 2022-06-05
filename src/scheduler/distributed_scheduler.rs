@@ -13,7 +13,7 @@ use crate::env;
 use crate::error::{Error, NetworkError, Result};
 use crate::map_output_tracker::MapOutputTracker;
 use crate::partial::{ApproximateActionListener, ApproximateEvaluator, PartialResult};
-use crate::rdd::{OpId, RddBase, RddE};
+use crate::rdd::{ItemE, OpId, Rdd, RddBase};
 use crate::scheduler::{
     listener::{JobEndListener, JobStartListener},
     CompletionEvent, EventQueue, Job, JobListener, JobTracker, LiveListenerBus, NativeScheduler,
@@ -120,10 +120,10 @@ impl DistributedScheduler {
 
     /// Run an approximate job on the given RDD and pass all the results to an ApproximateEvaluator
     /// as they arrive. Returns a partial result object from the evaluator.
-    pub fn run_approximate_job<T: Data, TE: Data, U: Data, R, F, E>(
+    pub fn run_approximate_job<T: Data, U: Data, R, F, E>(
         self: Arc<Self>,
         func: Arc<F>,
-        final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        final_rdd: Arc<dyn Rdd<Item = T>>,
         action_id: Option<OpId>,
         evaluator: E,
         timeout: Duration,
@@ -132,7 +132,7 @@ impl DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
@@ -180,10 +180,10 @@ impl DistributedScheduler {
         })
     }
 
-    pub fn run_job<T: Data, TE: Data, U: Data, F>(
+    pub fn run_job<T: Data, U: Data, F>(
         self: Arc<Self>,
         func: Arc<F>,
-        final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        final_rdd: Arc<dyn Rdd<Item = T>>,
         action_id: Option<OpId>,
         partitions: Vec<usize>,
         allow_local: bool,
@@ -192,7 +192,7 @@ impl DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U,
     {
@@ -218,16 +218,16 @@ impl DistributedScheduler {
     }
 
     /// Start the event processing loop for a given job.
-    async fn event_process_loop<T: Data, TE: Data, U: Data, F, L>(
+    async fn event_process_loop<T: Data, U: Data, F, L>(
         self: Arc<Self>,
         allow_local: bool,
-        jt: Arc<JobTracker<F, U, T, TE, L>>,
+        jt: Arc<JobTracker<F, U, T, L>>,
     ) -> Result<Vec<U>>
     where
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U,
         L: JobListener,
@@ -316,7 +316,7 @@ impl DistributedScheduler {
             .collect())
     }
 
-    async fn receive_results<T: Data, TE: Data, U: Data, F, R>(
+    async fn receive_results<T: Data, U: Data, F, R>(
         event_queues: Arc<DashMap<usize, VecDeque<CompletionEvent>>>,
         receiver: R,
         task: TaskOption,
@@ -325,7 +325,7 @@ impl DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U,
         R: futures::AsyncRead + std::marker::Unpin,
@@ -356,7 +356,7 @@ impl DistributedScheduler {
                     TaskResult::ResultTask(r) => r,
                     _ => panic!("wrong result type"),
                 };
-                if let Ok(task_final) = tsk.downcast::<ResultTask<T, TE, U, F>>() {
+                if let Ok(task_final) = tsk.downcast::<ResultTask<T, U, F>>() {
                     let task_final = task_final as Box<dyn TaskBase>;
                     DistributedScheduler::task_ended(
                         event_queues,
@@ -409,7 +409,7 @@ impl DistributedScheduler {
 
 #[async_trait::async_trait]
 impl NativeScheduler for DistributedScheduler {
-    fn submit_task<T: Data, TE: Data, U: Data, F>(
+    fn submit_task<T: Data, U: Data, F>(
         &self,
         task: TaskOption,
         _id_in_job: usize,
@@ -418,7 +418,7 @@ impl NativeScheduler for DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U,
     {
@@ -461,7 +461,7 @@ impl NativeScheduler for DistributedScheduler {
                         log::debug!("sent data to exec @{}", target_executor.port());
 
                         // receive results back
-                        DistributedScheduler::receive_results::<T, TE, U, F, _>(
+                        DistributedScheduler::receive_results::<T, U, F, _>(
                             event_queues_clone,
                             reader,
                             task,

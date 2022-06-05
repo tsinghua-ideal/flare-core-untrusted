@@ -9,10 +9,11 @@ use crate::context::Context;
 use crate::dependency::{Dependency, ShuffleDependency};
 use crate::env::{Env, BOUNDED_MEM_CACHE, RDDB_MAP};
 use crate::error::Result;
+use crate::map_output_tracker::GetServerUriReq;
 use crate::partitioner::Partitioner;
 use crate::rdd::*;
 use crate::serializable_traits::{AnyData, Data, Func, SerFunc};
-use crate::shuffle::ShuffleFetcher;
+use crate::shuffle::{ShuffleError, ShuffleFetcher};
 use crate::split::Split;
 use parking_lot::Mutex;
 use serde_derive::{Deserialize, Serialize};
@@ -36,15 +37,11 @@ impl Split for ShuffledRddSplit {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ShuffledRdd<K, V, C, KE, CE, FE, FD>
+pub struct ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
-    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone,
 {
     #[serde(with = "serde_traitobject")]
     parent: Arc<dyn Rdd<Item = (K, V)>>,
@@ -54,19 +51,13 @@ where
     #[serde(with = "serde_traitobject")]
     part: Box<dyn Partitioner>,
     shuffle_id: usize,
-    fe: FE,
-    fd: FD,
 }
 
-impl<K, V, C, KE, CE, FE, FD> Clone for ShuffledRdd<K, V, C, KE, CE, FE, FD>
+impl<K, V, C> Clone for ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
-    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone,
 {
     fn clone(&self) -> Self {
         ShuffledRdd {
@@ -75,29 +66,21 @@ where
             vals: self.vals.clone(),
             part: self.part.clone(),
             shuffle_id: self.shuffle_id,
-            fe: self.fe.clone(),
-            fd: self.fd.clone(),
         }
     }
 }
 
-impl<K, V, C, KE, CE, FE, FD> ShuffledRdd<K, V, C, KE, CE, FE, FD>
+impl<K, V, C> ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: Func(Vec<(K, C)>) -> (KE, CE) + Clone,
-    FD: Func((KE, CE)) -> Vec<(K, C)> + Clone,
 {
     #[track_caller]
     pub(crate) fn new(
         parent: Arc<dyn Rdd<Item = (K, V)>>,
         aggregator: Arc<Aggregator<K, V, C>>,
         part: Box<dyn Partitioner>,
-        fe: FE,
-        fd: FD,
     ) -> Self {
         let ctx = parent.get_context();
         let secure = parent.get_secure(); //temp
@@ -111,8 +94,6 @@ where
             vals,
             part,
             shuffle_id,
-            fe,
-            fd,
         }
     }
 
@@ -124,32 +105,36 @@ where
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
-        let fut = ShuffleFetcher::secure_fetch::<KE, CE>(self.shuffle_id, part_id);
-        let buckets: Vec<Vec<(KE, CE)>> = futures::executor::block_on(fut)?
+        let fut = ShuffleFetcher::secure_fetch(
+            GetServerUriReq::PrevStage(self.shuffle_id),
+            part_id,
+            usize::MAX,
+        );
+        let buckets: Vec<Vec<ItemE>> = futures::executor::block_on(fut)?
             .into_iter()
             .filter(|sub_part| sub_part.len() > 0)
             .collect(); // bucket per subpartition
-                        //pre_merge
-        let parent_rdd_id = self.parent.get_rdd_id();
-        let child_rdd_id = self.vals.id;
-        let parent_op_id = self.parent.get_op_id();
-        let child_op_id = self.vals.op_id;
-        let dep_info = DepInfo::new(1, 0, parent_rdd_id, child_rdd_id, parent_op_id, child_op_id);
-        println!("bucket size before pre_merge: {:?}", buckets.get_size());
-        acc_arg.get_enclave_lock();
-        let buckets = wrapper_pre_merge(parent_op_id, buckets, dep_info);
-        acc_arg.free_enclave_lock();
-        println!("bucket size after pre_merge: {:?}", buckets.get_size());
-        //
         let num_sub_part = buckets.len();
         if num_sub_part == 0 {
             return Ok(Vec::new());
         }
+        //column sort
+        let now = Instant::now();
+        let data = self.secure_column_sort_first(stage_id, buckets, acc_arg);
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("***in shuffled rdd, first column sort, total {:?}***", dur);
+
         //shuffle read
         let now = Instant::now();
-        let data = self.secure_shuffle_read(buckets, acc_arg);
+        let data = self.secure_shuffle_read(stage_id, data, acc_arg);
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("***in shuffled rdd, shuffle read, total {:?}***", dur);
+
+        //column sort again to filter
+        let now = Instant::now();
+        let data = self.secure_column_sort_second(stage_id, data, acc_arg);
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("***in shuffled rdd, second column sort, total {:?}***", dur);
 
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
@@ -161,44 +146,211 @@ where
         Ok(vec![handle])
     }
 
-    fn secure_shuffle_read(
+    fn secure_column_sort_first(
         &self,
-        buckets: Vec<Vec<(KE, CE)>>,
+        stage_id: usize,
+        buckets: Vec<Vec<ItemE>>,
         acc_arg: &mut AccArg,
-    ) -> Vec<(KE, CE)> {
-        acc_arg.get_enclave_lock();
+    ) -> Vec<ItemE> {
+        //need split_num fix first
+        wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
+        //count the cnt_per_partition
+        {
+            let cur_rdd_ids = vec![self.vals.id];
+            let cur_op_ids = vec![self.vals.op_id];
+            let reduce_id = *acc_arg.part_ids.last().unwrap();
+            let cur_part_ids = vec![reduce_id];
+
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(20);
+            let invalid_ptr = wrapper_secure_execute(
+                &cur_rdd_ids,
+                &cur_op_ids,
+                &cur_part_ids,
+                Default::default(),
+                dep_info,
+                &buckets,
+                &acc_arg.captured_vars,
+            );
+            assert_eq!(invalid_ptr, 0);
+            acc_arg.free_enclave_lock();
+        }
+        //step 3 - 8
+        let data = ShuffleFetcher::fetch_sort(buckets, stage_id, acc_arg, vec![21, 22, 23]);
+        data
+    }
+
+    fn secure_column_sort_second(
+        &self,
+        stage_id: usize,
+        data: Vec<ItemE>,
+        acc_arg: &mut AccArg,
+    ) -> Vec<ItemE> {
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
-        let cur_part_ids = vec![*acc_arg.part_ids.last().unwrap()];
-        let dep_info = DepInfo::padding_new(2);
-
-        let result_ptr = wrapper_secure_execute(
-            &cur_rdd_ids,
-            &cur_op_ids,
-            &cur_part_ids,
-            Default::default(),
-            dep_info,
-            &buckets,
-            &acc_arg.captured_vars,
+        let reduce_id = *acc_arg.part_ids.last().unwrap();
+        let cur_part_ids = vec![reduce_id];
+        //step 1: sort + step 2: shuffle (transpose)
+        let fetched_data = {
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(25);
+            let result_ptr = wrapper_secure_execute(
+                &cur_rdd_ids,
+                &cur_op_ids,
+                &cur_part_ids,
+                Default::default(),
+                dep_info,
+                &data,
+                &acc_arg.captured_vars,
+            );
+            let buckets =
+                get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            acc_arg.free_enclave_lock();
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let ser_bytes = bincode::serialize(&bucket).unwrap();
+                log::debug!(
+                    "during step 2. bucket #{} in stage id #{}, partition #{}: {:?}",
+                    i,
+                    stage_id,
+                    reduce_id,
+                    bucket
+                );
+                env::SORT_CACHE.insert((stage_id, reduce_id, i), ser_bytes);
+            }
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 2))
+                .unwrap();
+            let fut = ShuffleFetcher::secure_fetch(
+                GetServerUriReq::CurStage(stage_id),
+                reduce_id,
+                usize::MAX,
+            );
+            futures::executor::block_on(fut)
+                .unwrap()
+                .collect::<Vec<_>>()
+        };
+        log::debug!(
+            "step 2 finished. partition = {:?}, data = {:?}",
+            reduce_id,
+            fetched_data
         );
+        //step 3 - 8
+        let data = ShuffleFetcher::fetch_sort(fetched_data, stage_id, acc_arg, vec![26, 27, 28]);
+        data
+    }
 
-        let mut result =
-            get_encrypted_data::<(KE, CE)>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+    fn secure_shuffle_read(
+        &self,
+        stage_id: usize,
+        data: Vec<ItemE>,
+        acc_arg: &mut AccArg,
+    ) -> Vec<ItemE> {
+        //the current implementation is not fully oblivious
+        //because Opaque doe not design for general oblivious group_by
+        //but aggregate should be oblivious
+        let reduce_id = *acc_arg.part_ids.last().unwrap();
+        let num_splits = *acc_arg.split_nums.last().unwrap();
 
-        acc_arg.free_enclave_lock();
-        *result
+        let cur_rdd_ids = vec![self.vals.id];
+        let cur_op_ids = vec![self.vals.op_id];
+        let cur_part_ids = vec![reduce_id];
+
+        //first aggregate
+        let mut agg_data = {
+            acc_arg.get_enclave_lock();
+
+            let dep_info = DepInfo::padding_new(2);
+
+            let result_ptr = wrapper_secure_execute(
+                &cur_rdd_ids,
+                &cur_op_ids,
+                &cur_part_ids,
+                Default::default(),
+                dep_info,
+                &data,
+                &acc_arg.captured_vars,
+            );
+
+            let result =
+                get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            acc_arg.free_enclave_lock();
+            *result
+        };
+
+        if reduce_id != 0 {
+            let fut = ShuffleFetcher::secure_fetch(
+                GetServerUriReq::CurStage(stage_id),
+                reduce_id,
+                (reduce_id + num_splits - 1) % num_splits,
+            );
+            let mut fut_res = futures::executor::block_on(fut);
+            //the aggregate info may not be prepared
+            while fut_res.is_err() {
+                match fut_res {
+                    Ok(_) => unreachable!(),
+                    Err(ShuffleError::RequestedCacheNotFound) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        fut_res = futures::executor::block_on(ShuffleFetcher::secure_fetch(
+                            GetServerUriReq::CurStage(stage_id),
+                            reduce_id,
+                            (reduce_id + num_splits - 1) % num_splits,
+                        ));
+                    }
+                    _ => break,
+                }
+            }
+            let mut received_agg_info = fut_res.unwrap().collect::<Vec<_>>();
+            //aggregate again
+            if !received_agg_info.is_empty() {
+                let sup_data = received_agg_info.remove(0);
+                assert!(received_agg_info.is_empty());
+                let mut tmp_captured_var = HashMap::new();
+                tmp_captured_var.insert(cur_rdd_ids[0], sup_data);
+
+                acc_arg.get_enclave_lock();
+                let dep_info = DepInfo::padding_new(24);
+                let result_ptr = wrapper_secure_execute(
+                    &cur_rdd_ids,
+                    &cur_op_ids,
+                    &cur_part_ids,
+                    Default::default(),
+                    dep_info,
+                    &agg_data,
+                    &tmp_captured_var,
+                );
+
+                let result =
+                    get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+                acc_arg.free_enclave_lock();
+                agg_data = *result;
+            }
+        }
+
+        //send aggregate info to the next worker
+        if reduce_id != num_splits - 1 {
+            let last_kc = agg_data.pop();
+            if last_kc.is_some() {
+                let ser_bytes = bincode::serialize(&vec![last_kc.unwrap()]).unwrap();
+                env::SORT_CACHE.insert(
+                    (stage_id, reduce_id, (reduce_id + 1) % num_splits),
+                    ser_bytes,
+                );
+            } else {
+                env::SORT_CACHE.insert(
+                    (stage_id, reduce_id, (reduce_id + 1) % num_splits),
+                    bincode::serialize(&Vec::<ItemE>::new()).unwrap(),
+                );
+            }
+        }
+
+        agg_data
     }
 }
 
-impl<K, V, C, KE, CE, FE, FD> RddBase for ShuffledRdd<K, V, C, KE, CE, FE, FD>
+impl<K, V, C> RddBase for ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
-    FD: SerFunc((KE, CE)) -> Vec<(K, C)>,
 {
     fn cache(&self) {
         self.vals.cache();
@@ -207,10 +359,6 @@ where
 
     fn should_cache(&self) -> bool {
         self.vals.should_cache()
-    }
-
-    fn free_data_enc(&self, ptr: *mut u8) {
-        let _data_enc = unsafe { Box::from_raw(ptr as *mut Vec<(KE, CE)>) };
     }
 
     fn get_rdd_id(&self) -> usize {
@@ -233,7 +381,7 @@ where
         let cur_rdd_id = self.vals.id;
         let cur_op_id = self.vals.op_id;
         vec![Dependency::ShuffleDependency(Arc::new(
-            ShuffleDependency::<_, _, _, KE, CE>::new(
+            ShuffleDependency::new(
                 self.shuffle_id,
                 false,
                 self.parent.get_rdd_base(),
@@ -248,13 +396,6 @@ where
 
     fn get_secure(&self) -> bool {
         self.vals.secure
-    }
-
-    fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
-        // rdd_id is actually op_id
-        let value = move_data::<(KE, CE)>(self.get_op_id(), value_ptr);
-        let size = value.get_size();
-        (Box::into_raw(value) as *mut u8, size)
     }
 
     fn splits(&self) -> Vec<Box<dyn Split>> {
@@ -287,15 +428,11 @@ where
     }
 }
 
-impl<K, V, C, KE, CE, FE, FD> Rdd for ShuffledRdd<K, V, C, KE, CE, FE, FD>
+impl<K, V, C> Rdd for ShuffledRdd<K, V, C>
 where
     K: Data + Eq + Hash,
     V: Data,
     C: Data,
-    KE: Data,
-    CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
-    FD: SerFunc((KE, CE)) -> Vec<(K, C)>,
 {
     type Item = (K, C);
 
@@ -355,30 +492,5 @@ where
         } else {
             self.secure_compute_prev(stage_id, split, acc_arg, tx)
         }
-    }
-}
-
-impl<K, V, C, KE, CE, FE, FD> RddE for ShuffledRdd<K, V, C, KE, CE, FE, FD>
-where
-    K: Data + Eq + Hash,
-    V: Data,
-    C: Data,
-    KE: Data,
-    CE: Data,
-    FE: SerFunc(Vec<(K, C)>) -> (KE, CE),
-    FD: SerFunc((KE, CE)) -> Vec<(K, C)>,
-{
-    type ItemE = (KE, CE);
-
-    fn get_rdde(&self) -> Arc<dyn RddE<Item = Self::Item, ItemE = Self::ItemE>> {
-        Arc::new(self.clone())
-    }
-
-    fn get_fe(&self) -> Box<dyn Func(Vec<Self::Item>) -> Self::ItemE> {
-        Box::new(self.fe.clone()) as Box<dyn Func(Vec<Self::Item>) -> Self::ItemE>
-    }
-
-    fn get_fd(&self) -> Box<dyn Func(Self::ItemE) -> Vec<Self::Item>> {
-        Box::new(self.fd.clone()) as Box<dyn Func(Self::ItemE) -> Vec<Self::Item>>
     }
 }

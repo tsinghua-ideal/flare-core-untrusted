@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::scheduler::{JobListener, NativeScheduler, Stage, TaskBase, TaskContext};
 use crate::serializable_traits::{Data, SerFunc};
-use crate::{RddE, OpId, Result};
+use crate::{ItemE, OpId, Rdd, Result};
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -46,16 +46,21 @@ impl Ord for Job {
 type PendingTasks = BTreeMap<Stage, BTreeSet<Box<dyn TaskBase>>>;
 
 /// Contains all the necessary types to run and track a job progress
-pub(crate) struct JobTracker<F, U: Data, T: Data, TE: Data, L>
+pub(crate) struct JobTracker<F, U: Data, T: Data, L>
 where
-    F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+    F: SerFunc(
+        (
+            TaskContext,
+            (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+        ),
+    ) -> U,
     L: JobListener,
 {
     pub output_parts: Vec<usize>,
     pub num_output_parts: usize,
     pub final_stage: Stage,
     pub func: Arc<F>,
-    pub final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+    pub final_rdd: Arc<dyn Rdd<Item = T>>,
     pub action_id: Option<OpId>,
     pub run_id: usize,
     pub waiting: Mutex<BTreeSet<Stage>>,
@@ -65,23 +70,27 @@ where
     pub pending_tasks: Mutex<PendingTasks>,
     pub listener: L,
     _marker_t: PhantomData<T>,
-    _marker_te: PhantomData<TE>,
     _marker_u: PhantomData<U>,
 }
 
-impl<F, U: Data, T: Data, TE: Data, L> JobTracker<F, U, T, TE, L>
+impl<F, U: Data, T: Data, L> JobTracker<F, U, T, L>
 where
-    F: SerFunc((TaskContext, (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>))) -> U,
+    F: SerFunc(
+        (
+            TaskContext,
+            (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+        ),
+    ) -> U,
     L: JobListener,
 {
     pub async fn from_scheduler<S>(
         scheduler: &S,
         func: Arc<F>,
-        final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        final_rdd: Arc<dyn Rdd<Item = T>>,
         action_id: Option<OpId>,
         output_parts: Vec<usize>,
         listener: L,
-    ) -> Result<Arc<JobTracker<F, U, T, TE, L>>>
+    ) -> Result<Arc<JobTracker<F, U, T, L>>>
     where
         S: NativeScheduler,
     {
@@ -104,11 +113,11 @@ where
         run_id: usize,
         final_stage: Stage,
         func: Arc<F>,
-        final_rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        final_rdd: Arc<dyn Rdd<Item = T>>,
         action_id: Option<OpId>,
         output_parts: Vec<usize>,
         listener: L,
-    ) -> Arc<JobTracker<F, U, T, TE, L>> {
+    ) -> Arc<JobTracker<F, U, T, L>> {
         let finished: Vec<bool> = (0..output_parts.len()).map(|_| false).collect();
         let pending_tasks: BTreeMap<Stage, BTreeSet<Box<dyn TaskBase>>> = BTreeMap::new();
         Arc::new(JobTracker {
@@ -126,7 +135,6 @@ where
             pending_tasks: Mutex::new(pending_tasks),
             listener: listener,
             _marker_t: PhantomData,
-            _marker_te: PhantomData,
             _marker_u: PhantomData,
         })
     }

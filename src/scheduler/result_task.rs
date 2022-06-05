@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::dependency::DepInfo;
 use crate::env;
-use crate::rdd::{OpId, RddE, STAGE_LOCK};
+use crate::rdd::{ItemE, OpId, Rdd, STAGE_LOCK};
 use crate::scheduler::{Task, TaskBase, TaskContext};
 use crate::serializable_traits::{AnyData, Data};
 use crate::shuffle::ShuffleFetcher;
@@ -15,12 +15,12 @@ use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct ResultTask<T: Data, TE: Data, U: Data, F>
+pub(crate) struct ResultTask<T: Data, U: Data, F>
 where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U
         + 'static
@@ -35,7 +35,7 @@ where
     pub stage_id: usize,
     pinned: bool,
     #[serde(with = "serde_traitobject")]
-    pub rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+    pub rdd: Arc<dyn Rdd<Item = T>>,
     pub action_id: Option<OpId>,
     pub func: Arc<F>,
     pub partition: usize,
@@ -43,12 +43,12 @@ where
     pub output_id: usize,
 }
 
-impl<T: Data, TE: Data, U: Data, F> Display for ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> Display for ResultTask<T, U, F>
 where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U
         + 'static
@@ -63,12 +63,12 @@ where
     }
 }
 
-impl<T: Data, TE: Data, U: Data, F> ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> ResultTask<T, U, F>
 where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U
         + 'static
@@ -94,12 +94,12 @@ where
     }
 }
 
-impl<T: Data, TE: Data, U: Data, F> ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> ResultTask<T, U, F>
 where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U
         + 'static
@@ -113,7 +113,7 @@ where
         task_id: usize,
         run_id: usize,
         stage_id: usize,
-        rdd: Arc<dyn RddE<Item = T, ItemE = TE>>,
+        rdd: Arc<dyn Rdd<Item = T>>,
         action_id: Option<OpId>,
         func: Arc<F>,
         partition: usize,
@@ -135,12 +135,12 @@ where
     }
 }
 
-impl<T: Data, TE: Data, U: Data, F> TaskBase for ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> TaskBase for ResultTask<T, U, F>
 where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U
         + 'static
@@ -175,12 +175,12 @@ where
     }
 }
 
-impl<T: Data, TE: Data, U: Data, F> Task for ResultTask<T, TE, U, F>
+impl<T: Data, U: Data, F> Task for ResultTask<T, U, F>
 where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = TE>>),
+                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
             ),
         ) -> U
         + 'static
