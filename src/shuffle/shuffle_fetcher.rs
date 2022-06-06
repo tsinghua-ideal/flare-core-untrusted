@@ -299,7 +299,7 @@ impl ShuffleFetcher {
         let num_splits = *acc_arg.split_nums.last().unwrap();
 
         let cnt_per_partition = {
-            let mut cnt_per_partition = wrapper_get_cnt_per_partition(cur_op_ids[0]);
+            let mut cnt_per_partition = wrapper_get_cnt_per_partition(cur_op_ids[0], reduce_id);
             //meet the requirement
             let limit = 2 * (num_splits - 1) * (num_splits - 1);
             if cnt_per_partition < limit {
@@ -313,7 +313,6 @@ impl ShuffleFetcher {
             };
             let r = cnt_per_partition % d;
             cnt_per_partition += (d - r) % d;
-
             cnt_per_partition = futures::executor::block_on(ShuffleFetcher::fetch_cnt(
                 stage_id,
                 reduce_id,
@@ -323,7 +322,7 @@ impl ShuffleFetcher {
             assert!(
                 cnt_per_partition % 2 == 0 && cnt_per_partition % num_splits == 0 //&& cnt_per_partition >= 2 * (num_splits - 1) * (num_splits - 1)
             );
-            wrapper_set_cnt_per_partition(cur_op_ids[0], cnt_per_partition);
+            wrapper_set_cnt_per_partition(cur_op_ids[0], reduce_id, cnt_per_partition);
             cnt_per_partition
         };
         log::debug!("finish get max cnt: {:?}", cnt_per_partition);
@@ -341,9 +340,10 @@ impl ShuffleFetcher {
                 &data,
                 &acc_arg.captured_vars,
             );
-            let buckets =
+            let mut buckets =
                 get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
+            buckets.resize(num_splits, Vec::new());
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
                 log::debug!(
@@ -389,7 +389,11 @@ impl ShuffleFetcher {
             let mut buckets =
                 get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
-            assert_eq!(buckets.len(), 2);
+            if buckets.is_empty() {
+                buckets.resize(2, Vec::new());
+            } else {
+                assert_eq!(buckets.len(), 2);
+            }
             let bucket = buckets.pop().unwrap();
             let ser_bytes = bincode::serialize(&bucket).unwrap();
             log::debug!(
@@ -437,7 +441,11 @@ impl ShuffleFetcher {
             let mut buckets =
                 get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
-            assert_eq!(buckets.len(), 2);
+            if buckets.is_empty() {
+                buckets.resize(2, Vec::new());
+            } else {
+                assert_eq!(buckets.len(), 2);
+            }
             if reduce_id != 0 {
                 buckets.swap(0, 1);
             }
@@ -476,6 +484,7 @@ impl ShuffleFetcher {
                         .into_iter()
                         .flatten(),
                 )
+                .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>()
         };
         log::debug!("step 8 finished. partition #{}, {:?}", reduce_id, res);

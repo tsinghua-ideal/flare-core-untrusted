@@ -1,9 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::slice::Chunks;
 use std::sync::{
-    mpsc::{self, SyncSender},
+    mpsc::{self, RecvError, SyncSender},
     Arc,
 };
 use std::thread::{self, JoinHandle};
@@ -146,13 +145,19 @@ where
                         Arc::new(AtomicBool::new(false)),
                     );
                     let handles = rdd.iterator_raw(stage_id, split, &mut acc_arg_cg, tx)?;
-                    let received = rx.recv().unwrap();
-                    kv.0 = *get_encrypted_data::<ItemE>(
-                        rdd.get_op_id(),
-                        acc_arg_cg.dep_info,
-                        received as *mut u8,
-                    );
-                    acc_arg_cg.free_enclave_lock();
+                    match rx.recv() {
+                        Ok(received) => {
+                            kv.0 = *get_encrypted_data::<ItemE>(
+                                rdd.get_op_id(),
+                                acc_arg_cg.dep_info,
+                                received as *mut u8,
+                            );
+                            acc_arg_cg.free_enclave_lock();
+                        }
+                        Err(RecvError) => {
+                            kv.0 = Default::default();
+                        }
+                    }
                     if acc_arg_cg.is_caching_final_rdd() {
                         let size = kv.0.get_size();
                         let data_ptr = Box::into_raw(Box::new(kv.0.clone()));
@@ -165,10 +170,6 @@ where
                     for handle in handles {
                         handle.join().unwrap();
                     }
-                    if kv.0.is_empty() {
-                        return Ok(Vec::new());
-                    }
-
                     //TODO need to sort kv.0
                     unimplemented!();
                 }
@@ -182,10 +183,8 @@ where
                     );
                     kv.1 = futures::executor::block_on(fut)?
                         .into_iter()
+                        .filter(|x| !x.is_empty())
                         .collect::<Vec<_>>();
-                    if kv.1.iter().map(|x| x.len()).sum::<usize>() == 0 {
-                        return Ok(Vec::new());
-                    }
                 }
             };
 
@@ -201,15 +200,19 @@ where
                         Arc::new(AtomicBool::new(false)),
                     );
                     let handles = rdd.iterator_raw(stage_id, split, &mut acc_arg_cg, tx)?;
-
-                    let received = rx.recv().unwrap();
-                    kw.0 = *get_encrypted_data::<ItemE>(
-                        rdd.get_op_id(),
-                        acc_arg_cg.dep_info,
-                        received as *mut u8,
-                    );
-                    acc_arg_cg.free_enclave_lock();
-
+                    match rx.recv() {
+                        Ok(received) => {
+                            kw.0 = *get_encrypted_data::<ItemE>(
+                                rdd.get_op_id(),
+                                acc_arg_cg.dep_info,
+                                received as *mut u8,
+                            );
+                            acc_arg_cg.free_enclave_lock();
+                        }
+                        Err(RecvError) => {
+                            kw.0 = Default::default();
+                        }
+                    }
                     if acc_arg_cg.is_caching_final_rdd() {
                         let size = kw.0.get_size();
                         let data_ptr = Box::into_raw(Box::new(kw.0.clone()));
@@ -221,9 +224,6 @@ where
                     }
                     for handle in handles {
                         handle.join().unwrap();
-                    }
-                    if kw.0.is_empty() {
-                        return Ok(Vec::new());
                     }
                     //TODO need to sort kw.0
                     unimplemented!();
@@ -238,10 +238,8 @@ where
                     );
                     kw.1 = futures::executor::block_on(fut)?
                         .into_iter()
+                        .filter(|x| !x.is_empty())
                         .collect::<Vec<_>>();
-                    if kw.1.iter().map(|x| x.len()).sum::<usize>() == 0 {
-                        return Ok(Vec::new());
-                    }
                 }
             }
             //TODO: what if has_shuffle is false?
@@ -305,9 +303,11 @@ where
                 &buckets,
                 &acc_arg.captured_vars,
             );
-            let buckets =
+            let mut buckets =
                 get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
+            buckets.resize(self.number_of_splits(), Vec::new());
+
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
                 log::debug!(
@@ -328,6 +328,7 @@ where
             );
             futures::executor::block_on(fut)
                 .unwrap()
+                .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>()
         };
         log::debug!(
@@ -364,9 +365,13 @@ where
                 &data,
                 &acc_arg.captured_vars,
             );
-            let buckets =
+            let mut buckets =
                 get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
+            buckets.resize(self.number_of_splits(), Vec::new());
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12))
+                .unwrap();
+
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
                 log::debug!(
@@ -387,6 +392,7 @@ where
             );
             futures::executor::block_on(fut)
                 .unwrap()
+                .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>()
         };
         log::debug!(
@@ -415,7 +421,9 @@ where
         let cur_part_ids = vec![reduce_id];
 
         //first aggregate
-        let mut agg_data = {
+        let mut agg_data = if data.is_empty() {
+            Vec::new()
+        } else {
             acc_arg.get_enclave_lock();
             let dep_info = DepInfo::padding_new(2);
             let result_ptr = wrapper_secure_execute(
@@ -434,6 +442,13 @@ where
             *result
         };
 
+        //sync in order to clear the sort cache
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12)).unwrap();
+        //clear the sort cache
+        env::SORT_CACHE.retain(|k, _| k.0 != stage_id);
+        //sync again to avoid clearing the just-written value
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12)).unwrap();
+
         if reduce_id != 0 {
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(stage_id),
@@ -445,7 +460,7 @@ where
             while fut_res.is_err() {
                 match fut_res {
                     Ok(_) => unreachable!(),
-                    Err(ShuffleError::RequestedCacheNotFound) => {
+                    Err(_) => {
                         std::thread::sleep(Duration::from_millis(5));
                         fut_res = futures::executor::block_on(ShuffleFetcher::secure_fetch(
                             GetServerUriReq::CurStage(stage_id),
@@ -453,7 +468,6 @@ where
                             (reduce_id + num_splits - 1) % num_splits,
                         ));
                     }
-                    _ => break,
                 }
             }
             let mut received_agg_info = fut_res.unwrap().collect::<Vec<_>>();
@@ -461,29 +475,33 @@ where
             if !received_agg_info.is_empty() {
                 let sup_data = received_agg_info.remove(0);
                 assert!(received_agg_info.is_empty());
-                let mut tmp_captured_var = HashMap::new();
-                tmp_captured_var.insert(cur_rdd_ids[0], sup_data);
+                if agg_data.is_empty() {
+                    agg_data = sup_data;
+                } else if !sup_data.is_empty() {
+                    let mut tmp_captured_var = HashMap::new();
+                    tmp_captured_var.insert(cur_rdd_ids[0], sup_data);
 
-                acc_arg.get_enclave_lock();
-                let dep_info = DepInfo::padding_new(24);
-                let result_ptr = wrapper_secure_execute(
-                    &cur_rdd_ids,
-                    &cur_op_ids,
-                    &cur_part_ids,
-                    Default::default(),
-                    dep_info,
-                    &agg_data,
-                    &tmp_captured_var,
-                );
+                    acc_arg.get_enclave_lock();
+                    let dep_info = DepInfo::padding_new(24);
+                    let result_ptr = wrapper_secure_execute(
+                        &cur_rdd_ids,
+                        &cur_op_ids,
+                        &cur_part_ids,
+                        Default::default(),
+                        dep_info,
+                        &agg_data,
+                        &tmp_captured_var,
+                    );
 
-                let mut result =
-                    get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
-                acc_arg.free_enclave_lock();
-                //insert result in the front
-                assert!(result.len() <= 2);
-                agg_data[0] = result.pop().unwrap();
-                if !result.is_empty() {
-                    agg_data.insert(0, result.remove(0));
+                    let mut result =
+                        get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+                    acc_arg.free_enclave_lock();
+                    //insert result in the front
+                    assert!(result.len() <= 2);
+                    agg_data[0] = result.pop().unwrap();
+                    if !result.is_empty() {
+                        agg_data.insert(0, result.remove(0));
+                    }
                 }
             }
         }

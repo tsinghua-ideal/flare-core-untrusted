@@ -112,12 +112,9 @@ where
         );
         let buckets: Vec<Vec<ItemE>> = futures::executor::block_on(fut)?
             .into_iter()
-            .filter(|sub_part| sub_part.len() > 0)
+            .filter(|x| !x.is_empty())
             .collect(); // bucket per subpartition
-        let num_sub_part = buckets.len();
-        if num_sub_part == 0 {
-            return Ok(Vec::new());
-        }
+
         //column sort
         let now = Instant::now();
         let data = self.secure_column_sort_first(stage_id, buckets, acc_arg);
@@ -175,6 +172,7 @@ where
             assert_eq!(invalid_ptr, 0);
             acc_arg.free_enclave_lock();
         }
+        println!("count the cnt_per_partition");
         //step 3 - 8
         let data = ShuffleFetcher::fetch_sort(buckets, stage_id, acc_arg, vec![21, 22, 23]);
         data
@@ -203,9 +201,13 @@ where
                 &data,
                 &acc_arg.captured_vars,
             );
-            let buckets =
+            let mut buckets =
                 get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
+            buckets.resize(self.number_of_splits(), Vec::new());
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12))
+                .unwrap();
+
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
                 log::debug!(
@@ -226,6 +228,7 @@ where
             );
             futures::executor::block_on(fut)
                 .unwrap()
+                .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>()
         };
         log::debug!(
@@ -255,11 +258,11 @@ where
         let cur_part_ids = vec![reduce_id];
 
         //first aggregate
-        let mut agg_data = {
+        let mut agg_data = if data.is_empty() {
+            Vec::new()
+        } else {
             acc_arg.get_enclave_lock();
-
             let dep_info = DepInfo::padding_new(2);
-
             let result_ptr = wrapper_secure_execute(
                 &cur_rdd_ids,
                 &cur_op_ids,
@@ -276,6 +279,13 @@ where
             *result
         };
 
+        //sync in order to clear the sort cache
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12)).unwrap();
+        //clear the sort cache
+        env::SORT_CACHE.retain(|k, _| k.0 != stage_id);
+        //sync again to avoid clearing the just-written value
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12)).unwrap();
+
         if reduce_id != 0 {
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(stage_id),
@@ -287,7 +297,7 @@ where
             while fut_res.is_err() {
                 match fut_res {
                     Ok(_) => unreachable!(),
-                    Err(ShuffleError::RequestedCacheNotFound) => {
+                    Err(_) => {
                         std::thread::sleep(Duration::from_millis(5));
                         fut_res = futures::executor::block_on(ShuffleFetcher::secure_fetch(
                             GetServerUriReq::CurStage(stage_id),
@@ -295,7 +305,6 @@ where
                             (reduce_id + num_splits - 1) % num_splits,
                         ));
                     }
-                    _ => break,
                 }
             }
             let mut received_agg_info = fut_res.unwrap().collect::<Vec<_>>();
@@ -303,25 +312,29 @@ where
             if !received_agg_info.is_empty() {
                 let sup_data = received_agg_info.remove(0);
                 assert!(received_agg_info.is_empty());
-                let mut tmp_captured_var = HashMap::new();
-                tmp_captured_var.insert(cur_rdd_ids[0], sup_data);
+                if agg_data.is_empty() {
+                    agg_data = sup_data;
+                } else if !sup_data.is_empty() {
+                    let mut tmp_captured_var = HashMap::new();
+                    tmp_captured_var.insert(cur_rdd_ids[0], sup_data);
 
-                acc_arg.get_enclave_lock();
-                let dep_info = DepInfo::padding_new(24);
-                let result_ptr = wrapper_secure_execute(
-                    &cur_rdd_ids,
-                    &cur_op_ids,
-                    &cur_part_ids,
-                    Default::default(),
-                    dep_info,
-                    &agg_data,
-                    &tmp_captured_var,
-                );
+                    acc_arg.get_enclave_lock();
+                    let dep_info = DepInfo::padding_new(24);
+                    let result_ptr = wrapper_secure_execute(
+                        &cur_rdd_ids,
+                        &cur_op_ids,
+                        &cur_part_ids,
+                        Default::default(),
+                        dep_info,
+                        &agg_data,
+                        &tmp_captured_var,
+                    );
 
-                let result =
-                    get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
-                acc_arg.free_enclave_lock();
-                agg_data = *result;
+                    let result =
+                        get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+                    acc_arg.free_enclave_lock();
+                    agg_data = *result;
+                }
             }
         }
 
@@ -332,7 +345,7 @@ where
                 let ser_bytes = bincode::serialize(&vec![last_kc.unwrap()]).unwrap();
                 env::SORT_CACHE.insert(
                     (stage_id, reduce_id, (reduce_id + 1) % num_splits),
-                    ser_bytes,
+                    ser_bytes.clone(),
                 );
             } else {
                 env::SORT_CACHE.insert(

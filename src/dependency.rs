@@ -18,7 +18,11 @@ use std::convert::TryInto;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::forget;
-use std::sync::{atomic, mpsc, Arc};
+use std::sync::{
+    atomic,
+    mpsc::{self, RecvError},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 #[repr(C)]
@@ -312,14 +316,19 @@ where
                 .unwrap();
 
             let num_output_splits = self.partitioner.get_num_of_partitions();
-            let buckets_ptr = rx.recv().unwrap();
-            let mut buckets = get_encrypted_data::<Vec<ItemE>>(
-                rdd_base.get_op_id(),
-                dep_info,
-                buckets_ptr as *mut u8,
-            );
-            acc_arg.free_enclave_lock();
-            buckets.resize(num_output_splits, Vec::new());
+            let buckets = match rx.recv() {
+                Ok(buckets_ptr) => {
+                    let mut buckets = get_encrypted_data::<Vec<ItemE>>(
+                        rdd_base.get_op_id(),
+                        dep_info,
+                        buckets_ptr as *mut u8,
+                    );
+                    acc_arg.free_enclave_lock();
+                    buckets.resize(num_output_splits, Vec::new());
+                    *buckets
+                }
+                Err(RecvError) => vec![Vec::new(); num_output_splits],
+            };
 
             for handle in handles {
                 handle.join().unwrap();

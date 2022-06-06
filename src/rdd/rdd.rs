@@ -14,7 +14,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{
     atomic::{self, AtomicBool, AtomicUsize},
-    mpsc::{sync_channel, Receiver, SyncSender},
+    mpsc::{sync_channel, Receiver, RecvError, SyncSender},
     Arc, RwLock, Weak,
 };
 use std::thread::{self, JoinHandle};
@@ -73,7 +73,6 @@ pub type ItemE = Vec<u8>;
 
 static immediate_cout: bool = true;
 pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
-pub const MERGE_FACTOR: usize = 64;
 pub const MAX_ENC_BL: usize = 1024;
 
 extern "C" {
@@ -100,10 +99,12 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut usize,
         op_id: OpId,
+        part_id: usize,
     ) -> sgx_status_t;
     pub fn set_cnt_per_partition(
         eid: sgx_enclave_id_t,
         op_id: OpId,
+        part_id: usize,
         cnt_per_partition: usize,
     ) -> sgx_status_t;
     pub fn free_res_enc(
@@ -285,7 +286,7 @@ pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<usiz
     wait
 }
 
-pub fn wrapper_get_cnt_per_partition(op_id: OpId) -> usize {
+pub fn wrapper_get_cnt_per_partition(op_id: OpId, part_id: usize) -> usize {
     let eid = Env::get()
         .enclave
         .lock()
@@ -294,7 +295,7 @@ pub fn wrapper_get_cnt_per_partition(op_id: OpId) -> usize {
         .unwrap()
         .geteid();
     let mut cnt_per_partition: usize = 0;
-    let sgx_status = unsafe { get_cnt_per_partition(eid, &mut cnt_per_partition, op_id) };
+    let sgx_status = unsafe { get_cnt_per_partition(eid, &mut cnt_per_partition, op_id, part_id) };
     match sgx_status {
         sgx_status_t::SGX_SUCCESS => {}
         _ => {
@@ -304,7 +305,7 @@ pub fn wrapper_get_cnt_per_partition(op_id: OpId) -> usize {
     cnt_per_partition
 }
 
-pub fn wrapper_set_cnt_per_partition(op_id: OpId, cnt_per_partition: usize) {
+pub fn wrapper_set_cnt_per_partition(op_id: OpId, part_id: usize, cnt_per_partition: usize) {
     let eid = Env::get()
         .enclave
         .lock()
@@ -312,7 +313,7 @@ pub fn wrapper_set_cnt_per_partition(op_id: OpId, cnt_per_partition: usize) {
         .as_ref()
         .unwrap()
         .geteid();
-    let sgx_status = unsafe { set_cnt_per_partition(eid, op_id, cnt_per_partition) };
+    let sgx_status = unsafe { set_cnt_per_partition(eid, op_id, part_id, cnt_per_partition) };
     match sgx_status {
         sgx_status_t::SGX_SUCCESS => {}
         _ => {
@@ -1421,9 +1422,15 @@ pub trait Rdd: RddBase + 'static {
             acc_arg.insert_quadruple(rdd_id, action_id, usize::MAX, usize::MAX);
         }
         let handles = self.secure_compute(stage_id, split, &mut acc_arg, tx)?;
-        let received = rx.recv().unwrap();
-        let result = get_encrypted_data::<ItemE>(op_id, dep_info, received as *mut u8);
-        acc_arg.free_enclave_lock();
+        let result = match rx.recv() {
+            Ok(received) => {
+                let result = get_encrypted_data::<ItemE>(op_id, dep_info, received as *mut u8);
+                acc_arg.free_enclave_lock();
+                *result
+            }
+            Err(RecvError) => Vec::new(),
+        };
+
         for handle in handles {
             handle.join().unwrap();
         }

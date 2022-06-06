@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 use std::sync::{
-    mpsc::{sync_channel, SyncSender, TryRecvError},
+    mpsc::{sync_channel, RecvError, SyncSender, TryRecvError},
     Arc,
 };
 use std::thread::JoinHandle;
@@ -122,17 +122,23 @@ where
                         let handles = rdd
                             .secure_compute(stage_id, p.clone(), &mut acc_arg, tx_un)
                             .unwrap();
-                        let received = rx_un.recv().unwrap();
-                        let result = get_encrypted_data::<ItemE>(
-                            rdd.get_op_id(),
-                            dep_info,
-                            received as *mut u8,
-                        );
+                        let result = match rx_un.recv() {
+                            Ok(received) => {
+                                let result = get_encrypted_data::<ItemE>(
+                                    rdd.get_op_id(),
+                                    dep_info,
+                                    received as *mut u8,
+                                );
+                                acc_arg.free_enclave_lock();
+                                *result
+                            }
+                            Err(RecvError) => Vec::new(),
+                        }
+                        .into_iter();
                         for handle in handles {
                             handle.join().unwrap();
                         }
-                        acc_arg.free_enclave_lock();
-                        result.into_iter()
+                        result
                     })
                     .flatten()
                     .collect::<Vec<_>>();
