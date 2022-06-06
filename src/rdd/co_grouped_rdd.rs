@@ -143,7 +143,6 @@ where
                         None,
                         Arc::new(AtomicBool::new(false)),
                     );
-                    let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?; //TODO need sorted
                     let mut kv_0 = Vec::new();
 
@@ -157,7 +156,7 @@ where
                         kv_0.push(*result_bl);
                     }
 
-                    if caching {
+                    if acc_arg_cg.is_caching_final_rdd() {
                         let size = kv_0.get_size();
                         let data_ptr = Box::into_raw(Box::new(kv_0.clone()));
                         Env::get().cache_tracker.put_sdata(
@@ -223,7 +222,6 @@ where
                         None,
                         Arc::new(AtomicBool::new(false)),
                     );
-                    let caching = acc_arg_cg.is_caching_final_rdd();
                     let handles = rdd.iterator_raw(split, &mut acc_arg_cg, tx)?; //TODO need sorted
                     let mut kw_0 = Vec::new();
 
@@ -237,7 +235,7 @@ where
                         kw_0.push(*result_bl);
                     }
 
-                    if caching {
+                    if acc_arg_cg.is_caching_final_rdd() {
                         let size = kw_0.get_size();
                         let data_ptr = Box::into_raw(Box::new(kw_0.clone()));
                         Env::get().cache_tracker.put_sdata(

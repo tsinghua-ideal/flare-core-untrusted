@@ -832,7 +832,8 @@ impl AccArg {
     }
 
     pub fn is_caching_final_rdd(&self) -> bool {
-        self.rdd_ids.is_empty()
+        *self.part_ids.first().unwrap() != usize::MAX
+            && *self.rdd_ids.first().unwrap() == self.caching_rdd_id
     }
 
     pub fn get_enclave_lock(&self) {
@@ -1408,7 +1409,6 @@ pub trait Rdd: RddBase + 'static {
         if let Some(action_id) = action_id {
             acc_arg.insert_quadruple(rdd_id, action_id, usize::MAX, usize::MAX);
         }
-        let caching = acc_arg.is_caching_final_rdd();
         let handles = self.secure_compute(split, &mut acc_arg, tx)?;
 
         let mut result = Vec::new();
@@ -1422,7 +1422,7 @@ pub trait Rdd: RddBase + 'static {
             handle.join().unwrap();
         }
 
-        if caching {
+        if acc_arg.is_caching_final_rdd() {
             let size = result.get_size();
             let data_ptr = Box::into_raw(Box::new(result.clone()));
             Env::get()
