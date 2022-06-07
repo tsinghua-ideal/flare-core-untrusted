@@ -109,6 +109,7 @@ where
             GetServerUriReq::PrevStage(self.shuffle_id),
             part_id,
             usize::MAX,
+            None,
         );
         let buckets: Vec<Vec<ItemE>> = futures::executor::block_on(fut)?
             .into_iter()
@@ -188,6 +189,9 @@ where
         let cur_op_ids = vec![self.vals.op_id];
         let reduce_id = *acc_arg.part_ids.last().unwrap();
         let cur_part_ids = vec![reduce_id];
+        //due to rdds like union, we only need partial executor info registered for the stage id
+        let part_id_offset = acc_arg.part_ids.first().unwrap() - acc_arg.part_ids.last().unwrap();
+        let num_splits = *acc_arg.split_nums.last().unwrap();
         //step 1: sort + step 2: shuffle (transpose)
         let fetched_data = {
             acc_arg.get_enclave_lock();
@@ -204,9 +208,13 @@ where
             let mut buckets =
                 get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
-            buckets.resize(self.number_of_splits(), Vec::new());
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12))
-                .unwrap();
+            buckets.resize(num_splits, Vec::new());
+            futures::executor::block_on(ShuffleFetcher::fetch_sync((
+                stage_id,
+                part_id_offset,
+                num_splits,
+            )))
+            .unwrap();
 
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
@@ -219,12 +227,17 @@ where
                 );
                 env::SORT_CACHE.insert((stage_id, reduce_id, i), ser_bytes);
             }
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 2))
-                .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync((
+                stage_id,
+                part_id_offset,
+                num_splits,
+            )))
+            .unwrap();
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(stage_id),
                 reduce_id,
                 usize::MAX,
+                Some((part_id_offset, num_splits)),
             );
             futures::executor::block_on(fut)
                 .unwrap()
@@ -251,6 +264,7 @@ where
         //because Opaque doe not design for general oblivious group_by
         //but aggregate should be oblivious
         let reduce_id = *acc_arg.part_ids.last().unwrap();
+        let part_id_offset = acc_arg.part_ids.first().unwrap() - acc_arg.part_ids.last().unwrap();
         let num_splits = *acc_arg.split_nums.last().unwrap();
 
         let cur_rdd_ids = vec![self.vals.id];
@@ -280,17 +294,28 @@ where
         };
 
         //sync in order to clear the sort cache
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12)).unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync((
+            stage_id,
+            part_id_offset,
+            num_splits,
+        )))
+        .unwrap();
         //clear the sort cache
         env::SORT_CACHE.retain(|k, _| k.0 != stage_id);
         //sync again to avoid clearing the just-written value
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 12)).unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync((
+            stage_id,
+            part_id_offset,
+            num_splits,
+        )))
+        .unwrap();
 
         if reduce_id != 0 {
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(stage_id),
                 reduce_id,
                 (reduce_id + num_splits - 1) % num_splits,
+                Some((part_id_offset, num_splits)),
             );
             let mut fut_res = futures::executor::block_on(fut);
             //the aggregate info may not be prepared
@@ -303,6 +328,7 @@ where
                             GetServerUriReq::CurStage(stage_id),
                             reduce_id,
                             (reduce_id + num_splits - 1) % num_splits,
+                            Some((part_id_offset, num_splits)),
                         ));
                     }
                 }

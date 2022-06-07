@@ -88,20 +88,17 @@ impl Task for ShuffleMapTask {
             dep_info.parent_rdd_id,
             dep_info.identifier,
         );
+        let num_splits = rdd_base.number_of_splits();
         STAGE_LOCK.insert_stage(rdd_id_pair, self.task_id);
-        STAGE_LOCK.set_num_splits(rdd_id_pair, rdd_base.number_of_splits());
+        STAGE_LOCK.set_num_splits(rdd_id_pair, num_splits);
         let res = SerBox::new(
             self.dep
                 .do_shuffle_task(self.stage_id, rdd_base, self.partition),
         ) as SerBox<dyn AnyData>;
         STAGE_LOCK.remove_stage(rdd_id_pair, self.task_id);
         //sync in order to clear the sort cache
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(
-            self.stage_id,
-            self.partition,
-            12,
-        ))
-        .unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync((self.stage_id, 0, num_splits)))
+            .unwrap();
         //clear the sort cache
         env::SORT_CACHE.retain(|k, _| k.0 != self.stage_id);
         res

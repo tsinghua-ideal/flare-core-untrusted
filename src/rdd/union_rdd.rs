@@ -88,13 +88,6 @@ where
         acc_arg: &mut AccArg,
         tx: SyncSender<usize>,
     ) -> Result<Vec<JoinHandle<()>>> {
-        let eid = Env::get()
-            .enclave
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .geteid();
         match &self.0 {
             NonUniquePartitioner { rdds, .. } => {
                 let tx = tx.clone();

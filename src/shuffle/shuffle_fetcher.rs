@@ -124,35 +124,37 @@ impl ShuffleFetcher {
         Ok(results.into_iter())
     }
 
-    pub async fn fetch_sync(stage_id: usize, reduce_id: usize, step: usize) -> Result<()> {
+    pub async fn fetch_sync(part_group: (usize, usize, usize)) -> Result<()> {
         log::debug!(
-            "begin fetch_sync, stage_id = {:?}, step = {:?}, reduce_id = {:?}",
-            stage_id,
-            step,
-            reduce_id
+            "begin fetch_sync, part_group (stage_id = {:?}, part_id_offset = {:?}, cur_num_splits = {:?})",
+            part_group.0,
+            part_group.1,
+            part_group.2,
         );
         env::Env::get()
             .map_output_tracker
-            .check_ready(stage_id, step)
+            .check_ready(part_group)
             .await
             .map_err(|_| ShuffleError::FailCheckingReady)?;
         log::debug!(
-            "finish fetch_sync, stage_id = {:?}, step = {:?}, reduce_id = {:?}",
-            stage_id,
-            step,
-            reduce_id
+            "finish fetch_sync, part_group (stage_id = {:?}, part_id_offset = {:?}, cur_num_splits = {:?})",
+            part_group.0,
+            part_group.1,
+            part_group.2,
         );
         Ok(())
     }
 
-    pub async fn fetch_cnt(stage_id: usize, reduce_id: usize, mut cnt: usize) -> Result<usize> {
-        env::SORT_CACHE_CNT.insert((stage_id, reduce_id), cnt);
+    pub async fn fetch_cnt(
+        //(stage_id, part_id_offset, cur num split)
+        part_group: (usize, usize, usize),
+        mut cnt: usize,
+    ) -> Result<usize> {
         cnt = env::Env::get()
             .map_output_tracker
-            .get_max_cnt(stage_id, cnt)
+            .get_max_cnt(part_group, cnt)
             .await
             .map_err(|_| ShuffleError::FailGettingMaxCnt)?;
-        env::SORT_CACHE_CNT.insert((stage_id, reduce_id), cnt);
         Ok(cnt)
     }
 
@@ -160,15 +162,19 @@ impl ShuffleFetcher {
         req: GetServerUriReq,
         reduce_id: usize,
         fetch_from: usize,
+        part_group: Option<(usize, usize)>,
     ) -> Result<impl Iterator<Item = Vec<ItemE>>> {
         log::debug!("inside fetch function");
-        let server_uris = env::Env::get()
+        let mut server_uris = env::Env::get()
             .map_output_tracker
             .get_server_uris(&req)
             .await
             .map_err(|err| ShuffleError::FailFetchingShuffleUris {
                 source: Box::new(err),
             })?;
+        if let Some((s, n)) = part_group {
+            server_uris = server_uris[s..s + n].to_vec();
+        }
         //get the uri of current worker
         let uri = env::Env::get().shuffle_manager.get_server_uri();
         assert_eq!(uri, server_uris[reduce_id]);
@@ -296,6 +302,7 @@ impl ShuffleFetcher {
         let cur_op_ids = vec![*acc_arg.op_ids.last().unwrap()];
         let reduce_id = *acc_arg.part_ids.last().unwrap();
         let cur_part_ids = vec![reduce_id];
+        let part_id_offset = acc_arg.part_ids.first().unwrap() - acc_arg.part_ids.last().unwrap();
         let num_splits = *acc_arg.split_nums.last().unwrap();
 
         let cnt_per_partition = {
@@ -314,8 +321,7 @@ impl ShuffleFetcher {
             let r = cnt_per_partition % d;
             cnt_per_partition += (d - r) % d;
             cnt_per_partition = futures::executor::block_on(ShuffleFetcher::fetch_cnt(
-                stage_id,
-                reduce_id,
+                (stage_id, part_id_offset, num_splits),
                 cnt_per_partition,
             ))
             .unwrap();
@@ -355,12 +361,17 @@ impl ShuffleFetcher {
                 );
                 env::SORT_CACHE.insert((stage_id, reduce_id, i), ser_bytes);
             }
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 4))
-                .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync((
+                stage_id,
+                part_id_offset,
+                num_splits,
+            )))
+            .unwrap();
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(stage_id),
                 reduce_id,
                 usize::MAX,
+                Some((part_id_offset, num_splits)),
             );
             futures::executor::block_on(fut)
                 .unwrap()
@@ -407,12 +418,17 @@ impl ShuffleFetcher {
                 (stage_id, reduce_id, (reduce_id + 1) % num_splits),
                 ser_bytes,
             );
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 6))
-                .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync((
+                stage_id,
+                part_id_offset,
+                num_splits,
+            )))
+            .unwrap();
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(stage_id),
                 reduce_id,
                 (reduce_id + num_splits - 1) % num_splits,
+                Some((part_id_offset, num_splits)),
             );
             buckets.append(
                 &mut futures::executor::block_on(fut)
@@ -467,12 +483,17 @@ impl ShuffleFetcher {
                 ser_bytes,
             );
 
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(stage_id, reduce_id, 8))
-                .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync((
+                stage_id,
+                part_id_offset,
+                num_splits,
+            )))
+            .unwrap();
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(stage_id),
                 reduce_id,
                 (reduce_id + 1) % num_splits,
+                Some((part_id_offset, num_splits)),
             );
             buckets
                 .pop()

@@ -37,10 +37,10 @@ pub(crate) enum MapOutputTrackerMessage {
     GetMapOutputLocations(usize),
     // Contains stage_id
     GetExecutorLocations(usize),
-    // Contains stage_id, cnt,
-    GetMaxCnt(usize, usize),
-    // Contains stage_id, step
-    CheckStepReady(usize, usize),
+    // Contains part_group, cnt,
+    GetMaxCnt((usize, usize, usize), usize),
+    // Contains part_group
+    CheckStepReady((usize, usize, usize)),
     StopMapOutputTracker,
 }
 
@@ -57,10 +57,10 @@ pub(crate) struct MapOutputTracker {
     fetching_for_sort: Arc<DashSet<usize>>,
     generation: Arc<Mutex<i64>>,
     master_addr: SocketAddr,
-    //(stage_id, step) -> barrier. If the worker is ready for step if the corresponding uri is contained
-    step_map: Arc<Mutex<HashMap<(usize, usize), Arc<Barrier>>>>,
-    //(stage_id) -> (cnt, barrier)
-    cnt_map: Arc<Mutex<HashMap<usize, (usize, Arc<Barrier>)>>>,
+    //(part_group) -> barrier. If the worker is ready for step if the corresponding uri is contained
+    step_map: Arc<Mutex<HashMap<(usize, usize, usize), Arc<Barrier>>>>,
+    //(part_group) -> (cnt, barrier)
+    cnt_map: Arc<Mutex<HashMap<(usize, usize, usize), (usize, Arc<Barrier>)>>>,
     // stage_id -> hosts indexed by partition id
     executor_map: ServerUris,
 }
@@ -139,7 +139,7 @@ impl MapOutputTracker {
         Ok(locs)
     }
 
-    async fn client_check_ready(&self, stage_id: usize, step: usize) -> Result<()> {
+    async fn client_check_ready(&self, part_group: (usize, usize, usize)) -> Result<()> {
         let mut stream = loop {
             match TcpStream::connect(self.master_addr).await {
                 Ok(stream) => break stream,
@@ -149,12 +149,8 @@ impl MapOutputTracker {
         let (reader, writer) = stream.split();
         let reader = reader.compat();
         let mut writer = writer.compat_write();
-        log::debug!(
-            "connected to master to sync at stage #{}, step #{}",
-            stage_id,
-            step
-        );
-        let bytes = bincode::serialize(&MapOutputTrackerMessage::CheckStepReady(stage_id, step))?;
+        log::debug!("connected to master to sync at part_group {:?}", part_group);
+        let bytes = bincode::serialize(&MapOutputTrackerMessage::CheckStepReady(part_group))?;
         let mut message = MsgBuilder::new_default();
         let mut data = message.init_root::<serialized_data::Builder>();
         data.set_msg(&bytes);
@@ -167,7 +163,11 @@ impl MapOutputTracker {
         Ok(())
     }
 
-    async fn client_get_max_cnt(&self, stage_id: usize, cnt: usize) -> Result<usize> {
+    async fn client_get_max_cnt(
+        &self,
+        part_group: (usize, usize, usize),
+        cnt: usize,
+    ) -> Result<usize> {
         let mut stream = loop {
             match TcpStream::connect(self.master_addr).await {
                 Ok(stream) => break stream,
@@ -177,9 +177,12 @@ impl MapOutputTracker {
         let (reader, writer) = stream.split();
         let reader = reader.compat();
         let mut writer = writer.compat_write();
-        log::debug!("connected to master to fetch cnt at stage #{}", stage_id);
+        log::debug!(
+            "connected to master to fetch cnt at part group #{:?}",
+            part_group
+        );
 
-        let bytes = bincode::serialize(&MapOutputTrackerMessage::GetMaxCnt(stage_id, cnt))?;
+        let bytes = bincode::serialize(&MapOutputTrackerMessage::GetMaxCnt(part_group, cnt))?;
         let mut message = MsgBuilder::new_default();
         let mut data = message.init_root::<serialized_data::Builder>();
         data.set_msg(&bytes);
@@ -290,77 +293,63 @@ impl MapOutputTracker {
                             // writting response
                             bincode::serialize(&locs)?
                         }
-                        MapOutputTrackerMessage::GetMaxCnt(stage_id, cnt_per_partition) => {
-                            let executors = executor_map_clone
-                                .get(&stage_id)
-                                .ok_or_else(|| MapOutputError::StageIdNotFound(stage_id))?;
-                            let num_of_executors = executors.len();
-                            assert!(
-                                executors.iter().filter(|x| x.is_some()).count()
-                                    == num_of_executors
-                                    && num_of_executors > 0
-                            );
+                        MapOutputTrackerMessage::GetMaxCnt(part_group, cnt_per_partition) => {
+                            let num_of_executors = part_group.2;
+                            assert!(num_of_executors > 0);
 
                             let barrier = {
                                 let mut unlocked_cnt_map = cnt_map_clone.lock();
-                                let (item, barrier) = unlocked_cnt_map.entry(stage_id).or_insert((
-                                    cnt_per_partition,
-                                    Arc::new(Barrier::new(num_of_executors)),
-                                ));
+                                let (item, barrier) = unlocked_cnt_map.entry(part_group).or_insert(
+                                    (cnt_per_partition, Arc::new(Barrier::new(num_of_executors))),
+                                );
                                 *item = std::cmp::max(*item, cnt_per_partition);
                                 barrier.clone()
                             };
 
                             //send back
                             log::debug!(
-                                "(stage id) wait for the |get max cnt| point ({:?})",
-                                stage_id,
+                                "(part_group) wait for the |get max cnt| point ({:?})",
+                                part_group,
                             );
                             barrier.wait().await;
-                            log::debug!("(stage id) pass the |get max cnt| point ({:?})", stage_id,);
+                            log::debug!(
+                                "(part_group) pass the |get max cnt| point ({:?})",
+                                part_group
+                            );
 
                             let cnt = {
-                                let unlocked_cnt_map = cnt_map_clone.lock();
-                                let (item, _barrier) = unlocked_cnt_map.get(&stage_id).unwrap();
-                                *item
+                                let mut unlocked_cnt_map = cnt_map_clone.lock();
+                                let (item, _barrier) =
+                                    unlocked_cnt_map.remove(&part_group).unwrap();
+                                item
                             };
-                            //TODO: check whether to remove the entry and how to
+
                             bincode::serialize(&cnt)?
                         }
-                        MapOutputTrackerMessage::CheckStepReady(stage_id, step) => {
-                            let executors = executor_map_clone
-                                .get(&stage_id)
-                                .ok_or_else(|| MapOutputError::StageIdNotFound(stage_id))?;
-                            let num_of_executors = executors.len();
-                            assert!(
-                                executors.iter().filter(|x| x.is_some()).count()
-                                    == num_of_executors
-                                    && num_of_executors > 0
-                            );
+                        MapOutputTrackerMessage::CheckStepReady(part_group) => {
+                            let num_of_executors = part_group.2;
+                            assert!(num_of_executors > 0);
                             //insert the value and release the lock immediately
 
                             let barrier = {
                                 let mut unlocked_step_map = step_map_clone.lock();
                                 let barrier = unlocked_step_map
-                                    .entry((stage_id, step))
+                                    .entry(part_group)
                                     .or_insert(Arc::new(Barrier::new(num_of_executors)));
                                 barrier.clone()
                             };
 
                             log::debug!(
-                                "(stage id, step) wait for the |check ready| point ({:?}, {:?})",
-                                stage_id,
-                                step,
+                                "(part_group) wait for the |check ready| point {:?}",
+                                part_group
                             );
                             barrier.wait().await;
                             log::debug!(
-                                "(stage id, step) pass the |check ready| point ({:?}, {:?})",
-                                stage_id,
-                                step,
+                                "(part_group) pass the |check ready| point {:?}",
+                                part_group
                             );
 
-                            //is it neccessary to remove?
-                            step_map_clone.lock().remove(&(stage_id, step));
+                            step_map_clone.lock().remove(&part_group);
 
                             //check
                             bincode::serialize(&true)?
@@ -554,13 +543,17 @@ impl MapOutputTracker {
         }
     }
 
-    pub async fn check_ready(&self, stage_id: usize, step: usize) -> Result<()> {
-        self.client_check_ready(stage_id, step).await?;
+    pub async fn check_ready(&self, part_group: (usize, usize, usize)) -> Result<()> {
+        self.client_check_ready(part_group).await?;
         Ok(())
     }
 
-    pub async fn get_max_cnt(&self, stage_id: usize, cnt: usize) -> Result<usize> {
-        let cnt = self.client_get_max_cnt(stage_id, cnt).await?;
+    pub async fn get_max_cnt(
+        &self,
+        part_group: (usize, usize, usize),
+        cnt: usize,
+    ) -> Result<usize> {
+        let cnt = self.client_get_max_cnt(part_group, cnt).await?;
         Ok(cnt)
     }
 

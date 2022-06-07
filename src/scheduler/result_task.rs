@@ -193,8 +193,9 @@ where
     fn run(&self, id: usize) -> SerBox<dyn AnyData> {
         log::debug!("resulttask runs");
         let rdd_id = self.rdd.get_rdd_id();
+        let num_splits = self.rdd.number_of_splits();
         STAGE_LOCK.insert_stage((rdd_id, rdd_id, 0), self.task_id);
-        STAGE_LOCK.set_num_splits((rdd_id, rdd_id, 0), self.rdd.number_of_splits());
+        STAGE_LOCK.set_num_splits((rdd_id, rdd_id, 0), num_splits);
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
 
@@ -217,11 +218,11 @@ where
                     };
                     STAGE_LOCK.free_stage_lock();
                     //sync in order to clear the sort cache
-                    futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                    futures::executor::block_on(ShuffleFetcher::fetch_sync((
                         self.stage_id,
-                        self.partition,
-                        12,
-                    ))
+                        0,
+                        num_splits,
+                    )))
                     .unwrap();
                     //clear the sort cache
                     env::SORT_CACHE.retain(|k, _| k.0 != self.stage_id);
