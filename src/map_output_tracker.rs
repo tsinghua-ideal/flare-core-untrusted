@@ -57,10 +57,10 @@ pub(crate) struct MapOutputTracker {
     fetching_for_sort: Arc<DashSet<usize>>,
     generation: Arc<Mutex<i64>>,
     master_addr: SocketAddr,
-    //(part_group) -> barrier. If the worker is ready for step if the corresponding uri is contained
-    step_map: Arc<Mutex<HashMap<(usize, usize, usize), Arc<Barrier>>>>,
-    //(part_group) -> (cnt, barrier)
-    cnt_map: Arc<Mutex<HashMap<(usize, usize, usize), (usize, Arc<Barrier>)>>>,
+    //(part_group) -> (barrier, num_executors). If the worker is ready for step if the corresponding uri is contained
+    step_map: Arc<Mutex<HashMap<(usize, usize, usize), (Arc<Barrier>, usize)>>>,
+    //(part_group) -> (cnt, barrier, num_executors)
+    cnt_map: Arc<Mutex<HashMap<(usize, usize, usize), (usize, Arc<Barrier>, usize)>>>,
     // stage_id -> hosts indexed by partition id
     executor_map: ServerUris,
 }
@@ -299,9 +299,12 @@ impl MapOutputTracker {
 
                             let barrier = {
                                 let mut unlocked_cnt_map = cnt_map_clone.lock();
-                                let (item, barrier) = unlocked_cnt_map.entry(part_group).or_insert(
-                                    (cnt_per_partition, Arc::new(Barrier::new(num_of_executors))),
-                                );
+                                let (item, barrier, _) =
+                                    unlocked_cnt_map.entry(part_group).or_insert((
+                                        cnt_per_partition,
+                                        Arc::new(Barrier::new(num_of_executors)),
+                                        num_of_executors,
+                                    ));
                                 *item = std::cmp::max(*item, cnt_per_partition);
                                 barrier.clone()
                             };
@@ -317,12 +320,17 @@ impl MapOutputTracker {
                                 part_group
                             );
 
-                            let cnt = {
+                            let (cnt, should_remove) = {
                                 let mut unlocked_cnt_map = cnt_map_clone.lock();
-                                let (item, _barrier) =
-                                    unlocked_cnt_map.remove(&part_group).unwrap();
-                                item
+                                let (item, _, remain) =
+                                    unlocked_cnt_map.get_mut(&part_group).unwrap();
+                                *remain -= 1;
+                                (*item, *remain == 0)
                             };
+
+                            if should_remove {
+                                cnt_map_clone.lock().remove(&part_group).unwrap();
+                            }
 
                             bincode::serialize(&cnt)?
                         }
@@ -333,9 +341,10 @@ impl MapOutputTracker {
 
                             let barrier = {
                                 let mut unlocked_step_map = step_map_clone.lock();
-                                let barrier = unlocked_step_map
-                                    .entry(part_group)
-                                    .or_insert(Arc::new(Barrier::new(num_of_executors)));
+                                let (barrier, _) = unlocked_step_map.entry(part_group).or_insert((
+                                    Arc::new(Barrier::new(num_of_executors)),
+                                    num_of_executors,
+                                ));
                                 barrier.clone()
                             };
 
@@ -349,7 +358,16 @@ impl MapOutputTracker {
                                 part_group
                             );
 
-                            step_map_clone.lock().remove(&part_group);
+                            let should_remove = {
+                                let mut unlocked_step_map = step_map_clone.lock();
+                                let (_, remain) = unlocked_step_map.get_mut(&part_group).unwrap();
+                                *remain -= 1;
+                                *remain == 0
+                            };
+
+                            if should_remove {
+                                step_map_clone.lock().remove(&part_group).unwrap();
+                            }
 
                             //check
                             bincode::serialize(&true)?
