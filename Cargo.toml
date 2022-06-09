@@ -54,7 +54,7 @@ serde_derive = "1.0.125"
 uriparse = "0.6.1"
 
 # encryption
-aes-gcm = "0.7.0"
+aes-gcm = "0.8.0"
 
 # dynamic typing
 downcast-rs = "1.1.1"
@@ -67,8 +67,8 @@ rusoto_core = { version = "0.43", optional = true }
 rusoto_s3 = { version = "0.43", optional = true }
 
 # rust sgx sdk
-sgx_types = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
-sgx_urts = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
+sgx_types = { path = "../incubator-teaclave-sgx-sdk/sgx_types" }
+sgx_urts = { path = "../incubator-teaclave-sgx-sdk/sgx_urts" }
 
 [build-dependencies]
 capnpc = "0.12.1"
@@ -80,5 +80,6 @@ parquet = "0.15.1"
 tempfile = "3"
 
 [patch.'https://github.com/apache/teaclave-sgx-sdk.git']
+sgx_alloc = { path = "../incubator-teaclave-sgx-sdk/sgx_alloc" }
 sgx_types = { path = "../incubator-teaclave-sgx-sdk/sgx_types" }
 sgx_urts = { path = "../incubator-teaclave-sgx-sdk/sgx_urts" }
