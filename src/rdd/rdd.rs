@@ -165,6 +165,29 @@ pub unsafe extern "C" fn sbrk_o(increment: usize) -> *mut c_void {
     libc::sbrk(increment as intptr_t)
 }
 
+//return the length of current cpu set
+#[no_mangle]
+pub unsafe extern "C" fn ocall_set_thread_affinity(is_for_om: u8) -> usize {
+    let cur_cpu_set = (0..affinity::get_core_num()).collect::<Vec<usize>>();
+    //by default, the first core is for OM
+    match is_for_om {
+        1 => affinity::set_thread_affinity(&cur_cpu_set[0..1]).unwrap(),
+        0 => affinity::set_thread_affinity(&cur_cpu_set[1..]).unwrap(),
+        _ => unreachable!(),
+    }
+    cur_cpu_set.len()
+}
+
+//return the current cpu set
+#[no_mangle]
+pub unsafe extern "C" fn ocall_get_thread_affinity(cores: *mut usize, cores_len: usize) -> usize {
+    let cores = std::slice::from_raw_parts_mut(cores, cores_len);
+    let actual_cores = affinity::get_thread_affinity().unwrap();
+    let len = actual_cores.len();
+    cores[..len].copy_from_slice(&actual_cores);
+    len
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ocall_cache_to_outside(
     rdd_id: usize,

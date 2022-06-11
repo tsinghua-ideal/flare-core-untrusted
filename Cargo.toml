@@ -13,6 +13,7 @@ name = "vega"
 aws_connectors = ["rusoto_core", "rusoto_s3"]
 
 [dependencies]
+affinity = "0.1.2"
 async-trait = "0.1.30"
 crossbeam = "0.7.3"
 dashmap = "4"
