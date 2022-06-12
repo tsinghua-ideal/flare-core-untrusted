@@ -27,15 +27,15 @@ const CAPNP_BUF_READ_OPTS: ReaderOptions = ReaderOptions {
 pub(crate) enum GetServerUriReq {
     // Contains shuffle_id
     PrevStage(usize),
-    // Contains stage_id
-    CurStage(usize),
+    // Contains (stage_id, part_id_offset, num_splits)
+    CurStage((usize, usize, usize)),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum MapOutputTrackerMessage {
     // Contains shuffle_id
     GetMapOutputLocations(usize),
-    // Contains stage_id
+    // Contains stage_id, not the part group, because the workers will cache the server list
     GetExecutorLocations(usize),
     // Contains part_group, cnt,
     GetMaxCnt((usize, usize, usize), usize),
@@ -111,12 +111,12 @@ impl MapOutputTracker {
         let mut writer = writer.compat_write();
 
         let bytes = match req {
-            GetServerUriReq::CurStage(stage_id) => {
+            GetServerUriReq::CurStage(part_group) => {
                 log::debug!(
-                    "connected to master to fetch shuffle task #{} data hosts",
-                    stage_id
+                    "connected to master to fetch sort task #{:?} data hosts",
+                    part_group
                 );
-                bincode::serialize(&MapOutputTrackerMessage::GetExecutorLocations(*stage_id))?
+                bincode::serialize(&MapOutputTrackerMessage::GetExecutorLocations(part_group.0))?
             }
             GetServerUriReq::PrevStage(shuffle_id) => {
                 log::debug!(
@@ -456,7 +456,7 @@ impl MapOutputTracker {
 
     pub async fn get_server_uris(&self, req: &GetServerUriReq) -> Result<Vec<String>> {
         match req {
-            GetServerUriReq::CurStage(stage_id) => {
+            GetServerUriReq::CurStage((stage_id, _, _)) => {
                 log::debug!(
                     "trying to get uri for stage #{}, current executors: {:?}",
                     stage_id,

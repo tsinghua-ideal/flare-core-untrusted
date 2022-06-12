@@ -225,7 +225,7 @@ where
                     )))
                     .unwrap();
                     //clear the sort cache
-                    env::SORT_CACHE.retain(|k, _| k.0 != self.stage_id);
+                    env::SORT_CACHE.retain(|k, _| k.0 .0 != self.stage_id);
 
                     res
                 }),

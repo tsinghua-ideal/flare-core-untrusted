@@ -100,7 +100,7 @@ impl Task for ShuffleMapTask {
         futures::executor::block_on(ShuffleFetcher::fetch_sync((self.stage_id, 0, num_splits)))
             .unwrap();
         //clear the sort cache
-        env::SORT_CACHE.retain(|k, _| k.0 != self.stage_id);
+        env::SORT_CACHE.retain(|k, _| k.0 .0 != self.stage_id);
         res
     }
 }

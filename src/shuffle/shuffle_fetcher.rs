@@ -162,7 +162,6 @@ impl ShuffleFetcher {
         req: GetServerUriReq,
         reduce_id: usize,
         fetch_from: usize,
-        part_group: Option<(usize, usize)>,
     ) -> Result<impl Iterator<Item = Vec<ItemE>>> {
         log::debug!("inside fetch function");
         let mut server_uris = env::Env::get()
@@ -172,7 +171,7 @@ impl ShuffleFetcher {
             .map_err(|err| ShuffleError::FailFetchingShuffleUris {
                 source: Box::new(err),
             })?;
-        if let Some((s, n)) = part_group {
+        if let GetServerUriReq::CurStage((_, s, n)) = req {
             server_uris = server_uris[s..s + n].to_vec();
         }
         //get the uri of current worker
@@ -221,8 +220,11 @@ impl ShuffleFetcher {
                 let mut lock = server_queue.lock().await;
                 if let Some((server_uri, input_ids)) = lock.pop() {
                     let server_uri = match req {
-                        GetServerUriReq::CurStage(stage_id) => {
-                            format!("{}/sort/{}", server_uri, stage_id)
+                        GetServerUriReq::CurStage(part_group) => {
+                            format!(
+                                "{}/sort/{}/{}/{}",
+                                server_uri, part_group.0, part_group.1, part_group.2
+                            )
                         }
                         GetServerUriReq::PrevStage(shuffle_id) => {
                             format!("{}/shuffle/{}", server_uri, shuffle_id)
@@ -302,8 +304,13 @@ impl ShuffleFetcher {
         let cur_op_ids = vec![*acc_arg.op_ids.last().unwrap()];
         let reduce_id = *acc_arg.part_ids.last().unwrap();
         let cur_part_ids = vec![reduce_id];
-        let part_id_offset = acc_arg.part_ids.first().unwrap() - acc_arg.part_ids.last().unwrap();
+        let part_id_offset = if acc_arg.part_ids[0] == usize::MAX {
+            acc_arg.part_ids[1] - acc_arg.part_ids.last().unwrap()
+        } else {
+            acc_arg.part_ids[0] - acc_arg.part_ids.last().unwrap()
+        };
         let num_splits = *acc_arg.split_nums.last().unwrap();
+        let part_group = (stage_id, part_id_offset, num_splits);
 
         let cnt_per_partition = {
             let mut cnt_per_partition = wrapper_get_cnt_per_partition(cur_op_ids[0], reduce_id);
@@ -359,19 +366,13 @@ impl ShuffleFetcher {
                     reduce_id,
                     bucket
                 );
-                env::SORT_CACHE.insert((stage_id, reduce_id, i), ser_bytes);
+                env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
             }
-            futures::executor::block_on(ShuffleFetcher::fetch_sync((
-                stage_id,
-                part_id_offset,
-                num_splits,
-            )))
-            .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
             let fut = ShuffleFetcher::secure_fetch(
-                GetServerUriReq::CurStage(stage_id),
+                GetServerUriReq::CurStage(part_group),
                 reduce_id,
                 usize::MAX,
-                Some((part_id_offset, num_splits)),
             );
             futures::executor::block_on(fut)
                 .unwrap()
@@ -415,20 +416,14 @@ impl ShuffleFetcher {
                 bucket,
             );
             env::SORT_CACHE.insert(
-                (stage_id, reduce_id, (reduce_id + 1) % num_splits),
+                (part_group, reduce_id, (reduce_id + 1) % num_splits),
                 ser_bytes,
             );
-            futures::executor::block_on(ShuffleFetcher::fetch_sync((
-                stage_id,
-                part_id_offset,
-                num_splits,
-            )))
-            .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
             let fut = ShuffleFetcher::secure_fetch(
-                GetServerUriReq::CurStage(stage_id),
+                GetServerUriReq::CurStage(part_group),
                 reduce_id,
                 (reduce_id + num_splits - 1) % num_splits,
-                Some((part_id_offset, num_splits)),
             );
             buckets.append(
                 &mut futures::executor::block_on(fut)
@@ -476,24 +471,18 @@ impl ShuffleFetcher {
             );
             env::SORT_CACHE.insert(
                 (
-                    stage_id,
+                    part_group,
                     reduce_id,
                     (reduce_id + num_splits - 1) % num_splits,
                 ),
                 ser_bytes,
             );
 
-            futures::executor::block_on(ShuffleFetcher::fetch_sync((
-                stage_id,
-                part_id_offset,
-                num_splits,
-            )))
-            .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
             let fut = ShuffleFetcher::secure_fetch(
-                GetServerUriReq::CurStage(stage_id),
+                GetServerUriReq::CurStage(part_group),
                 reduce_id,
                 (reduce_id + 1) % num_splits,
-                Some((part_id_offset, num_splits)),
             );
             buckets
                 .pop()
