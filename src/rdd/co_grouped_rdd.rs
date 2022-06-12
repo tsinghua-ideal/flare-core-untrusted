@@ -175,12 +175,10 @@ where
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     has_shuffle = true;
-                    //TODO need revision if fe & fd of group_by is passed
                     let fut = ShuffleFetcher::secure_fetch(
                         GetServerUriReq::PrevStage(shuffle_id),
                         split.get_index(),
                         usize::MAX,
-                        None,
                     );
                     kv.1 = futures::executor::block_on(fut)?
                         .into_iter()
@@ -231,12 +229,10 @@ where
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     has_shuffle = true;
-                    //TODO need revision if fe & fd of group_by is passed
                     let fut = ShuffleFetcher::secure_fetch(
                         GetServerUriReq::PrevStage(shuffle_id),
                         split.get_index(),
                         usize::MAX,
-                        None,
                     );
                     kw.1 = futures::executor::block_on(fut)?
                         .into_iter()
@@ -293,8 +289,13 @@ where
         let reduce_id = *acc_arg.part_ids.last().unwrap();
         let cur_part_ids = vec![reduce_id];
         //due to rdds like union, we only need partial executor info registered for the stage id
-        let part_id_offset = acc_arg.part_ids.first().unwrap() - acc_arg.part_ids.last().unwrap();
+        let part_id_offset = if acc_arg.part_ids[0] == usize::MAX {
+            acc_arg.part_ids[1] - acc_arg.part_ids.last().unwrap()
+        } else {
+            acc_arg.part_ids[0] - acc_arg.part_ids.last().unwrap()
+        };
         let num_splits = *acc_arg.split_nums.last().unwrap();
+        let part_group = (stage_id, part_id_offset, num_splits);
 
         //step 1: sort + step 2: shuffle (transpose)
         let fetched_data = {
@@ -323,19 +324,13 @@ where
                     reduce_id,
                     bucket
                 );
-                env::SORT_CACHE.insert((stage_id, reduce_id, i), ser_bytes);
+                env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
             }
-            futures::executor::block_on(ShuffleFetcher::fetch_sync((
-                stage_id,
-                part_id_offset,
-                num_splits,
-            )))
-            .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
             let fut = ShuffleFetcher::secure_fetch(
-                GetServerUriReq::CurStage(stage_id),
+                GetServerUriReq::CurStage(part_group),
                 reduce_id,
                 usize::MAX,
-                Some((part_id_offset, num_splits)),
             );
             futures::executor::block_on(fut)
                 .unwrap()
@@ -364,8 +359,14 @@ where
         let reduce_id = *acc_arg.part_ids.last().unwrap();
         let cur_part_ids = vec![reduce_id];
         //due to rdds like union, we only need partial executor info registered for the stage id
-        let part_id_offset = acc_arg.part_ids.first().unwrap() - acc_arg.part_ids.last().unwrap();
+        let part_id_offset = if acc_arg.part_ids[0] == usize::MAX {
+            acc_arg.part_ids[1] - acc_arg.part_ids.last().unwrap()
+        } else {
+            acc_arg.part_ids[0] - acc_arg.part_ids.last().unwrap()
+        };
         let num_splits = *acc_arg.split_nums.last().unwrap();
+        let part_group = (stage_id, part_id_offset, num_splits);
+
         //step 1: sort + step 2: shuffle (transpose)
         let fetched_data = {
             acc_arg.get_enclave_lock();
@@ -383,12 +384,7 @@ where
                 get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
             acc_arg.free_enclave_lock();
             buckets.resize(num_splits, Vec::new());
-            futures::executor::block_on(ShuffleFetcher::fetch_sync((
-                stage_id,
-                part_id_offset,
-                num_splits,
-            )))
-            .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
 
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
@@ -399,19 +395,13 @@ where
                     reduce_id,
                     bucket
                 );
-                env::SORT_CACHE.insert((stage_id, reduce_id, i), ser_bytes);
+                env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
             }
-            futures::executor::block_on(ShuffleFetcher::fetch_sync((
-                stage_id,
-                part_id_offset,
-                num_splits,
-            )))
-            .unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
             let fut = ShuffleFetcher::secure_fetch(
-                GetServerUriReq::CurStage(stage_id),
+                GetServerUriReq::CurStage(part_group),
                 reduce_id,
                 usize::MAX,
-                Some((part_id_offset, num_splits)),
             );
             futures::executor::block_on(fut)
                 .unwrap()
@@ -437,8 +427,13 @@ where
         //the current implementation is not fully oblivious
         //because Opaque doe not design for general oblivious join
         let reduce_id = *acc_arg.part_ids.last().unwrap();
-        let part_id_offset = acc_arg.part_ids.first().unwrap() - acc_arg.part_ids.last().unwrap();
+        let part_id_offset = if acc_arg.part_ids[0] == usize::MAX {
+            acc_arg.part_ids[1] - acc_arg.part_ids.last().unwrap()
+        } else {
+            acc_arg.part_ids[0] - acc_arg.part_ids.last().unwrap()
+        };
         let num_splits = *acc_arg.split_nums.last().unwrap();
+        let part_group = (stage_id, part_id_offset, num_splits);
 
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
@@ -467,28 +462,17 @@ where
         };
 
         //sync in order to clear the sort cache
-        futures::executor::block_on(ShuffleFetcher::fetch_sync((
-            stage_id,
-            part_id_offset,
-            num_splits,
-        )))
-        .unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
         //clear the sort cache
-        env::SORT_CACHE.retain(|k, _| k.0 != stage_id);
+        env::SORT_CACHE.retain(|k, _| k.0 != part_group);
         //sync again to avoid clearing the just-written value
-        futures::executor::block_on(ShuffleFetcher::fetch_sync((
-            stage_id,
-            part_id_offset,
-            num_splits,
-        )))
-        .unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
 
         if reduce_id != 0 {
             let fut = ShuffleFetcher::secure_fetch(
-                GetServerUriReq::CurStage(stage_id),
+                GetServerUriReq::CurStage(part_group),
                 reduce_id,
                 (reduce_id + num_splits - 1) % num_splits,
-                Some((part_id_offset, num_splits)),
             );
             let mut fut_res = futures::executor::block_on(fut);
             //the aggregate info may not be prepared
@@ -498,10 +482,9 @@ where
                     Err(_) => {
                         std::thread::sleep(Duration::from_millis(5));
                         fut_res = futures::executor::block_on(ShuffleFetcher::secure_fetch(
-                            GetServerUriReq::CurStage(stage_id),
+                            GetServerUriReq::CurStage(part_group),
                             reduce_id,
                             (reduce_id + num_splits - 1) % num_splits,
-                            Some((part_id_offset, num_splits)),
                         ));
                     }
                 }
@@ -548,12 +531,12 @@ where
             if last_kc.is_some() {
                 let ser_bytes = bincode::serialize(&vec![last_kc.unwrap()]).unwrap();
                 env::SORT_CACHE.insert(
-                    (stage_id, reduce_id, (reduce_id + 1) % num_splits),
+                    (part_group, reduce_id, (reduce_id + 1) % num_splits),
                     ser_bytes,
                 );
             } else {
                 env::SORT_CACHE.insert(
-                    (stage_id, reduce_id, (reduce_id + 1) % num_splits),
+                    (part_group, reduce_id, (reduce_id + 1) % num_splits),
                     bincode::serialize(&Vec::<ItemE>::new()).unwrap(),
                 );
             }
@@ -616,7 +599,6 @@ where
             let rdd_base = rdd0.get_rdd_base();
             log::debug!("creating aggregator inside cogrouprdd");
             deps.push(Dependency::ShuffleDependency(
-                //TODO need revision if fe & fd of group_by is passed
                 Arc::new(ShuffleDependency::new(
                     shuffle_ids.remove(0),
                     true,
@@ -643,7 +625,6 @@ where
             let rdd_base = rdd1.get_rdd_base();
             log::debug!("creating aggregator inside cogrouprdd");
             deps.push(Dependency::ShuffleDependency(
-                //TODO need revision if fe & fd of group_by is passed
                 Arc::new(ShuffleDependency::new(
                     shuffle_ids.remove(0),
                     true,

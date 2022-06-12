@@ -178,12 +178,25 @@ impl ShuffleService {
         let parts: Vec<_> = uri.path().split('/').collect();
         match parts.as_slice() {
             [_, endpoint] if *endpoint == "status" => Ok(ShuffleResponse::Status(StatusCode::OK)),
-            [_, endpoint, s_id, input_id, reduce_id]
-                if *endpoint == "shuffle" || *endpoint == "sort" =>
+            [_, endpoint, shuffle_id, input_id, reduce_id] if *endpoint == "shuffle" => {
+                Ok(ShuffleResponse::CachedData(self.get_cached_data(
+                    uri,
+                    &[*shuffle_id, *input_id, *reduce_id],
+                    *endpoint == "sort",
+                )?))
+            }
+            [_, endpoint, stage_id, part_id_offset, num_splits, input_id, reduce_id]
+                if *endpoint == "sort" =>
             {
                 Ok(ShuffleResponse::CachedData(self.get_cached_data(
                     uri,
-                    &[*s_id, *input_id, *reduce_id],
+                    &[
+                        *stage_id,
+                        *part_id_offset,
+                        *num_splits,
+                        *input_id,
+                        *reduce_id,
+                    ],
                     *endpoint == "sort",
                 )?))
             }
@@ -203,8 +216,8 @@ impl ShuffleService {
             }
             Ok(parts) => parts,
         };
-        let params = &(parts[0], parts[1], parts[2]);
         if is_sort {
+            let params = &((parts[0], parts[1], parts[2]), parts[3], parts[4]);
             if let Some(cached_data) = env::SORT_CACHE.get(params) {
                 log::debug!("got a request @ `{}`, params: {:?}", uri, params);
                 Ok(Vec::from(&cached_data[..]))
@@ -212,6 +225,7 @@ impl ShuffleService {
                 Err(ShuffleError::RequestedCacheNotFound)
             }
         } else {
+            let params = &(parts[0], parts[1], parts[2]);
             if let Some(cached_data) = env::SHUFFLE_CACHE.get(params) {
                 log::debug!("got a request @ `{}`, params: {:?}", uri, params);
                 Ok(Vec::from(&cached_data[..]))

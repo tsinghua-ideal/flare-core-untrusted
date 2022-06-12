@@ -25,9 +25,12 @@ use tokio::runtime::{Handle, Runtime};
 use sgx_types::*;
 use sgx_urts::SgxEnclave;
 
-/// ShuffleCache or SortCache
+/// ShuffleCache
 /// The key is: {shuffle_id}/{input_id}/{reduce_id}
-type SCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
+type ShuffleCache = Arc<DashMap<(usize, usize, usize), Vec<u8>>>;
+/// SortCache
+/// The key is: {(stage_id, part_id_offset, num_splits)}/{input_id}/{reduce_id}
+type SortCache = Arc<DashMap<((usize, usize, usize), usize, usize), Vec<u8>>>;
 
 const ENV_VAR_PREFIX: &str = "VEGA_";
 pub(crate) const THREAD_PREFIX: &str = "_VEGA";
@@ -35,9 +38,8 @@ static CONF: OnceCell<Configuration> = OnceCell::new();
 static ENV: OnceCell<Env> = OnceCell::new();
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(Env::build_async_executor);
 
-pub(crate) static SHUFFLE_CACHE: Lazy<SCache> = Lazy::new(|| Arc::new(DashMap::new()));
-//TODO: SORT_CACHE should be managed in the unit of part_group, instead of stage
-pub(crate) static SORT_CACHE: Lazy<SCache> = Lazy::new(|| Arc::new(DashMap::new()));
+pub(crate) static SHUFFLE_CACHE: Lazy<ShuffleCache> = Lazy::new(|| Arc::new(DashMap::new()));
+pub(crate) static SORT_CACHE: Lazy<SortCache> = Lazy::new(|| Arc::new(DashMap::new()));
 pub(crate) static BOUNDED_MEM_CACHE: Lazy<BoundedMemoryCache> = Lazy::new(BoundedMemoryCache::new);
 pub(crate) static RDDB_MAP: Lazy<RddBMap> = Lazy::new(|| RddBMap::new());
 
