@@ -44,7 +44,7 @@ pub enum ShuffleError {
     RequestedCacheNotFound,
 
     #[error("unexpected shuffle server problem")]
-    UnexpectedServerError(#[from] hyper::error::Error),
+    UnexpectedServerError(#[from] hyper::Error),
 
     #[error("unexpected URI sent in the request: {0}")]
     UnexpectedUri(String),

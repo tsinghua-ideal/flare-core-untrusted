@@ -28,7 +28,7 @@ pub enum Error {
 
     #[error("couldn't determine the path to the current binary")]
     CurrentBinaryPath,
-    
+
     #[error("couldn't determine the current enclave's name")]
     CurrentEnclaveName,
 
@@ -78,7 +78,7 @@ pub enum Error {
     OsStringToString(OsString),
 
     #[error("failed writing to output destination")]
-    OutputWrite(#[source] std::io::Error),
+    OutputWrite(#[source] capnp::Error),
 
     #[error("failed to parse hosts file at {}", path.display())]
     ParseHosts {

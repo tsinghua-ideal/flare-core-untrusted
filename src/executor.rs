@@ -15,14 +15,14 @@ use crossbeam::{channel::bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
-    stream::StreamExt,
     task::{spawn, spawn_blocking},
-    time::delay_for,
+    time::sleep,
 };
-use tokio_util::compat::{Tokio02AsyncReadCompatExt, Tokio02AsyncWriteCompatExt};
+use tokio_stream::StreamExt;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const CAPNP_BUF_READ_OPTS: ReaderOptions = ReaderOptions {
-    traversal_limit_in_words: std::u64::MAX,
+    traversal_limit_in_words: None,
     nesting_limit: 64,
 };
 
@@ -60,7 +60,7 @@ impl Executor {
         let mut listener = TcpListener::bind(addr)
             .await
             .map_err(NetworkError::TcpListener)?;
-        while let Some(Ok(mut stream)) = listener.incoming().next().await {
+        while let Ok((mut stream, _)) = listener.accept().await {
             let rcv_main = rcv_main.clone();
             let selfc = Arc::clone(&self);
             let res: Result<Signal> = spawn(async move {
@@ -80,9 +80,8 @@ impl Executor {
                 }
                 log::debug!("received new task @{} executor", selfc.port);
                 let message = {
-                    let message_reader = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS)
-                        .await?
-                        .ok_or_else(|| NetworkError::NoMessageReceived)?;
+                    let message_reader =
+                        capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
                     spawn_blocking(move || -> Result<_> {
                         let des_task = selfc.deserialize_task(message_reader)?;
                         selfc.run_task(des_task)
@@ -181,14 +180,13 @@ impl Executor {
             .await
             .map_err(NetworkError::TcpListener)?;
         let mut signal: Result<Signal> = Err(Error::ExecutorShutdown);
-        while let Some(Ok(mut stream)) = listener.incoming().next().await {
+        while let Ok((mut stream, _)) = listener.accept().await {
             let (reader, writer) = stream.split();
             let reader = reader.compat();
             let writer = writer.compat_write();
             let data = {
-                let signal_data = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS)
-                    .await?
-                    .ok_or_else(|| NetworkError::NoMessageReceived)?;
+                let signal_data =
+                    capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
                 bincode::deserialize::<Signal>(
                     signal_data
                         .get_root::<serialized_data::Reader>()?
@@ -230,7 +228,7 @@ impl Executor {
             }
         }
         // give some time to the executor threads to shut down hopefully
-        delay_for(Duration::from_millis(1_000)).await;
+        sleep(Duration::from_millis(1_000)).await;
         signal
     }
 }
