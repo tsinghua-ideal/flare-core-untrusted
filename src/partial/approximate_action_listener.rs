@@ -70,7 +70,7 @@ where
                     true,
                 ));
             }
-            tokio::time::delay_for(self.timeout / 20).await;
+            tokio::time::sleep(self.timeout / 20).await;
         }
         // Ran out of time before full completion, return partial job
         let result = PartialResult::new(self.evaluator.lock().await.current_result(), false);

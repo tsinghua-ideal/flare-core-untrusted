@@ -90,9 +90,11 @@ impl Env {
         F: FnOnce() -> R,
     {
         if let Ok(rt) = Handle::try_current() {
-            rt.enter(func)
+            let _guard = rt.enter();
+            func()
         } else if let Some(rt) = &*ASYNC_RT {
-            rt.enter(func)
+            let _guard = rt.enter();
+            func()
         } else {
             unreachable!()
         }
@@ -107,9 +109,8 @@ impl Env {
             None
         } else {
             Some(
-                tokio::runtime::Builder::new()
+                tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
-                    .threaded_scheduler()
                     .build()
                     .unwrap(),
             )

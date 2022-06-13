@@ -36,7 +36,7 @@ use uuid::Uuid;
 use Schedulers::*;
 
 const CAPNP_BUF_READ_OPTS: ReaderOptions = ReaderOptions {
-    traversal_limit_in_words: std::u64::MAX,
+    traversal_limit_in_words: None,
     nesting_limit: 64,
 };
 

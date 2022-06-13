@@ -16,11 +16,12 @@ use capnp::message::ReaderOptions;
 use capnp_futures::serialize as capnp_serialize;
 use dashmap::{DashMap, DashSet};
 use serde_derive::{Deserialize, Serialize};
-use tokio::{net::TcpListener, stream::StreamExt};
-use tokio_util::compat::{Tokio02AsyncReadCompatExt, Tokio02AsyncWriteCompatExt};
+use tokio::net::TcpListener;
+use tokio_stream::StreamExt;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const CAPNP_BUF_READ_OPTS: ReaderOptions = ReaderOptions {
-    traversal_limit_in_words: std::u64::MAX,
+    traversal_limit_in_words: None,
     nesting_limit: 64,
 };
 
@@ -131,9 +132,7 @@ impl CacheTracker {
             capnp::serialize::write_message(&mut stream, &message).map_err(Error::OutputWrite)?;
         }
 
-        let message_reader = capnp_serialize::read_message(stream, CAPNP_BUF_READ_OPTS)
-            .await?
-            .ok_or_else(|| NetworkError::NoMessageReceived)?;
+        let message_reader = capnp_serialize::read_message(stream, CAPNP_BUF_READ_OPTS).await?;
         let shuffle_data = message_reader.get_root::<serialized_data::Reader>()?;
         let reply: CacheTrackerMessageReply = bincode::deserialize(&shuffle_data.get_msg()?)?;
         Ok(reply)
@@ -150,7 +149,7 @@ impl CacheTracker {
                 .await
                 .map_err(NetworkError::TcpListener)?;
             log::debug!("cache tracker server started");
-            while let Some(Ok(mut stream)) = listener.incoming().next().await {
+            while let Ok((mut stream, _)) = listener.accept().await {
                 let selfc = Arc::clone(&self);
                 tokio::spawn(async move {
                     let (reader, writer) = stream.split();
@@ -158,9 +157,8 @@ impl CacheTracker {
                     let writer = writer.compat_write();
 
                     //reading
-                    let message_reader = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS)
-                        .await?
-                        .ok_or_else(|| NetworkError::NoMessageReceived)?;
+                    let message_reader =
+                        capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
                     let data = message_reader.get_root::<serialized_data::Reader>()?;
                     let message: CacheTrackerMessage = bincode::deserialize(data.get_msg()?)?;
 
