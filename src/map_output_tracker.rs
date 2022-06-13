@@ -9,14 +9,12 @@ use capnp_futures::serialize as capnp_serialize;
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 use thiserror::Error;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    stream::StreamExt,
-};
-use tokio_util::compat::{Tokio02AsyncReadCompatExt, Tokio02AsyncWriteCompatExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_stream::StreamExt;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const CAPNP_BUF_READ_OPTS: ReaderOptions = ReaderOptions {
-    traversal_limit_in_words: std::u64::MAX,
+    traversal_limit_in_words: None,
     nesting_limit: 64,
 };
 
@@ -84,9 +82,7 @@ impl MapOutputTracker {
         let mut shuffle_data = message.init_root::<serialized_data::Builder>();
         shuffle_data.set_msg(&shuffle_id_bytes);
         capnp_serialize::write_message(&mut writer, &message).await?;
-        let message_reader = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS)
-            .await?
-            .ok_or_else(|| NetworkError::NoMessageReceived)?;
+        let message_reader = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
         let shuffle_data = message_reader.get_root::<serialized_data::Reader>()?;
         let locs: Vec<String> = bincode::deserialize(&shuffle_data.get_msg()?)?;
         Ok(locs)
@@ -104,7 +100,7 @@ impl MapOutputTracker {
                 .await
                 .map_err(NetworkError::TcpListener)?;
             log::debug!("map output tracker server started");
-            while let Some(Ok(mut stream)) = listener.incoming().next().await {
+            while let Ok((mut stream, _)) = listener.accept().await {
                 let server_uris_clone = server_uris.clone();
                 tokio::spawn(async move {
                     let (reader, writer) = stream.split();
@@ -112,9 +108,8 @@ impl MapOutputTracker {
                     let writer = writer.compat_write();
 
                     // reading
-                    let message_reader = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS)
-                        .await?
-                        .ok_or_else(|| NetworkError::NoMessageReceived)?;
+                    let message_reader =
+                        capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
                     let shuffle_id = {
                         let data = message_reader.get_root::<serialized_data::Reader>()?;
                         bincode::deserialize(data.get_msg()?)?
@@ -128,7 +123,7 @@ impl MapOutputTracker {
                         == 0
                     {
                         //check whether this will hurt the performance or not
-                        tokio::time::delay_for(Duration::from_millis(1)).await;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     let locs = server_uris_clone
                         .get(&shuffle_id)
@@ -227,7 +222,7 @@ impl MapOutputTracker {
             if self.fetching.contains(&shuffle_id) {
                 while self.fetching.contains(&shuffle_id) {
                     // TODO: check whether this will hurt the performance or not
-                    tokio::time::delay_for(Duration::from_millis(1)).await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 let servers = self
                     .server_uris

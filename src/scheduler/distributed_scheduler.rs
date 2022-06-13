@@ -27,10 +27,10 @@ use capnp_futures::serialize as capnp_serialize;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::net::TcpStream;
-use tokio_util::compat::{Tokio02AsyncReadCompatExt, Tokio02AsyncWriteCompatExt};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const CAPNP_BUF_READ_OPTS: ReaderOptions = ReaderOptions {
-    traversal_limit_in_words: std::u64::MAX,
+    traversal_limit_in_words: None,
     nesting_limit: 64,
 };
 
@@ -330,8 +330,6 @@ impl DistributedScheduler {
         let result: TaskResult = {
             let message = capnp_futures::serialize::read_message(receiver, CAPNP_BUF_READ_OPTS)
                 .await
-                .unwrap()
-                .ok_or_else(|| NetworkError::NoMessageReceived)
                 .unwrap();
             let task_data = message.get_root::<serialized_data::Reader>().unwrap();
             log::debug!(
@@ -472,7 +470,7 @@ impl NativeScheduler for DistributedScheduler {
                             //100s
                             panic!("executor @{} not initialized", target_executor.port());
                         }
-                        tokio::time::delay_for(Duration::from_millis(20)).await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                         num_retries += 1;
                         continue;
                     }

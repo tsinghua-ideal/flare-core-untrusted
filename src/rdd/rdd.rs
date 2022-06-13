@@ -73,7 +73,7 @@ pub type ItemE = Vec<u8>;
 
 static immediate_cout: bool = true;
 pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
-pub const MERGE_FACTOR: usize = 64;
+pub const MERGE_FACTOR: usize = 32;
 pub const MAX_ENC_BL: usize = 1024;
 
 extern "C" {

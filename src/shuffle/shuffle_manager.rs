@@ -140,7 +140,7 @@ impl ShuffleManager {
                         send_child.send(Ok(res.status())).unwrap();
                     }
                     // sleep for a while before checking again if there are status requests
-                    tokio::time::delay_for(Duration::from_millis(25)).await
+                    tokio::time::sleep(Duration::from_millis(25)).await
                 }
                 Ok::<(), ShuffleError>(())
             },
