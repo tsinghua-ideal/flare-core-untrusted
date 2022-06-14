@@ -74,6 +74,8 @@ pub type ItemE = Vec<u8>;
 static immediate_cout: bool = true;
 pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
 pub const MAX_ENC_BL: usize = 1024;
+pub const MAX_THREAD: usize = 11;
+pub const MAX_OM_THREAD: usize = 10;
 
 extern "C" {
     pub fn secure_execute_pre(
@@ -168,13 +170,14 @@ pub unsafe extern "C" fn sbrk_o(increment: usize) -> *mut c_void {
 //return the length of current cpu set
 #[no_mangle]
 pub unsafe extern "C" fn ocall_set_thread_affinity(is_for_om: u8) -> usize {
-    let cur_cpu_set = (0..affinity::get_core_num()).collect::<Vec<usize>>();
+    let mut cur_cpu_set = (0..affinity::get_core_num()).collect::<Vec<usize>>();
     //by default, the first core is for OM
     match is_for_om {
-        1 => affinity::set_thread_affinity(&cur_cpu_set[0..1]).unwrap(),
-        0 => affinity::set_thread_affinity(&cur_cpu_set[1..]).unwrap(),
+        1 => affinity::set_thread_affinity(&cur_cpu_set[0..MAX_OM_THREAD]).unwrap(),
+        0 => affinity::set_thread_affinity(&cur_cpu_set[MAX_OM_THREAD..MAX_THREAD]).unwrap(),
         _ => unreachable!(),
     }
+    cur_cpu_set.truncate(MAX_THREAD);
     cur_cpu_set.len()
 }
 
@@ -182,7 +185,8 @@ pub unsafe extern "C" fn ocall_set_thread_affinity(is_for_om: u8) -> usize {
 #[no_mangle]
 pub unsafe extern "C" fn ocall_get_thread_affinity(cores: *mut usize, cores_len: usize) -> usize {
     let cores = std::slice::from_raw_parts_mut(cores, cores_len);
-    let actual_cores = affinity::get_thread_affinity().unwrap();
+    let mut actual_cores = affinity::get_thread_affinity().unwrap();
+    actual_cores.truncate(MAX_THREAD);
     let len = actual_cores.len();
     cores[..len].copy_from_slice(&actual_cores);
     len
