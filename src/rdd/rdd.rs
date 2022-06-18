@@ -947,7 +947,7 @@ impl StageLock {
             lock_holder_info: RwLock::new(LockHolderInfo {
                 cur_holder: (0, 0, 0),
                 num_cur_holders: 0,
-                max_cur_holders: 1,
+                max_cur_holders: 48,
             }),
             waiting_list: RwLock::new(BTreeMap::new()),
             num_splits_mapping: RwLock::new(BTreeMap::new()),
