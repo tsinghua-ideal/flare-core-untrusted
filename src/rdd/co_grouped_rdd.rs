@@ -165,8 +165,6 @@ where
                             size,
                         );
                     }
-                    //TODO: pre_merge
-
                     for sub_part in kv_0 {
                         let sub_part_len = sub_part.len();
                         if sub_part_len > 0 {
@@ -184,23 +182,6 @@ where
                     let kv_1 = futures::executor::block_on(fut)?
                         .into_iter()
                         .collect::<Vec<_>>();
-                    //pre_merge
-                    let parent_rdd_id = self.rdd0.get_rdd_id();
-                    let parent_op_id = self.rdd0.get_op_id();
-                    let dep_info = DepInfo::new(
-                        1,
-                        0,
-                        parent_rdd_id,
-                        self.vals.id,
-                        parent_op_id,
-                        self.vals.op_id,
-                    );
-                    println!("bucket size before pre_merge: {:?}", kv_1.get_size());
-                    acc_arg.get_enclave_lock();
-                    let kv_1 = wrapper_pre_merge(parent_op_id, kv_1, dep_info);
-                    acc_arg.free_enclave_lock();
-                    println!("bucket size after pre_merge: {:?}", kv_1.get_size());
-                    //
                     for sub_part in kv_1 {
                         let sub_part_len = sub_part.len();
                         if sub_part_len > 0 {
@@ -244,8 +225,6 @@ where
                             size,
                         );
                     }
-                    //TODO: pre_merge
-
                     for sub_part in kw_0 {
                         let sub_part_len = sub_part.len();
                         if sub_part_len > 0 {
@@ -263,23 +242,6 @@ where
                     let kw_1 = futures::executor::block_on(fut)?
                         .into_iter()
                         .collect::<Vec<_>>();
-                    //pre_merge
-                    let parent_rdd_id = self.rdd1.get_rdd_id();
-                    let parent_op_id = self.rdd1.get_op_id();
-                    let dep_info = DepInfo::new(
-                        1,
-                        1,
-                        parent_rdd_id,
-                        self.vals.id,
-                        parent_op_id,
-                        self.vals.op_id,
-                    );
-                    println!("bucket size before pre_merge: {:?}", kw_1.get_size());
-                    acc_arg.get_enclave_lock();
-                    let kw_1 = wrapper_pre_merge(parent_op_id, kw_1, dep_info);
-                    acc_arg.free_enclave_lock();
-                    println!("bucket size after pre_merge: {:?}", kw_1.get_size());
-                    //
                     for sub_part in kw_1 {
                         let sub_part_len = sub_part.len();
                         if sub_part_len > 0 {

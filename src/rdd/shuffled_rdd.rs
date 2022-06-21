@@ -108,18 +108,7 @@ where
             .into_iter()
             .filter(|sub_part| sub_part.len() > 0)
             .collect(); // bucket per subpartition
-                        //pre_merge
-        let parent_rdd_id = self.parent.get_rdd_id();
-        let child_rdd_id = self.vals.id;
-        let parent_op_id = self.parent.get_op_id();
-        let child_op_id = self.vals.op_id;
-        let dep_info = DepInfo::new(1, 0, parent_rdd_id, child_rdd_id, parent_op_id, child_op_id);
-        println!("bucket size before pre_merge: {:?}", buckets.get_size());
-        acc_arg.get_enclave_lock();
-        let buckets = wrapper_pre_merge(parent_op_id, buckets, dep_info);
-        acc_arg.free_enclave_lock();
-        println!("bucket size after pre_merge: {:?}", buckets.get_size());
-        //
+
         let num_sub_part = buckets.len();
         if num_sub_part == 0 {
             return Ok(Vec::new());

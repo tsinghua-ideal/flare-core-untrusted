@@ -96,14 +96,6 @@ extern "C" {
         input: Input,
         captured_vars: *const u8,
     ) -> sgx_status_t;
-    pub fn pre_merge(
-        eid: sgx_enclave_id_t,
-        retval: *mut usize,
-        tid: u64,
-        op_id: OpId,
-        dep_info: DepInfo,
-        input: Input,
-    ) -> sgx_status_t;
     pub fn free_res_enc(
         eid: sgx_enclave_id_t,
         op_id: OpId,
@@ -282,39 +274,6 @@ pub fn start_execute<T: Data>(acc_arg: AccArg, data: Vec<T>, tx: SyncSender<usiz
     tx.send(result_ptr).unwrap();
 
     wait
-}
-
-pub fn wrapper_pre_merge<T: Data>(
-    op_id: OpId,
-    data: Vec<Vec<T>>,
-    dep_info: DepInfo,
-) -> Vec<Vec<T>> {
-    if data.len() <= MERGE_FACTOR {
-        return data;
-    }
-
-    let eid = Env::get()
-        .enclave
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .geteid();
-    let tid: u64 = thread::current().id().as_u64().into();
-    let now = Instant::now();
-    let mut result_ptr = 0;
-    let input = Input::new(&data);
-    let sgx_status = unsafe { pre_merge(eid, &mut result_ptr, tid, op_id, dep_info, input) };
-    match sgx_status {
-        sgx_status_t::SGX_SUCCESS => {}
-        _ => {
-            panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-        }
-    };
-    let mut data = get_encrypted_data::<Vec<Vec<T>>>(op_id, dep_info, result_ptr as *mut u8);
-    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-    println!("pre_merge total {:?}s", dur);
-    data.remove(0)
 }
 
 pub fn wrapper_action<T: Data>(data: Vec<T>, rdd_id: usize, op_id: OpId, is_local: bool) -> usize {
