@@ -104,7 +104,7 @@ where
     ) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
         let fut = ShuffleFetcher::secure_fetch(self.shuffle_id, part_id);
-        let buckets: Vec<Vec<ItemE>> = futures::executor::block_on(fut)?
+        let buckets: Vec<Vec<Vec<ItemE>>> = futures::executor::block_on(fut)?
             .into_iter()
             .filter(|sub_part| sub_part.len() > 0)
             .collect(); // bucket per subpartition
@@ -129,7 +129,11 @@ where
         Ok(vec![handle])
     }
 
-    fn secure_shuffle_read(&self, buckets: Vec<Vec<ItemE>>, acc_arg: &mut AccArg) -> Vec<ItemE> {
+    fn secure_shuffle_read(
+        &self,
+        buckets: Vec<Vec<Vec<ItemE>>>,
+        acc_arg: &mut AccArg,
+    ) -> Vec<ItemE> {
         acc_arg.get_enclave_lock();
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];

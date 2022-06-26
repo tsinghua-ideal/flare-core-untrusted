@@ -122,7 +122,7 @@ impl ShuffleFetcher {
     pub async fn secure_fetch(
         shuffle_id: usize,
         reduce_id: usize,
-    ) -> Result<impl Iterator<Item = Vec<ItemE>>> {
+    ) -> Result<impl Iterator<Item = Vec<Vec<ItemE>>>> {
         log::debug!("inside fetch function");
         let mut inputs_by_uri = HashMap::new();
         let server_uris = env::Env::get()
@@ -170,7 +170,7 @@ impl ShuffleFetcher {
                     let server_uri = format!("{}/shuffle/{}", server_uri, shuffle_id);
                     let mut chunk_uri_str = String::with_capacity(server_uri.len() + 12);
                     chunk_uri_str.push_str(&server_uri);
-                    let mut shuffle_chunks = Vec::with_capacity(input_ids.len());
+                    let mut shuffle_chunks = Vec::new();
                     for input_id in input_ids.clone() {
                         if failure.load(atomic::Ordering::Acquire) {
                             // Abort early since the work failed in an other future
@@ -188,19 +188,26 @@ impl ShuffleFetcher {
                             hyper::body::to_bytes(res.into_body()).await
                         };
                         if let Ok(bytes) = data_bytes {
-                            let deser_data =
-                                bincode::deserialize::<Vec<Vec<ItemE>>>(&bytes.to_vec())?;
-                            shuffle_chunks.push(deser_data);
+                            let mut deser_data =
+                                bincode::deserialize::<Vec<Vec<Vec<ItemE>>>>(&bytes.to_vec())?;
+                            if shuffle_chunks.is_empty() {
+                                shuffle_chunks = deser_data;
+                            } else {
+                                assert_eq!(shuffle_chunks.len(), deser_data.len());
+                                for (i, chunk) in shuffle_chunks.iter_mut().enumerate() {
+                                    chunk.append(&mut deser_data[i]);
+                                }
+                            }
                         } else {
                             failure.store(true, atomic::Ordering::Release);
                             return Err(ShuffleError::FailedFetchOp);
                         }
                     }
-                    Ok::<Box<dyn Iterator<Item = Vec<ItemE>> + Send>, _>(Box::new(
-                        shuffle_chunks.into_iter().flatten(),
+                    Ok::<Box<dyn Iterator<Item = Vec<Vec<ItemE>>> + Send>, _>(Box::new(
+                        shuffle_chunks.into_iter(),
                     ))
                 } else {
-                    Ok::<Box<dyn Iterator<Item = Vec<ItemE>> + Send>, _>(Box::new(
+                    Ok::<Box<dyn Iterator<Item = Vec<Vec<ItemE>>> + Send>, _>(Box::new(
                         std::iter::empty(),
                     ))
                 }
@@ -210,11 +217,17 @@ impl ShuffleFetcher {
         log::debug!("total_results fetch results: {}", total_results);
         let task_results = future::join_all(tasks.into_iter()).await;
         let results = task_results.into_iter().fold(
-            Ok(Vec::<Vec<ItemE>>::with_capacity(total_results)),
+            Ok(Vec::<Vec<Vec<ItemE>>>::with_capacity(total_results)),
             |curr, res| {
                 if let Ok(mut curr) = curr {
                     if let Ok(Ok(res)) = res {
-                        curr.extend(res);
+                        if curr.is_empty() {
+                            curr = res.collect::<Vec<_>>();
+                        } else {
+                            for (acc, mut a) in curr.iter_mut().zip(res) {
+                                acc.append(&mut a);
+                            }
+                        }
                         Ok(curr)
                     } else {
                         Err(ShuffleError::FailedFetchOp)
