@@ -17,6 +17,8 @@ use hyper::{
 };
 use uuid::Uuid;
 
+pub const MAX_LEN: usize = 64;
+
 pub(crate) type Result<T> = StdResult<T, ShuffleError>;
 
 /// Creates directories and files required for storing shuffle data.
@@ -178,9 +180,9 @@ impl ShuffleService {
         let parts: Vec<_> = uri.path().split('/').collect();
         match parts.as_slice() {
             [_, endpoint] if *endpoint == "status" => Ok(ShuffleResponse::Status(StatusCode::OK)),
-            [_, endpoint, shuffle_id, input_id, reduce_id] if *endpoint == "shuffle" => Ok(
+            [_, endpoint, shuffle_id, input_id, reduce_id, section_id] if *endpoint == "shuffle" => Ok(
                 ShuffleResponse::CachedData(
-                    self.get_cached_data(uri, &[*shuffle_id, *input_id, *reduce_id])?,
+                    self.get_cached_data(uri, &[*shuffle_id, *input_id, *reduce_id, *section_id])?,
                 ),
             ),
             _ => Err(ShuffleError::UnexpectedUri(uri.path().to_string())),
@@ -188,7 +190,8 @@ impl ShuffleService {
     }
 
     fn get_cached_data(&self, uri: &Uri, parts: &[&str]) -> Result<Vec<u8>> {
-        // the path is: .../{shuffleid}/{inputid}/{reduceid}
+        // the path is: .../{shuffleid}/{inputid}/{reduceid}/{sectionid}
+        let section_id = String::from(parts[3]).parse().unwrap_or(0);
         let parts: Vec<_> = match parts
             .iter()
             .map(|part| ShuffleService::parse_path_part(part))
@@ -206,7 +209,7 @@ impl ShuffleService {
                 uri,
                 params
             );
-            Ok(Vec::from(&cached_data[..]))
+            Ok(Vec::from(&cached_data[MAX_LEN*section_id .. std::cmp::min(MAX_LEN*section_id + MAX_LEN, cached_data.len())]))
         } else {
             Err(ShuffleError::RequestedCacheNotFound)
         }
