@@ -17,7 +17,7 @@ use hyper::{
 };
 use uuid::Uuid;
 
-pub const MAX_LEN: usize = 64;
+pub const MAX_LEN: usize = 1<<20;
 
 pub(crate) type Result<T> = StdResult<T, ShuffleError>;
 

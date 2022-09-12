@@ -9,6 +9,7 @@ use crate::shuffle::*;
 use crate::shuffle::shuffle_manager::MAX_LEN;
 use futures::future;
 use hyper::{client::Client, Uri};
+use hyper::body::Bytes;
 use tokio::sync::Mutex;
 
 /// Parallel shuffle fetcher.
@@ -74,6 +75,7 @@ impl ShuffleFetcher {
                         }
                         log::debug!("inside parallel fetch {}", input_id);
                         let mut section_id:usize = 0;
+                        let mut final_bytes = Vec::<u8>::new();
                         while(true){
                             let chunk_uri = ShuffleFetcher::make_chunk_uri(
                                 &server_uri,
@@ -88,8 +90,7 @@ impl ShuffleFetcher {
                             };
                             if let Ok(bytes) = data_bytes {
                                 let Len = bytes.len();
-                                let deser_data = bincode::deserialize::<Vec<(K, V)>>(&bytes.to_vec())?;
-                                shuffle_chunks.push(deser_data);
+                                final_bytes.append(&mut bytes.to_vec());
                                 if Len < MAX_LEN{
                                     break
                                 }
@@ -99,6 +100,8 @@ impl ShuffleFetcher {
                             }
                             section_id+=1;
                         }
+                        let deser_data = bincode::deserialize::<Vec<(K, V)>>(&final_bytes)?;
+                        shuffle_chunks.push(deser_data);
                     }
                     Ok::<Box<dyn Iterator<Item = (K, V)> + Send>, _>(Box::new(
                         shuffle_chunks.into_iter().flatten(),
@@ -188,6 +191,7 @@ impl ShuffleFetcher {
                         }
                         log::debug!("inside parallel fetch {}", input_id);
                         let mut section_id:usize = 0;
+                        let mut final_bytes = Vec::<u8>::new();
                         while(true){
                             let chunk_uri = ShuffleFetcher::make_chunk_uri(
                                 &server_uri,
@@ -202,18 +206,9 @@ impl ShuffleFetcher {
                             };
                             if let Ok(bytes) = data_bytes {
                                 let Len = bytes.len();
-                                let mut deser_data =
-                                    bincode::deserialize::<Vec<Vec<Vec<ItemE>>>>(&bytes.to_vec())?;
-                                if shuffle_chunks.is_empty() {
-                                    shuffle_chunks = deser_data;
-                                } else {
-                                    assert_eq!(shuffle_chunks.len(), deser_data.len());
-                                    for (i, chunk) in shuffle_chunks.iter_mut().enumerate() {
-                                        chunk.append(&mut deser_data[i]);
-                                    }
-                                }
-                                if Len<MAX_LEN{
-                                    break;
+                                final_bytes.append(&mut bytes.to_vec());
+                                if Len < MAX_LEN{
+                                    break
                                 }
                             } else {
                                 failure.store(true, atomic::Ordering::Release);
@@ -221,6 +216,16 @@ impl ShuffleFetcher {
                             }
                             section_id+=1;
                         }
+                        let mut deser_data =
+                            bincode::deserialize::<Vec<Vec<Vec<ItemE>>>>(&final_bytes)?;
+                        if shuffle_chunks.is_empty() {
+                            shuffle_chunks = deser_data;
+                        } else {
+                            assert_eq!(shuffle_chunks.len(), deser_data.len());
+                            for (i, chunk) in shuffle_chunks.iter_mut().enumerate() {
+                                chunk.append(&mut deser_data[i]);
+                            }
+                        }   
                     }
                     Ok::<Box<dyn Iterator<Item = Vec<Vec<ItemE>>> + Send>, _>(Box::new(
                         shuffle_chunks.into_iter(),
