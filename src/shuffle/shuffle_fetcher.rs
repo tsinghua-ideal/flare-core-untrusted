@@ -10,8 +10,10 @@ use crate::rdd::{
     wrapper_set_cnt_per_partition, AccArg, ItemE,
 };
 use crate::serializable_traits::Data;
+use crate::shuffle::shuffle_manager::MAX_LEN;
 use crate::shuffle::*;
 use futures::future;
+use hyper::body::Bytes;
 use hyper::{client::Client, Uri};
 use tokio::sync::Mutex;
 
@@ -77,23 +79,34 @@ impl ShuffleFetcher {
                             return Err(ShuffleError::Other);
                         }
                         log::debug!("inside parallel fetch {}", input_id);
-                        let chunk_uri = ShuffleFetcher::make_chunk_uri(
-                            &server_uri,
-                            &mut chunk_uri_str,
-                            input_id,
-                            reduce_id,
-                        )?;
-                        let data_bytes = {
-                            let res = client.get(chunk_uri).await?;
-                            hyper::body::to_bytes(res.into_body()).await
-                        };
-                        if let Ok(bytes) = data_bytes {
-                            let deser_data = bincode::deserialize::<Vec<(K, V)>>(&bytes.to_vec())?;
-                            shuffle_chunks.push(deser_data);
-                        } else {
-                            failure.store(true, atomic::Ordering::Release);
-                            return Err(ShuffleError::FailedFetchOp);
+                        let mut section_id: usize = 0;
+                        let mut final_bytes = Vec::<u8>::new();
+                        loop {
+                            let chunk_uri = ShuffleFetcher::make_chunk_uri(
+                                &server_uri,
+                                &mut chunk_uri_str,
+                                input_id,
+                                reduce_id,
+                                section_id,
+                            )?;
+                            let data_bytes = {
+                                let res = client.get(chunk_uri).await?;
+                                hyper::body::to_bytes(res.into_body()).await
+                            };
+                            if let Ok(bytes) = data_bytes {
+                                let len = bytes.len();
+                                final_bytes.extend_from_slice(&bytes[..]);
+                                if len < MAX_LEN {
+                                    break;
+                                }
+                            } else {
+                                failure.store(true, atomic::Ordering::Release);
+                                return Err(ShuffleError::FailedFetchOp);
+                            }
+                            section_id += 1;
                         }
+                        let deser_data = bincode::deserialize::<Vec<(K, V)>>(&final_bytes)?;
+                        shuffle_chunks.push(deser_data);
                     }
                     Ok::<Box<dyn Iterator<Item = (K, V)> + Send>, _>(Box::new(
                         shuffle_chunks.into_iter().flatten(),
@@ -244,23 +257,34 @@ impl ShuffleFetcher {
                             input_id,
                             reduce_id
                         );
-                        let chunk_uri = ShuffleFetcher::make_chunk_uri(
-                            &server_uri,
-                            &mut chunk_uri_str,
-                            input_id,
-                            reduce_id,
-                        )?;
-                        let data_bytes = {
-                            let res = client.get(chunk_uri).await?;
-                            hyper::body::to_bytes(res.into_body()).await
-                        };
-                        if let Ok(bytes) = data_bytes {
-                            let deser_data = bincode::deserialize::<Vec<ItemE>>(&bytes.to_vec())?;
-                            shuffle_chunks.push(deser_data);
-                        } else {
-                            failure.store(true, atomic::Ordering::Release);
-                            return Err(ShuffleError::FailedFetchOp);
+                        let mut section_id: usize = 0;
+                        let mut final_bytes = Vec::<u8>::new();
+                        loop {
+                            let chunk_uri = ShuffleFetcher::make_chunk_uri(
+                                &server_uri,
+                                &mut chunk_uri_str,
+                                input_id,
+                                reduce_id,
+                                section_id,
+                            )?;
+                            let data_bytes = {
+                                let res = client.get(chunk_uri).await?;
+                                hyper::body::to_bytes(res.into_body()).await
+                            };
+                            if let Ok(bytes) = data_bytes {
+                                let len = bytes.len();
+                                final_bytes.extend_from_slice(&bytes[..]);
+                                if len < MAX_LEN {
+                                    break;
+                                }
+                            } else {
+                                failure.store(true, atomic::Ordering::Release);
+                                return Err(ShuffleError::FailedFetchOp);
+                            }
+                            section_id += 1;
                         }
+                        let deser_data = bincode::deserialize::<Vec<ItemE>>(&final_bytes)?;
+                        shuffle_chunks.push(deser_data);
                     }
                     Ok::<Box<dyn Iterator<Item = Vec<ItemE>> + Send>, _>(Box::new(
                         shuffle_chunks.into_iter(),
@@ -507,10 +531,19 @@ impl ShuffleFetcher {
         chunk: &mut String,
         input_id: usize,
         reduce_id: usize,
+        section_id: usize,
     ) -> Result<Uri> {
         let input_id = input_id.to_string();
         let reduce_id = reduce_id.to_string();
-        let path_tail = ["/".to_string(), input_id, "/".to_string(), reduce_id].concat();
+        let path_tail = [
+            "/".to_string(),
+            input_id,
+            "/".to_string(),
+            reduce_id,
+            "/".to_string(),
+            section_id.to_string(),
+        ]
+        .concat();
         if chunk.len() == base.len() {
             chunk.push_str(&path_tail);
         } else {
@@ -575,11 +608,11 @@ mod tests {
         let base = "http://127.0.0.1/shuffle";
         let mut chunk = base.to_owned();
 
-        let uri0 = ShuffleFetcher::make_chunk_uri(base, &mut chunk, 0, 1)?;
+        let uri0 = ShuffleFetcher::make_chunk_uri(base, &mut chunk, 0, 1, 0)?;
         let expected = format!("{}/0/1", base);
         assert_eq!(expected.as_str(), uri0);
 
-        let uri1 = ShuffleFetcher::make_chunk_uri(base, &mut chunk, 123, 123)?;
+        let uri1 = ShuffleFetcher::make_chunk_uri(base, &mut chunk, 123, 123, 0)?;
         let expected = format!("{}/123/123", base);
         assert_eq!(expected.as_str(), uri1);
 

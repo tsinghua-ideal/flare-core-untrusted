@@ -17,6 +17,7 @@ use hyper::{
 };
 use uuid::Uuid;
 
+pub(crate) const MAX_LEN: usize = 1 << 30;
 pub(crate) type Result<T> = StdResult<T, ShuffleError>;
 
 /// Creates directories and files required for storing shuffle data.
@@ -178,14 +179,16 @@ impl ShuffleService {
         let parts: Vec<_> = uri.path().split('/').collect();
         match parts.as_slice() {
             [_, endpoint] if *endpoint == "status" => Ok(ShuffleResponse::Status(StatusCode::OK)),
-            [_, endpoint, shuffle_id, input_id, reduce_id] if *endpoint == "shuffle" => {
+            [_, endpoint, shuffle_id, input_id, reduce_id, section_id]
+                if *endpoint == "shuffle" =>
+            {
                 Ok(ShuffleResponse::CachedData(self.get_cached_data(
                     uri,
-                    &[*shuffle_id, *input_id, *reduce_id],
+                    &[*shuffle_id, *input_id, *reduce_id, *section_id],
                     *endpoint == "sort",
                 )?))
             }
-            [_, endpoint, stage_id, part_id_offset, num_splits, input_id, reduce_id]
+            [_, endpoint, stage_id, part_id_offset, num_splits, input_id, reduce_id, section_id]
                 if *endpoint == "sort" =>
             {
                 Ok(ShuffleResponse::CachedData(self.get_cached_data(
@@ -196,6 +199,7 @@ impl ShuffleService {
                         *num_splits,
                         *input_id,
                         *reduce_id,
+                        *section_id,
                     ],
                     *endpoint == "sort",
                 )?))
@@ -205,7 +209,7 @@ impl ShuffleService {
     }
 
     fn get_cached_data(&self, uri: &Uri, parts: &[&str], is_sort: bool) -> Result<Vec<u8>> {
-        // the path is: .../{shuffleid}/{inputid}/{reduceid}
+        // the path is: .../{shuffleid}/{inputid}/{reduceid}/{sectionid}
         let parts: Vec<_> = match parts
             .iter()
             .map(|part| ShuffleService::parse_path_part(part))
@@ -218,17 +222,25 @@ impl ShuffleService {
         };
         if is_sort {
             let params = &((parts[0], parts[1], parts[2]), parts[3], parts[4]);
+            let section_id = parts[5];
             if let Some(cached_data) = env::SORT_CACHE.get(params) {
                 log::debug!("got a request @ `{}`, params: {:?}", uri, params);
-                Ok(Vec::from(&cached_data[..]))
+                Ok(Vec::from(
+                    &cached_data[MAX_LEN * section_id
+                        ..std::cmp::min(MAX_LEN * section_id + MAX_LEN, cached_data.len())],
+                ))
             } else {
                 Err(ShuffleError::RequestedCacheNotFound)
             }
         } else {
             let params = &(parts[0], parts[1], parts[2]);
+            let section_id = parts[3];
             if let Some(cached_data) = env::SHUFFLE_CACHE.get(params) {
                 log::debug!("got a request @ `{}`, params: {:?}", uri, params);
-                Ok(Vec::from(&cached_data[..]))
+                Ok(Vec::from(
+                    &cached_data[MAX_LEN * section_id
+                        ..std::cmp::min(MAX_LEN * section_id + MAX_LEN, cached_data.len())],
+                ))
             } else {
                 Err(ShuffleError::RequestedCacheNotFound)
             }
