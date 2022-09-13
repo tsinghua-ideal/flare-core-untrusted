@@ -17,7 +17,7 @@ use hyper::{
 };
 use uuid::Uuid;
 
-pub const MAX_LEN: usize = 1<<20;
+pub const MAX_LEN: usize = 1 << 30;
 
 pub(crate) type Result<T> = StdResult<T, ShuffleError>;
 
@@ -180,11 +180,14 @@ impl ShuffleService {
         let parts: Vec<_> = uri.path().split('/').collect();
         match parts.as_slice() {
             [_, endpoint] if *endpoint == "status" => Ok(ShuffleResponse::Status(StatusCode::OK)),
-            [_, endpoint, shuffle_id, input_id, reduce_id, section_id] if *endpoint == "shuffle" => Ok(
-                ShuffleResponse::CachedData(
-                    self.get_cached_data(uri, &[*shuffle_id, *input_id, *reduce_id, *section_id])?,
-                ),
-            ),
+            [_, endpoint, shuffle_id, input_id, reduce_id, section_id]
+                if *endpoint == "shuffle" =>
+            {
+                Ok(ShuffleResponse::CachedData(self.get_cached_data(
+                    uri,
+                    &[*shuffle_id, *input_id, *reduce_id, *section_id],
+                )?))
+            }
             _ => Err(ShuffleError::UnexpectedUri(uri.path().to_string())),
         }
     }
@@ -209,7 +212,10 @@ impl ShuffleService {
                 uri,
                 params
             );
-            Ok(Vec::from(&cached_data[MAX_LEN*section_id .. std::cmp::min(MAX_LEN*section_id + MAX_LEN, cached_data.len())]))
+            Ok(Vec::from(
+                &cached_data[MAX_LEN * section_id
+                    ..std::cmp::min(MAX_LEN * section_id + MAX_LEN, cached_data.len())],
+            ))
         } else {
             Err(ShuffleError::RequestedCacheNotFound)
         }
