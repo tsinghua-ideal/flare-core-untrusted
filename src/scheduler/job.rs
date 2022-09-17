@@ -51,7 +51,7 @@ where
     F: SerFunc(
         (
             TaskContext,
-            (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
         ),
     ) -> U,
     L: JobListener,
@@ -78,7 +78,7 @@ where
     F: SerFunc(
         (
             TaskContext,
-            (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+            (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
         ),
     ) -> U,
     L: JobListener,

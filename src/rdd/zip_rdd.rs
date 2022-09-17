@@ -80,57 +80,67 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let current_split = split
             .downcast::<ZippedPartitionsSplit>()
             .or(Err(Error::DowncastFailure("ZippedPartitionsSplit")))?;
 
         let dep_info = DepInfo::padding_new(0);
-        let fst = self
-            .first
-            .secure_iterator(
-                stage_id,
-                current_split.fst_split.clone(),
-                dep_info.clone(),
-                None,
-            )?
-            .collect::<Vec<_>>();
-        let sec = self
-            .second
-            .secure_iterator(stage_id, current_split.sec_split.clone(), dep_info, None)?
-            .collect::<Vec<_>>();
+        let (fst_data_iter, fst_marks_iter) = self.first.secure_iterator(
+            stage_id,
+            current_split.fst_split.clone(),
+            dep_info.clone(),
+            None,
+        )?;
+        let fst_data = fst_data_iter.collect::<Vec<_>>();
+        let fst_marks = fst_marks_iter.collect::<Vec<_>>();
+        let (sec_data_iter, sec_marks_iter) = self.second.secure_iterator(
+            stage_id,
+            current_split.sec_split.clone(),
+            dep_info,
+            None,
+        )?;
+        let sec_data = sec_data_iter.collect::<Vec<_>>();
+        let sec_marks = sec_marks_iter.collect::<Vec<_>>();
 
-        let data = self.secure_zip((fst, sec), acc_arg);
+        let (data, marks) = self.secure_zip((fst_data, sec_data), (fst_marks, sec_marks), acc_arg);
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
-            let wait = start_execute(acc_arg, data, tx);
+            let wait = start_execute(acc_arg, data, marks, tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in zipped rdd, compute, total {:?}***", dur);
         });
         Ok(vec![handle])
     }
 
-    fn secure_zip(&self, data: (Vec<ItemE>, Vec<ItemE>), acc_arg: &mut AccArg) -> Vec<ItemE> {
+    fn secure_zip(
+        &self,
+        data: (Vec<ItemE>, Vec<ItemE>),
+        marks: (Vec<ItemE>, Vec<ItemE>),
+        acc_arg: &mut AccArg,
+    ) -> (Vec<ItemE>, Vec<ItemE>) {
         acc_arg.get_enclave_lock();
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
         let cur_part_ids = vec![*acc_arg.part_ids.last().unwrap()];
         let dep_info = DepInfo::padding_new(2);
 
-        let result_ptr = wrapper_secure_execute(
+        let (data_ptr, marks_ptr) = wrapper_secure_execute(
             &cur_rdd_ids,
             &cur_op_ids,
             &cur_part_ids,
             Default::default(),
             dep_info,
             &data,
+            &marks,
             &acc_arg.captured_vars,
         );
-        let result = get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+        let (data, marks) =
+            get_encrypted_data::<ItemE, ItemE>(cur_op_ids[0], dep_info, data_ptr, marks_ptr);
         acc_arg.free_enclave_lock();
-        *result
+        (data, marks)
     }
 }
 
@@ -209,7 +219,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(stage_id, split, acc_arg, tx)
     }
@@ -253,7 +263,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();

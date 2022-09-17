@@ -102,7 +102,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
         let fut = ShuffleFetcher::secure_fetch(
@@ -115,75 +115,7 @@ where
             .filter(|x| !x.is_empty())
             .collect(); // bucket per subpartition
 
-        //column sort
-        let now = Instant::now();
-        let data = self.secure_column_sort_first(stage_id, buckets, acc_arg);
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("***in shuffled rdd, first column sort, total {:?}***", dur);
-
-        //shuffle read
-        let now = Instant::now();
-        let data = self.secure_shuffle_read(stage_id, data, acc_arg);
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("***in shuffled rdd, shuffle read, total {:?}***", dur);
-
-        //column sort again to filter
-        let now = Instant::now();
-        let data = self.secure_column_sort_second(stage_id, data, acc_arg);
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("***in shuffled rdd, second column sort, total {:?}***", dur);
-
-        let acc_arg = acc_arg.clone();
-        let handle = thread::spawn(move || {
-            let now = Instant::now();
-            let wait = start_execute(acc_arg, data, tx);
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
-            println!("***in shuffled rdd, compute, total {:?}***", dur);
-        });
-        Ok(vec![handle])
-    }
-
-    fn secure_column_sort_first(
-        &self,
-        stage_id: usize,
-        buckets: Vec<Vec<ItemE>>,
-        acc_arg: &mut AccArg,
-    ) -> Vec<ItemE> {
-        //need split_num fix first
-        wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
-        //count the cnt_per_partition
-        {
-            let cur_rdd_ids = vec![self.vals.id];
-            let cur_op_ids = vec![self.vals.op_id];
-            let reduce_id = *acc_arg.part_ids.last().unwrap();
-            let cur_part_ids = vec![reduce_id];
-
-            acc_arg.get_enclave_lock();
-            let dep_info = DepInfo::padding_new(20);
-            let invalid_ptr = wrapper_secure_execute(
-                &cur_rdd_ids,
-                &cur_op_ids,
-                &cur_part_ids,
-                Default::default(),
-                dep_info,
-                &buckets,
-                &acc_arg.captured_vars,
-            );
-            assert_eq!(invalid_ptr, 0);
-            acc_arg.free_enclave_lock();
-        }
-        println!("count the cnt_per_partition");
-        //step 3 - 8
-        let data = ShuffleFetcher::fetch_sort(buckets, stage_id, acc_arg, vec![21, 22, 23]);
-        data
-    }
-
-    fn secure_column_sort_second(
-        &self,
-        stage_id: usize,
-        data: Vec<ItemE>,
-        acc_arg: &mut AccArg,
-    ) -> Vec<ItemE> {
+        //some parameters
         let cur_rdd_ids = vec![self.vals.id];
         let cur_op_ids = vec![self.vals.op_id];
         let reduce_id = *acc_arg.part_ids.last().unwrap();
@@ -196,178 +128,65 @@ where
         };
         let num_splits = *acc_arg.split_nums.last().unwrap();
         let part_group = (stage_id, part_id_offset, num_splits);
-        //step 1: sort + step 2: shuffle (transpose)
-        let fetched_data = {
+
+        //column sort
+        //need split_num fix first
+        wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
+        let now = Instant::now();
+        let data = {
+            //count the cnt_per_partition
             acc_arg.get_enclave_lock();
-            let dep_info = DepInfo::padding_new(25);
-            let result_ptr = wrapper_secure_execute(
+            let dep_info = DepInfo::padding_new(20);
+            let invalid_ptr = wrapper_secure_execute(
                 &cur_rdd_ids,
                 &cur_op_ids,
                 &cur_part_ids,
                 Default::default(),
                 dep_info,
-                &data,
-                &acc_arg.captured_vars,
-            );
-            let mut buckets =
-                get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+                &buckets,
+                &Vec::<Vec<ItemE>>::new(),
+                &HashMap::new(),
+            )
+            .0;
+            assert_eq!(invalid_ptr, 0);
             acc_arg.free_enclave_lock();
-            buckets.resize(num_splits, Vec::new());
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
-
-            for (i, bucket) in buckets.into_iter().enumerate() {
-                let ser_bytes = bincode::serialize(&bucket).unwrap();
-                log::debug!(
-                    "during step 2. bucket #{} in stage id #{}, partition #{}: {:?}",
-                    i,
-                    stage_id,
-                    reduce_id,
-                    bucket
-                );
-                env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
-            }
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
-            let fut = ShuffleFetcher::secure_fetch(
-                GetServerUriReq::CurStage(part_group),
-                reduce_id,
-                usize::MAX,
-            );
-            futures::executor::block_on(fut)
-                .unwrap()
-                .filter(|x| !x.is_empty())
-                .collect::<Vec<_>>()
+            println!("count the cnt_per_partition");
+            //step 3 - 8
+            ShuffleFetcher::fetch_sort(
+                buckets,
+                &cur_rdd_ids,
+                &cur_op_ids,
+                &cur_part_ids,
+                part_group,
+                acc_arg,
+                0,
+            )
         };
-        log::debug!(
-            "step 2 finished. partition = {:?}, data = {:?}",
-            reduce_id,
-            fetched_data
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("***in shuffled rdd, first column sort, total {:?}***", dur);
+
+        //shuffle read
+        let now = Instant::now();
+        let (data, marks) = secure_shuffle_read(
+            data,
+            &cur_rdd_ids,
+            &cur_op_ids,
+            &cur_part_ids,
+            part_group,
+            acc_arg,
+            self.aggregator.is_default,
         );
-        //step 3 - 8
-        let data = ShuffleFetcher::fetch_sort(fetched_data, stage_id, acc_arg, vec![26, 27, 28]);
-        data
-    }
+        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+        println!("***in shuffled rdd, shuffle read, total {:?}***", dur);
 
-    fn secure_shuffle_read(
-        &self,
-        stage_id: usize,
-        data: Vec<ItemE>,
-        acc_arg: &mut AccArg,
-    ) -> Vec<ItemE> {
-        //the current implementation is not fully oblivious
-        //because Opaque doe not design for general oblivious group_by
-        //but aggregate should be oblivious
-        let reduce_id = *acc_arg.part_ids.last().unwrap();
-        let part_id_offset = if acc_arg.part_ids[0] == usize::MAX {
-            acc_arg.part_ids[1] - acc_arg.part_ids.last().unwrap()
-        } else {
-            acc_arg.part_ids[0] - acc_arg.part_ids.last().unwrap()
-        };
-        let num_splits = *acc_arg.split_nums.last().unwrap();
-        let part_group = (stage_id, part_id_offset, num_splits);
-
-        let cur_rdd_ids = vec![self.vals.id];
-        let cur_op_ids = vec![self.vals.op_id];
-        let cur_part_ids = vec![reduce_id];
-
-        //first aggregate
-        let mut agg_data = if data.is_empty() {
-            Vec::new()
-        } else {
-            acc_arg.get_enclave_lock();
-            let dep_info = DepInfo::padding_new(2);
-            let result_ptr = wrapper_secure_execute(
-                &cur_rdd_ids,
-                &cur_op_ids,
-                &cur_part_ids,
-                Default::default(),
-                dep_info,
-                &data,
-                &acc_arg.captured_vars,
-            );
-
-            let result =
-                get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
-            acc_arg.free_enclave_lock();
-            *result
-        };
-
-        //sync in order to clear the sort cache
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
-        //clear the sort cache
-        env::SORT_CACHE.retain(|k, _| k.0 != part_group);
-        //sync again to avoid clearing the just-written value
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
-
-        if reduce_id != 0 {
-            let fut = ShuffleFetcher::secure_fetch(
-                GetServerUriReq::CurStage(part_group),
-                reduce_id,
-                (reduce_id + num_splits - 1) % num_splits,
-            );
-            let mut fut_res = futures::executor::block_on(fut);
-            //the aggregate info may not be prepared
-            while fut_res.is_err() {
-                match fut_res {
-                    Ok(_) => unreachable!(),
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        fut_res = futures::executor::block_on(ShuffleFetcher::secure_fetch(
-                            GetServerUriReq::CurStage(part_group),
-                            reduce_id,
-                            (reduce_id + num_splits - 1) % num_splits,
-                        ));
-                    }
-                }
-            }
-            let mut received_agg_info = fut_res.unwrap().collect::<Vec<_>>();
-            //aggregate again
-            if !received_agg_info.is_empty() {
-                let sup_data = received_agg_info.remove(0);
-                assert!(received_agg_info.is_empty());
-                if agg_data.is_empty() {
-                    agg_data = sup_data;
-                } else if !sup_data.is_empty() {
-                    let mut tmp_captured_var = HashMap::new();
-                    tmp_captured_var.insert(cur_rdd_ids[0], sup_data);
-
-                    acc_arg.get_enclave_lock();
-                    let dep_info = DepInfo::padding_new(24);
-                    let result_ptr = wrapper_secure_execute(
-                        &cur_rdd_ids,
-                        &cur_op_ids,
-                        &cur_part_ids,
-                        Default::default(),
-                        dep_info,
-                        &agg_data,
-                        &tmp_captured_var,
-                    );
-
-                    let result =
-                        get_encrypted_data::<ItemE>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
-                    acc_arg.free_enclave_lock();
-                    agg_data = *result;
-                }
-            }
-        }
-
-        //send aggregate info to the next worker
-        if reduce_id != num_splits - 1 {
-            let last_kc = agg_data.pop();
-            if last_kc.is_some() {
-                let ser_bytes = bincode::serialize(&vec![last_kc.unwrap()]).unwrap();
-                env::SORT_CACHE.insert(
-                    (part_group, reduce_id, (reduce_id + 1) % num_splits),
-                    ser_bytes.clone(),
-                );
-            } else {
-                env::SORT_CACHE.insert(
-                    (part_group, reduce_id, (reduce_id + 1) % num_splits),
-                    bincode::serialize(&Vec::<ItemE>::new()).unwrap(),
-                );
-            }
-        }
-
-        agg_data
+        let acc_arg = acc_arg.clone();
+        let handle = thread::spawn(move || {
+            let now = Instant::now();
+            let wait = start_execute(acc_arg, data, marks, tx);
+            let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
+            println!("***in shuffled rdd, compute, total {:?}***", dur);
+        });
+        Ok(vec![handle])
     }
 }
 
@@ -442,7 +261,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(stage_id, split, acc_arg, tx)
     }
@@ -497,7 +316,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();

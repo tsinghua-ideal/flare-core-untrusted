@@ -7,7 +7,7 @@ use crate::env;
 use crate::map_output_tracker::GetServerUriReq;
 use crate::rdd::{
     get_encrypted_data, wrapper_get_cnt_per_partition, wrapper_secure_execute,
-    wrapper_set_cnt_per_partition, AccArg, ItemE,
+    wrapper_set_cnt_per_partition, AccArg, ItemE, OpId, INTERVAL,
 };
 use crate::serializable_traits::Data;
 use crate::shuffle::shuffle_manager::MAX_LEN;
@@ -284,57 +284,51 @@ impl ShuffleFetcher {
                             section_id += 1;
                         }
                         let deser_data = bincode::deserialize::<Vec<ItemE>>(&final_bytes)?;
-                        shuffle_chunks.push(deser_data);
+                        shuffle_chunks.push((input_id, deser_data));
                     }
-                    Ok::<Box<dyn Iterator<Item = Vec<ItemE>> + Send>, _>(Box::new(
+                    Ok::<Box<dyn Iterator<Item = (usize, Vec<ItemE>)> + Send>, _>(Box::new(
                         shuffle_chunks.into_iter(),
                     ))
                 } else {
-                    Ok::<Box<dyn Iterator<Item = Vec<ItemE>> + Send>, _>(Box::new(
+                    Ok::<Box<dyn Iterator<Item = (usize, Vec<ItemE>)> + Send>, _>(Box::new(
                         std::iter::empty(),
                     ))
                 }
             };
             tasks.push(tokio::spawn(task));
         }
-        log::debug!("total_results fetch results: {}", total_results);
         let task_results = future::join_all(tasks.into_iter()).await;
-        let results = task_results.into_iter().fold(
-            Ok(Vec::<Vec<ItemE>>::with_capacity(total_results)),
-            |curr, res| {
-                if let Ok(mut curr) = curr {
-                    if let Ok(Ok(res)) = res {
-                        curr.extend(res);
-                        Ok(curr)
-                    } else {
-                        Err(ShuffleError::FailedFetchOp)
-                    }
-                } else {
-                    Err(ShuffleError::FailedFetchOp)
-                }
-            },
-        )?;
-        Ok(results.into_iter())
+        let mut sorted_task_results = task_results
+            .into_iter()
+            .filter_map(|x| x.ok())
+            .filter_map(|x| x.ok())
+            .flatten()
+            .collect::<Vec<_>>();
+        if (fetch_from == usize::MAX && sorted_task_results.len() != total_results)
+            || (fetch_from != usize::MAX && sorted_task_results.len() != 1)
+        {
+            log::debug!("fetched, not enough!");
+            return Err(ShuffleError::FailedFetchOp);
+        }
+
+        sorted_task_results.sort_by(|a, b| a.0.cmp(&b.0));
+        let results = Box::new(sorted_task_results.into_iter().map(|(_input_id, res)| res))
+            as Box<dyn Iterator<Item = Vec<ItemE>>>;
+        Ok(results)
     }
 
     pub fn fetch_sort(
         data: Vec<Vec<ItemE>>,
-        stage_id: usize,
-        acc_arg: &mut AccArg,
-        is_shuffle_list: Vec<u8>,
+        cur_rdd_ids: &Vec<usize>,
+        cur_op_ids: &Vec<OpId>,
+        cur_part_ids: &Vec<usize>,
+        part_group: (usize, usize, usize),
+        acc_arg: &AccArg,
+        phase: u8,
     ) -> Vec<ItemE> {
-        assert_eq!(is_shuffle_list.len(), 3);
-        let cur_rdd_ids = vec![*acc_arg.rdd_ids.last().unwrap()];
-        let cur_op_ids = vec![*acc_arg.op_ids.last().unwrap()];
-        let reduce_id = *acc_arg.part_ids.last().unwrap();
-        let cur_part_ids = vec![reduce_id];
-        let part_id_offset = if acc_arg.part_ids[0] == usize::MAX {
-            acc_arg.part_ids[1] - acc_arg.part_ids.last().unwrap()
-        } else {
-            acc_arg.part_ids[0] - acc_arg.part_ids.last().unwrap()
-        };
-        let num_splits = *acc_arg.split_nums.last().unwrap();
-        let part_group = (stage_id, part_id_offset, num_splits);
+        let reduce_id = cur_part_ids[0];
+        let stage_id = part_group.0;
+        let num_splits = part_group.2;
 
         let cnt_per_partition = {
             let mut cnt_per_partition = wrapper_get_cnt_per_partition(cur_op_ids[0], reduce_id);
@@ -352,7 +346,7 @@ impl ShuffleFetcher {
             let r = cnt_per_partition % d;
             cnt_per_partition += (d - r) % d;
             cnt_per_partition = futures::executor::block_on(ShuffleFetcher::fetch_cnt(
-                (stage_id, part_id_offset, num_splits),
+                part_group,
                 cnt_per_partition,
             ))
             .unwrap();
@@ -367,18 +361,25 @@ impl ShuffleFetcher {
         //step 3: sort + step 4: shuffle (untranspose)
         let data = {
             acc_arg.get_enclave_lock();
-            let dep_info = DepInfo::padding_new(is_shuffle_list[0]);
-            let result_ptr = wrapper_secure_execute(
-                &cur_rdd_ids,
-                &cur_op_ids,
-                &cur_part_ids,
+            let dep_info = DepInfo::padding_new(21 + phase * INTERVAL);
+            let (data_ptr, marks_ptr) = wrapper_secure_execute(
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
                 Default::default(),
                 dep_info,
                 &data,
-                &acc_arg.captured_vars,
+                &Vec::<ItemE>::new(),
+                &HashMap::new(),
             );
-            let mut buckets =
-                get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            assert_eq!(marks_ptr, 0);
+            let mut buckets = get_encrypted_data::<Vec<ItemE>, Vec<ItemE>>(
+                cur_op_ids[0],
+                dep_info,
+                data_ptr,
+                marks_ptr,
+            )
+            .0;
             acc_arg.free_enclave_lock();
             buckets.resize(num_splits, Vec::new());
             for (i, bucket) in buckets.into_iter().enumerate() {
@@ -412,18 +413,25 @@ impl ShuffleFetcher {
         //step 5: sort + step 6: shuffle (shift)
         let data = {
             acc_arg.get_enclave_lock();
-            let dep_info = DepInfo::padding_new(is_shuffle_list[1]);
-            let result_ptr = wrapper_secure_execute(
-                &cur_rdd_ids,
-                &cur_op_ids,
-                &cur_part_ids,
+            let dep_info = DepInfo::padding_new(22 + phase * INTERVAL);
+            let (data_ptr, marks_ptr) = wrapper_secure_execute(
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
                 Default::default(),
                 dep_info,
                 &data,
-                &acc_arg.captured_vars,
+                &Vec::<ItemE>::new(),
+                &HashMap::new(),
             );
-            let mut buckets =
-                get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            assert_eq!(marks_ptr, 0);
+            let mut buckets = get_encrypted_data::<Vec<ItemE>, Vec<ItemE>>(
+                cur_op_ids[0],
+                dep_info,
+                data_ptr,
+                marks_ptr,
+            )
+            .0;
             acc_arg.free_enclave_lock();
             if buckets.is_empty() {
                 buckets.resize(2, Vec::new());
@@ -439,6 +447,7 @@ impl ShuffleFetcher {
                 (reduce_id + 1) % num_splits,
                 bucket,
             );
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
             env::SORT_CACHE.insert(
                 (part_group, reduce_id, (reduce_id + 1) % num_splits),
                 ser_bytes,
@@ -463,18 +472,24 @@ impl ShuffleFetcher {
         //step 7: sort + step 8: shuffle (unshift)
         let res = {
             acc_arg.get_enclave_lock();
-            let dep_info = DepInfo::padding_new(is_shuffle_list[2]);
-            let result_ptr = wrapper_secure_execute(
-                &cur_rdd_ids,
-                &cur_op_ids,
-                &cur_part_ids,
+            let dep_info = DepInfo::padding_new(23 + phase * INTERVAL);
+            let (data_ptr, marks_ptr) = wrapper_secure_execute(
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
                 Default::default(),
                 dep_info,
                 &data,
-                &acc_arg.captured_vars,
+                &Vec::<ItemE>::new(),
+                &HashMap::new(),
             );
-            let mut buckets =
-                get_encrypted_data::<Vec<ItemE>>(cur_op_ids[0], dep_info, result_ptr as *mut u8);
+            let mut buckets = get_encrypted_data::<Vec<ItemE>, Vec<ItemE>>(
+                cur_op_ids[0],
+                dep_info,
+                data_ptr,
+                marks_ptr,
+            )
+            .0;
             acc_arg.free_enclave_lock();
             if buckets.is_empty() {
                 buckets.resize(2, Vec::new());
@@ -493,6 +508,7 @@ impl ShuffleFetcher {
                 (reduce_id + num_splits - 1) % num_splits,
                 bucket,
             );
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
             env::SORT_CACHE.insert(
                 (
                     part_group,

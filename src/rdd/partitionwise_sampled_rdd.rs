@@ -125,7 +125,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(stage_id, split, acc_arg, tx)
     }
@@ -171,7 +171,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();

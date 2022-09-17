@@ -328,12 +328,12 @@ impl CacheTracker {
         self.cache.scontain(key.0, key.1)
     }
 
-    pub fn get_sdata(&self, key: (usize, usize)) -> Option<usize> {
+    pub fn get_sdata(&self, key: (usize, usize)) -> Option<(usize, usize)> {
         let (rdd_id, part_id) = key;
         self.cache.sget(rdd_id, part_id)
     }
 
-    pub fn put_sdata(&self, key: (usize, usize), value: *mut u8, avoid_moving: usize) {
+    pub fn put_sdata(&self, key: (usize, usize), value: (usize, usize), avoid_moving: usize) {
         let (rdd_id, part_id) = key;
         let put_response = self.cache.sput(rdd_id, part_id, value, avoid_moving);
         if let CachePutResponse::CachePutSuccess(size) = put_response {

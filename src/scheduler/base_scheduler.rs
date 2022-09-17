@@ -29,7 +29,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
         L: JobListener,
@@ -59,7 +65,10 @@ pub(crate) trait NativeScheduler: Send + Sync {
                                 .secure_iterator(stage_id, split, dep_info, action_id)
                             {
                                 Ok(r) => r,
-                                Err(_) => Box::new(Vec::new().into_iter()),
+                                Err(_) => (
+                                    Box::new(Vec::new().into_iter()) as Box<dyn Iterator<Item = _>>,
+                                    Box::new(Vec::new().into_iter()) as Box<dyn Iterator<Item = _>>,
+                                ),
                             };
                             STAGE_LOCK.free_stage_lock();
                             res
@@ -69,7 +78,10 @@ pub(crate) trait NativeScheduler: Send + Sync {
                                 Ok(r) => r,
                                 Err(_) => Box::new(Vec::new().into_iter()),
                             },
-                            Box::new(Vec::new().into_iter()),
+                            (
+                                Box::new(Vec::new().into_iter()),
+                                Box::new(Vec::new().into_iter()),
+                            ),
                         ),
                     },
                 ))]));
@@ -232,7 +244,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
         L: JobListener,
@@ -270,7 +288,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
         L: JobListener,
@@ -413,7 +437,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
         L: JobListener,
@@ -448,7 +478,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
         L: JobListener,
@@ -550,7 +586,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U;
 

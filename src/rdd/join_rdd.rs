@@ -26,50 +26,7 @@ use serde_derive::{Deserialize, Serialize};
 use sgx_types::*;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) enum CoGroupSplitDep {
-    NarrowCoGroupSplitDep {
-        #[serde(with = "serde_traitobject")]
-        rdd: Arc<dyn RddBase>,
-        #[serde(with = "serde_traitobject")]
-        split: Box<dyn Split>,
-    },
-    ShuffleCoGroupSplitDep {
-        shuffle_id: usize,
-    },
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CoGroupSplit {
-    index: usize,
-    pub(crate) deps: Vec<CoGroupSplitDep>,
-}
-
-impl CoGroupSplit {
-    pub(crate) fn new(index: usize, deps: Vec<CoGroupSplitDep>) -> Self {
-        CoGroupSplit { index, deps }
-    }
-}
-
-impl Hasher for CoGroupSplit {
-    fn finish(&self) -> u64 {
-        self.index as u64
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for i in bytes {
-            self.write_u8(*i);
-        }
-    }
-}
-
-impl Split for CoGroupSplit {
-    fn get_index(&self) -> usize {
-        self.index
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CoGroupedRdd<K, V, W>
+pub struct JoinedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
@@ -84,7 +41,7 @@ where
     pub(crate) part: Box<dyn Partitioner>,
 }
 
-impl<K, V, W> CoGroupedRdd<K, V, W>
+impl<K, V, W> JoinedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
@@ -115,7 +72,7 @@ where
         }
 
         let vals = Arc::new(vals);
-        CoGroupedRdd {
+        JoinedRdd {
             vals,
             rdd0,
             rdd1,
@@ -313,7 +270,7 @@ where
     }
 }
 
-impl<K, V, W> RddBase for CoGroupedRdd<K, V, W>
+impl<K, V, W> RddBase for JoinedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
@@ -468,14 +425,13 @@ where
     }
 }
 
-impl<K, V, W> Rdd for CoGroupedRdd<K, V, W>
+impl<K, V, W> Rdd for JoinedRdd<K, V, W>
 where
     K: Data + Eq + Hash,
     V: Data,
     W: Data,
 {
-    type Item = (K, (Vec<V>, Vec<W>));
-    //type Item = (K, Vec<Vec<Box<dyn AnyData>>>);
+    type Item = (K, (V, W));
     fn get_rdd(&self) -> Arc<dyn Rdd<Item = Self::Item>> {
         Arc::new(self.clone())
     }
@@ -493,7 +449,7 @@ where
             match deps.remove(0) {
                 //deps[0]
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
-                    log::debug!("inside iterator CoGroupedRdd narrow dep");
+                    log::debug!("inside iterator JoinedRdd narrow dep");
                     for i in rdd
                         .iterator_any(split)?
                         .into_any()
@@ -501,10 +457,7 @@ where
                         .unwrap()
                         .into_iter()
                     {
-                        log::debug!(
-                            "inside iterator CoGroupedRdd narrow dep iterator any: {:?}",
-                            i
-                        );
+                        log::debug!("inside iterator JoinedRdd narrow dep iterator any: {:?}", i);
                         let (k, v) = i;
                         agg.entry(k)
                             .or_insert_with(|| (Vec::new(), Vec::new()))
@@ -513,7 +466,7 @@ where
                     }
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
-                    log::debug!("inside iterator CoGroupedRdd shuffle dep, agg: {:?}", agg);
+                    log::debug!("inside iterator JoinedRdd shuffle dep, agg: {:?}", agg);
                     let fut = ShuffleFetcher::fetch::<K, Vec<V>>(shuffle_id, split.get_index());
                     for (k, c) in futures::executor::block_on(fut)?.into_iter() {
                         let temp = agg.entry(k).or_insert_with(|| (Vec::new(), Vec::new()));
@@ -527,7 +480,7 @@ where
             match deps.remove(0) {
                 //deps[1]
                 CoGroupSplitDep::NarrowCoGroupSplitDep { rdd, split } => {
-                    log::debug!("inside iterator CoGroupedRdd narrow dep");
+                    log::debug!("inside iterator JoinedRdd narrow dep");
                     for i in rdd
                         .iterator_any(split)?
                         .into_any()
@@ -535,10 +488,7 @@ where
                         .unwrap()
                         .into_iter()
                     {
-                        log::debug!(
-                            "inside iterator CoGroupedRdd narrow dep iterator any: {:?}",
-                            i
-                        );
+                        log::debug!("inside iterator JoinedRdd narrow dep iterator any: {:?}", i);
                         let (k, v) = i;
                         agg.entry(k)
                             .or_insert_with(|| (Vec::new(), Vec::new()))
@@ -547,7 +497,7 @@ where
                     }
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
-                    log::debug!("inside iterator CoGroupedRdd shuffle dep, agg: {:?}", agg);
+                    log::debug!("inside iterator JoinedRdd shuffle dep, agg: {:?}", agg);
                     let fut = ShuffleFetcher::fetch::<K, Vec<W>>(shuffle_id, split.get_index());
                     for (k, c) in futures::executor::block_on(fut)?.into_iter() {
                         let temp = agg.entry(k).or_insert_with(|| (Vec::new(), Vec::new()));
@@ -558,7 +508,14 @@ where
                 }
             };
 
-            Ok(Box::new(agg.into_iter()))
+            Ok(Box::new(agg.into_iter().flat_map(|(k, (vs, ws))| {
+                vs.into_iter().flat_map(move |v| {
+                    let k = k.clone();
+                    ws.clone()
+                        .into_iter()
+                        .map(move |w| (k.clone(), (v.clone(), w)))
+                })
+            })))
         } else {
             panic!("Got split object from different concrete type other than CoGroupSplit")
         }

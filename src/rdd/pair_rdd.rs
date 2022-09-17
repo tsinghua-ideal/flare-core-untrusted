@@ -127,20 +127,25 @@ where
     where
         W: Data + Default,
     {
-        let f = Fn!(|v: (Vec<V>, Vec<W>)| {
-            let (vs, ws) = v;
-            let combine = vs
-                .into_iter()
-                .flat_map(move |v| ws.clone().into_iter().map(move |w| (v.clone(), w)));
-            Box::new(combine) as Box<dyn Iterator<Item = (V, W)>>
-        });
+        // let f = Fn!(|v: (Vec<V>, Vec<W>)| {
+        //     let (vs, ws) = v;
+        //     let combine = vs
+        //         .into_iter()
+        //         .flat_map(move |v| ws.clone().into_iter().map(move |w| (v.clone(), w)));
+        //     Box::new(combine) as Box<dyn Iterator<Item = (V, W)>>
+        // });
 
-        let cogrouped = self.cogroup(
-            other,
+        // let cogrouped = self.cogroup(
+        //     other,
+        //     Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
+        // );
+        // self.get_context().add_num(1);
+        // cogrouped.flat_map_values(Box::new(f))
+        SerArc::new(JoinedRdd::new(
+            self.get_rdd(),
+            other.get_rdd(),
             Box::new(HashPartitioner::<K>::new(num_splits)) as Box<dyn Partitioner>,
-        );
-        self.get_context().add_num(1);
-        cogrouped.flat_map_values(Box::new(f))
+        ))
     }
 
     #[track_caller]
@@ -283,7 +288,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(stage_id, split, acc_arg, tx)
     }
@@ -314,7 +319,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
@@ -434,7 +439,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(stage_id, split, acc_arg, tx)
     }
@@ -471,7 +476,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
@@ -594,7 +599,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(stage_id, split, acc_arg, tx)
     }
@@ -633,7 +638,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();

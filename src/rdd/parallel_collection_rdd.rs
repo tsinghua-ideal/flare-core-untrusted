@@ -68,7 +68,11 @@ impl<T: Data> ParallelCollectionSplit<T> {
         Box::new((0..len).map(move |i| data[i].clone()))
     }
 
-    fn secure_iterator(&self, acc_arg: &mut AccArg, tx: SyncSender<usize>) -> JoinHandle<()> {
+    fn secure_iterator(
+        &self,
+        acc_arg: &mut AccArg,
+        tx: SyncSender<(usize, usize)>,
+    ) -> JoinHandle<()> {
         let data = self.values.clone();
         let len = data.len();
         if len == 0 {
@@ -79,7 +83,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
-            let wait = start_execute(acc_arg, data, tx);
+            let wait = start_execute(acc_arg, data, Vec::<T>::new(), tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in parallel collection rdd, total {:?}***", dur);
         });
@@ -306,7 +310,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(stage_id, split, acc_arg, tx)
     }
@@ -350,7 +354,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         if let Some(s) = split.downcast_ref::<ParallelCollectionSplit<ItemE>>() {
             let cur_rdd_id = self.get_rdd_id();

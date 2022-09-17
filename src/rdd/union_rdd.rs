@@ -86,7 +86,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         match &self.0 {
             NonUniquePartitioner { rdds, .. } => {
@@ -105,7 +105,7 @@ where
                     .or(Err(Error::DowncastFailure("PartitionerAwareUnionSplit")))?;
                 let eenter_lock = Arc::new(AtomicBool::new(false));
                 let iter = rdds.iter().zip(split.parents(&rdds)).collect::<Vec<_>>();
-                let results = iter
+                let (data, marks): (Vec<_>, Vec<_>) = iter
                     .into_iter()
                     .map(|(rdd, p)| {
                         let rdd = rdd.clone();
@@ -115,31 +115,32 @@ where
                         let handles = rdd
                             .secure_compute(stage_id, p.clone(), &mut acc_arg, tx_un)
                             .unwrap();
-                        let result = match rx_un.recv() {
-                            Ok(received) => {
-                                let result = get_encrypted_data::<ItemE>(
+                        let (data, marks) = match rx_un.recv() {
+                            Ok((data_ptr, marks_ptr)) => {
+                                let (data, marks) = get_encrypted_data::<ItemE, ItemE>(
                                     rdd.get_op_id(),
                                     dep_info,
-                                    received as *mut u8,
+                                    data_ptr,
+                                    marks_ptr,
                                 );
                                 acc_arg.free_enclave_lock();
-                                *result
+                                (data, marks)
                             }
-                            Err(RecvError) => Vec::new(),
-                        }
-                        .into_iter();
+                            Err(RecvError) => (Vec::new(), Vec::new()),
+                        };
                         for handle in handles {
                             handle.join().unwrap();
                         }
-                        result
+                        (data.into_iter(), marks.into_iter())
                     })
-                    .flatten()
-                    .collect::<Vec<_>>();
+                    .unzip();
+                let data = data.into_iter().flatten().collect::<Vec<_>>();
+                let marks = marks.into_iter().flatten().collect::<Vec<_>>();
                 //start execution from union rdd
                 let acc_arg = acc_arg.clone();
                 let handle = thread::spawn(move || {
                     let now = Instant::now();
-                    let wait = start_execute(acc_arg, results, tx);
+                    let wait = start_execute(acc_arg, data, marks, tx);
                     let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
                     println!("***in union rdd, compute, total {:?}***", dur);
                 });
@@ -435,7 +436,7 @@ impl<T: Data> RddBase for UnionRdd<T> {
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         self.secure_compute(stage_id, split, acc_arg, tx)
     }
@@ -492,7 +493,7 @@ impl<T: Data> Rdd for UnionRdd<T> {
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();

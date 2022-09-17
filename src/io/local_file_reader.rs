@@ -360,12 +360,12 @@ where
         &self,
         data: Vec<ItemE>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
-            let wait = start_execute(acc_arg, data, tx);
+            let wait = start_execute(acc_arg, data, Vec::<ItemE>::new(), tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in local file reader, total {:?}***", dur);
         });
@@ -383,7 +383,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             false
         }
 
-        fn free_data_enc(&self, ptr: *mut u8) {
+        fn free_data_enc(&self, ptrs: (usize, usize)) {
             unreachable!()
         }
 
@@ -411,7 +411,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             self.sec_decoder.is_some()
         }
 
-        fn move_allocation(&self, value_ptr: *mut u8) -> (*mut u8, usize) {
+        fn move_allocation(&self, value_ptr: (usize, usize)) -> ((usize, usize), usize) {
             unreachable!()
         }
 
@@ -424,7 +424,7 @@ macro_rules! impl_common_lfs_rddb_funcs {
             stage_id: usize,
             split: Box<dyn Split>,
             acc_arg: &mut AccArg,
-            tx: SyncSender<usize>,
+            tx: SyncSender<(usize, usize)>,
         ) -> Result<Vec<JoinHandle<()>>> {
             self.secure_compute(stage_id, split, acc_arg, tx)
         }
@@ -539,7 +539,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let now = Instant::now();
@@ -597,7 +597,7 @@ where
         stage_id: usize,
         split: Box<dyn Split>,
         acc_arg: &mut AccArg,
-        tx: SyncSender<usize>,
+        tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<FileReader>().unwrap();
         let files_by_part = self.load_local_files()?;

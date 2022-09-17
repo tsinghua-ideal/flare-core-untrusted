@@ -132,7 +132,7 @@ impl DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
             ),
         ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
@@ -192,7 +192,7 @@ impl DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
             ),
         ) -> U,
     {
@@ -227,7 +227,7 @@ impl DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
             ),
         ) -> U,
         L: JobListener,
@@ -325,7 +325,7 @@ impl DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
             ),
         ) -> U,
         R: futures::AsyncRead + std::marker::Unpin,
@@ -416,7 +416,7 @@ impl NativeScheduler for DistributedScheduler {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
             ),
         ) -> U,
     {

@@ -10,7 +10,6 @@ use std::sync::{
 
 use crate::cache::BoundedMemoryCache;
 use crate::cache_tracker::CacheTracker;
-use crate::dependency::SpecShuffleCache;
 use crate::error::Error;
 use crate::hosts::Hosts;
 use crate::map_output_tracker::MapOutputTracker;

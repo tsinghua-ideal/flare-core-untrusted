@@ -15,7 +15,7 @@ pub(crate) enum CachePutResponse {
 }
 
 type CacheMap = Arc<DashMap<((usize, usize), usize), (Vec<u8>, usize)>>;
-type SecureCacheMap = Arc<DashMap<((usize, usize), usize), (usize, usize)>>; //(((key_space_id, cached_rdd_id), part_id), (encrypted_data, size))
+type SecureCacheMap = Arc<DashMap<((usize, usize), usize), ((usize, usize), usize)>>; //(((key_space_id, cached_rdd_id), part_id), ((encrypted_data, encrypted_marks) size))
 
 // Despite the name, it is currently unbounded cache. Once done with LRU iterator, have to make this bounded.
 // Since we are storing everything as serialized objects, size estimation is as simple as getting the length of byte vector
@@ -76,7 +76,7 @@ impl BoundedMemoryCache {
         self.smap.contains_key(&(dataset_id, part_id))
     }
 
-    pub fn sget(&self, dataset_id: (usize, usize), part_id: usize) -> Option<usize> {
+    pub fn sget(&self, dataset_id: (usize, usize), part_id: usize) -> Option<(usize, usize)> {
         self.smap
             .get(&(dataset_id, part_id))
             .map(|entry| entry.0.clone())
@@ -86,7 +86,7 @@ impl BoundedMemoryCache {
         &self,
         dataset_id: (usize, usize),
         part_id: usize,
-        value_ptr: *mut u8,
+        value_ptr: (usize, usize),
         avoid_moving: usize, //0 for need, and >0 for size in case of no need
     ) -> CachePutResponse {
         let rdd_base = match RDDB_MAP.get_rddb(dataset_id.1) {
@@ -105,7 +105,7 @@ impl BoundedMemoryCache {
             CachePutResponse::CachePutFailure
         } else {
             // TODO: ensure free space needs to be done and this needs to be modified
-            self.smap.insert(key, (value as usize, size));
+            self.smap.insert(key, (value, size));
             CachePutResponse::CachePutSuccess(size)
         }
     }
@@ -113,12 +113,12 @@ impl BoundedMemoryCache {
     //should be called in the end of program
     pub fn free_data_enc(&self) {
         for (key, value) in (*self.smap).clone() {
-            let rdd_id = key.0.1;
+            let rdd_id = key.0 .1;
             let rdd_base = match RDDB_MAP.get_rddb(rdd_id) {
                 Some(rdd_base) => rdd_base,
                 None => panic!("invalid cached rdd id"),
             };
-            rdd_base.free_data_enc(value.0 as *mut u8);
+            rdd_base.free_data_enc(value.0);
         }
     }
 
@@ -157,12 +157,22 @@ impl<'a> KeySpace<'a> {
     pub fn scontain(&self, rdd_id: usize, part_id: usize) -> bool {
         self.cache.scontain((self.key_space_id, rdd_id), part_id)
     }
-    pub fn sget(&self, dataset_id: usize, part_id: usize) -> Option<usize> {
+    pub fn sget(&self, dataset_id: usize, part_id: usize) -> Option<(usize, usize)> {
         self.cache.sget((self.key_space_id, dataset_id), part_id)
     }
-    pub fn sput(&self, dataset_id: usize, part_id: usize, value: *mut u8, avoid_moving: usize) -> CachePutResponse {
-        self.cache
-            .sput((self.key_space_id, dataset_id), part_id, value, avoid_moving)
+    pub fn sput(
+        &self,
+        dataset_id: usize,
+        part_id: usize,
+        value: (usize, usize),
+        avoid_moving: usize,
+    ) -> CachePutResponse {
+        self.cache.sput(
+            (self.key_space_id, dataset_id),
+            part_id,
+            value,
+            avoid_moving,
+        )
     }
     pub fn get_capacity(&self) -> usize {
         self.cache.max_mbytes

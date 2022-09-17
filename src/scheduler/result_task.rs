@@ -20,7 +20,13 @@ where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U
         + 'static
@@ -48,7 +54,13 @@ where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U
         + 'static
@@ -68,7 +80,13 @@ where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U
         + 'static
@@ -99,7 +117,13 @@ where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U
         + 'static
@@ -140,7 +164,13 @@ where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U
         + 'static
@@ -180,7 +210,13 @@ where
     F: Fn(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, Box<dyn Iterator<Item = ItemE>>),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U
         + 'static
@@ -214,7 +250,10 @@ where
                         self.action_id.clone(),
                     ) {
                         Ok(r) => r,
-                        Err(_) => Box::new(Vec::new().into_iter()),
+                        Err(_) => (
+                            Box::new(Vec::new().into_iter()) as Box<dyn Iterator<Item = _>>,
+                            Box::new(Vec::new().into_iter()) as Box<dyn Iterator<Item = _>>,
+                        ),
                     };
                     STAGE_LOCK.free_stage_lock();
                     //sync in order to clear the sort cache
@@ -234,7 +273,10 @@ where
                         Ok(r) => r,
                         Err(_) => Box::new(Vec::new().into_iter()),
                     },
-                    Box::new(Vec::new().into_iter()),
+                    (
+                        Box::new(Vec::new().into_iter()),
+                        Box::new(Vec::new().into_iter()),
+                    ),
                 ),
             },
         ))) as SerBox<dyn AnyData>;

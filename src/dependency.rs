@@ -317,15 +317,18 @@ where
 
             let num_output_splits = self.partitioner.get_num_of_partitions();
             let buckets = match rx.recv() {
-                Ok(buckets_ptr) => {
-                    let mut buckets = get_encrypted_data::<Vec<ItemE>>(
+                Ok((buckets_ptr, marks_ptr)) => {
+                    assert_eq!(marks_ptr, 0usize);
+                    let mut buckets = get_encrypted_data::<Vec<ItemE>, Vec<ItemE>>(
                         rdd_base.get_op_id(),
                         dep_info,
-                        buckets_ptr as *mut u8,
-                    );
+                        buckets_ptr,
+                        marks_ptr,
+                    )
+                    .0;
                     acc_arg.free_enclave_lock();
                     buckets.resize(num_output_splits, Vec::new());
-                    *buckets
+                    buckets
                 }
                 Err(RecvError) => vec![Vec::new(); num_output_splits],
             };
@@ -412,64 +415,6 @@ where
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             log::info!("in dependency, shuffle write {:?}", dur);
             env::Env::get().shuffle_manager.get_server_uri()
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SpecShuffleCache {
-    /// The key is: {op_ids}/{input_id(part_id)}/{identifier}
-    /// The value is : {res_ptr}/{final_op_id}
-    inner: Arc<DashMap<(u64, usize, usize), (Vec<usize>, OpId)>>,
-}
-
-impl SpecShuffleCache {
-    pub fn new() -> Self {
-        SpecShuffleCache {
-            inner: Arc::new(DashMap::new()),
-        }
-    }
-
-    pub fn get_mut(
-        &self,
-        key: &(u64, usize, usize),
-    ) -> Option<RefMut<(u64, usize, usize), (Vec<usize>, OpId), RandomState>> {
-        self.inner.get_mut(key)
-    }
-
-    pub fn insert(&self, key: (u64, usize, usize), value: (Vec<usize>, OpId)) {
-        self.inner.insert(key, value);
-    }
-
-    pub fn remove(
-        &self,
-        key: &(u64, usize, usize),
-    ) -> Option<((u64, usize, usize), (Vec<usize>, OpId))> {
-        self.inner.remove(key)
-    }
-
-    //should be called in the end of program
-    pub fn free_data_enc(&self) {
-        let eid = env::Env::get()
-            .enclave
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .geteid();
-        let dep_info = DepInfo::padding_new(0);
-        for (key, (ps, op_id)) in (*self.inner).clone() {
-            println!("free op_id {:?}", op_id);
-            for p_data_enc in ps {
-                let sgx_status =
-                    unsafe { free_res_enc(eid, op_id, dep_info, p_data_enc as *mut u8) };
-                match sgx_status {
-                    sgx_status_t::SGX_SUCCESS => {}
-                    _ => {
-                        panic!("[-] ECALL Enclave Failed {}!", sgx_status.as_str());
-                    }
-                }
-            }
         }
     }
 }
