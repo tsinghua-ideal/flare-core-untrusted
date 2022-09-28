@@ -157,22 +157,23 @@ impl CacheTracker {
                     let writer = writer.compat_write();
 
                     //reading
-                    let message_reader =
-                        capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
-                    let data = message_reader.get_root::<serialized_data::Reader>()?;
-                    let message: CacheTrackerMessage = bincode::deserialize(data.get_msg()?)?;
+                    let message = {
+                        let message_reader = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
+                        let data = message_reader.get_root::<serialized_data::Reader>()?;
+                        bincode::deserialize::<CacheTrackerMessage>(data.get_msg()?)?
+                    };
 
                     // send reply
                     let reply = selfc.process_message(message);
                     let result = bincode::serialize(&reply)?;
-                    let mut message = capnp::message::Builder::new_default();
-                    let mut locs_data = message.init_root::<serialized_data::Builder>();
-                    locs_data.set_msg(&result);
-                    // TODO: remove blocking call when possible
-                    futures::executor::block_on(async {
-                        capnp_serialize::write_message(writer, message).await?;
-                        Ok::<_, Error>(())
-                    })?;
+                    let message = {
+                        let mut message = capnp::message::Builder::new_default();
+                        let mut locs_data = message.init_root::<serialized_data::Builder>();
+                        locs_data.set_msg(&result);
+                        message
+                    };
+
+                    capnp_serialize::write_message(writer, message).await.unwrap();
 
                     Ok::<_, Error>(())
                 });

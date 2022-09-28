@@ -85,7 +85,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
             let now = Instant::now();
             let wait = start_execute(acc_arg, data, Vec::<T>::new(), tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
-            println!("***in parallel collection rdd, total {:?}***", dur);
+            log::debug!("***in parallel collection rdd, total {:?}***", dur);
         });
         handle
     }

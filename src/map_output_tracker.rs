@@ -311,7 +311,6 @@ impl MapOutputTracker {
                                 "(part_group) pass the |get max cnt| point ({:?})",
                                 part_group
                             );
-
                             let (cnt, should_remove) = {
                                 let mut unlocked_cnt_map = cnt_map_clone.lock();
                                 let (item, _, remain) =
@@ -366,16 +365,18 @@ impl MapOutputTracker {
                         }
                         MapOutputTrackerMessage::StopMapOutputTracker => unimplemented!(),
                     };
-                    let mut message = MsgBuilder::new_default();
-                    let mut data = message.init_root::<serialized_data::Builder>();
-                    data.set_msg(&result);
-                    // TODO: remove blocking call when possible
-                    futures::executor::block_on(async {
-                        capnp_futures::serialize::write_message(writer, message)
-                            .await
-                            .map_err(Error::CapnpDeserialization)?;
-                        Ok::<_, Error>(())
-                    })?;
+
+                    let message = {
+                        let mut message = MsgBuilder::new_default();
+                        let mut locs_data = message.init_root::<serialized_data::Builder>();
+                        locs_data.set_msg(&result);
+                        message
+                    };
+
+                    capnp_futures::serialize::write_message(writer, message)
+                        .await
+                        .map_err(Error::CapnpDeserialization)
+                        .unwrap();
                     Ok::<_, Error>(())
                 });
             }

@@ -62,7 +62,7 @@ fn wrapper_clear_cache() {
     };
 }
 
-pub const PRI_KEY_LOC: &str = "/home/lixiang/.ssh/124.9";
+pub const PRI_KEY_LOC: &str = "/root/.ssh/id_ed25519";
 // There is a problem with this approach since T needs to satisfy PartialEq, Eq for Range
 // No such restrictions are needed for Vec
 pub enum Sequence<T> {
@@ -95,7 +95,13 @@ impl Schedulers {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
     {
@@ -145,7 +151,13 @@ impl Schedulers {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
@@ -407,7 +419,7 @@ impl Context {
                 true,
                 Some(address_map.clone()),
                 shuffle_uris_map,
-                10000,
+                9999,
             ))),
             address_map,
             distributed_driver: true,
@@ -688,7 +700,15 @@ impl Context {
         func: F,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>))) -> U,
+        F: SerFunc(
+            (
+                Box<dyn Iterator<Item = T>>,
+                (
+                    Box<dyn Iterator<Item = ItemE>>,
+                    Box<dyn Iterator<Item = ItemE>>,
+                ),
+            ),
+        ) -> U,
     {
         let cl = Fn!(move |(_task_context, (iter_p, iter_e))| (func)((iter_p, iter_e)));
         let func = Arc::new(cl);
@@ -709,7 +729,15 @@ impl Context {
         partitions: P,
     ) -> Result<Vec<U>>
     where
-        F: SerFunc((Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>))) -> U,
+        F: SerFunc(
+            (
+                Box<dyn Iterator<Item = T>>,
+                (
+                    Box<dyn Iterator<Item = ItemE>>,
+                    Box<dyn Iterator<Item = ItemE>>,
+                ),
+            ),
+        ) -> U,
         P: IntoIterator<Item = usize>,
     {
         let cl = Fn!(move |(_task_context, iter)| (func)(iter));
@@ -732,7 +760,13 @@ impl Context {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
     {
@@ -762,7 +796,13 @@ impl Context {
         F: SerFunc(
             (
                 TaskContext,
-                (Box<dyn Iterator<Item = T>>, (Box<dyn Iterator<Item = ItemE>>, Box<dyn Iterator<Item = ItemE>>)),
+                (
+                    Box<dyn Iterator<Item = T>>,
+                    (
+                        Box<dyn Iterator<Item = ItemE>>,
+                        Box<dyn Iterator<Item = ItemE>>,
+                    ),
+                ),
             ),
         ) -> U,
         E: ApproximateEvaluator<U, R> + Send + Sync + 'static,
