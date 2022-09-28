@@ -64,8 +64,8 @@ impl Executor {
             let rcv_main = rcv_main.clone();
             let selfc = Arc::clone(&self);
             let res: Result<Signal> = spawn(async move {
-                let (reader, writer) = stream.split();
-                let reader = reader.compat();
+                let (reader, writer) = stream.into_split();
+                let mut reader = reader.compat();
                 let mut writer = writer.compat_write();
                 match rcv_main.try_recv() {
                     Ok(Signal::ShutDownError) => {
@@ -78,19 +78,19 @@ impl Executor {
                     }
                     _ => {}
                 }
-                log::debug!("received new task @{} executor", selfc.port);
+                let port = selfc.port;
+                log::debug!("received new task @{} executor", port);
                 let message = {
-                    let message_reader =
-                        capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
+                    let message_reader = capnp_serialize::read_message(&mut reader, CAPNP_BUF_READ_OPTS).await?;
                     spawn_blocking(move || -> Result<_> {
                         let des_task = selfc.deserialize_task(message_reader)?;
                         selfc.run_task(des_task)
                     })
                     .await??
                 };
-                // TODO: remove blocking call when possible
-                futures::executor::block_on(capnp_serialize::write_message(&mut writer, &message))
-                    .map_err(Error::CapnpDeserialization)?;
+                capnp_serialize::write_message(&mut writer, message).await
+                    .map_err(Error::CapnpDeserialization)
+                    .unwrap();
                 log::debug!("sent result data to driver");
                 Ok(Signal::Continue)
             })

@@ -428,7 +428,7 @@ impl NativeScheduler for DistributedScheduler {
                 log::debug!("target_executor: {:?}", target_executor);
                 match TcpStream::connect(&target_executor).await {
                     Ok(mut stream) => {
-                        let (reader, writer) = stream.split();
+                        let (reader, writer) = stream.into_split();
                         let reader = reader.compat();
                         let writer = writer.compat_write();
                         let now = Instant::now();
@@ -442,16 +442,16 @@ impl NativeScheduler for DistributedScheduler {
                             target_executor.port(),
                         );
 
-                        // TODO: remove blocking call when possible
-                        futures::executor::block_on(async {
+                        let message = {
                             let mut message = capnp::message::Builder::new_default();
                             let mut task_data = message.init_root::<serialized_data::Builder>();
                             task_data.set_msg(&task_bytes);
-                            capnp_serialize::write_message(writer, message)
-                                .await
-                                .map_err(Error::CapnpDeserialization)
-                                .unwrap();
-                        });
+                            message
+                        };
+
+                        capnp_serialize::write_message(writer, message).await
+                            .map_err(Error::CapnpDeserialization)
+                            .unwrap();
 
                         log::debug!("sent data to exec @{}", target_executor.port());
 
