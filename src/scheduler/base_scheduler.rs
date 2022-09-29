@@ -569,11 +569,11 @@ pub(crate) trait NativeScheduler: Send + Sync {
 
     fn get_preferred_locs(&self, rdd: Arc<dyn RddBase>, partition: usize) -> Vec<Ipv4Addr> {
         // TODO: have to implement this completely
-        if let Some(cached) = self.get_cache_locs(rdd.clone()) {
-            if let Some(cached) = cached.get(partition) {
-                return cached.clone();
-            }
-        }
+        // if let Some(cached) = self.get_cache_locs(rdd.clone()) {
+        //     if let Some(cached) = cached.get(partition) {
+        //         return cached.clone();
+        //     }
+        // }
         let rdd_prefs = rdd.preferred_locations(rdd.splits()[partition].clone());
         if !rdd.is_pinned() {
             if !rdd_prefs.is_empty() {
