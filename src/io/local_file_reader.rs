@@ -200,7 +200,7 @@ where
 
     /// This function should be called once per host to come with the paralel workload.
     /// Is safe to recompute on failure though.
-    fn load_local_files(&self) -> Result<Vec<Vec<PathBuf>>> {
+    fn load_local_files(&self, part_id: usize) -> Result<Vec<Vec<PathBuf>>> {
         let mut total_size = 0_u64;
         if self.is_single_file {
             let files = vec![vec![self.path.clone()]];
@@ -216,10 +216,21 @@ where
         let mut ex = 0.0;
         let mut ex2 = 0.0;
 
-        for (i, entry) in fs::read_dir(&self.path)
+        let mut entries = fs::read_dir(&self.path)
             .map_err(Error::InputRead)?
-            .enumerate()
-        {
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|e| e.as_ref().ok().map(|x| x.file_name()));
+        let num_nodes = self.splits.len();
+        let files_per_node = entries.len().checked_sub(1).unwrap() / num_nodes + 1;
+        let mut cur = 0;
+        for (i, entry) in entries.into_iter().enumerate() {
+            if cur < part_id * files_per_node || cur >= (part_id + 1) * files_per_node {
+                cur += 1;
+                continue;
+            } else {
+                cur += 1;
+            }
+
             let path = entry.map_err(Error::InputRead)?.path();
             if path.is_file() {
                 let is_proper_file = {
@@ -248,6 +259,11 @@ where
         if total_files == 0 {
             return Err(Error::NoFilesFound);
         }
+
+        debug!(
+            "the number of loaded files {:?}, the files are {:?}",
+            total_files, files
+        );
 
         let file_size_mean = (total_size / total_files) as u64;
         let std_dev = ((ex2 - ex.powf(2.0) / total_files as f32) / total_files as f32).sqrt();
@@ -524,9 +540,9 @@ where
 
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
-        let files_by_part = self.load_local_files()?;
         let idx = split.idx;
         let host = split.host;
+        let files_by_part = self.load_local_files(idx)?;
         Ok(Box::new(
             files_by_part
                 .into_iter()
@@ -543,9 +559,9 @@ where
     ) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let now = Instant::now();
-        let files_by_part = self.load_local_files()?;
         let idx = split.idx;
         let host = split.host;
+        let files_by_part = self.load_local_files(idx)?;
         let readers = files_by_part
             .into_iter()
             .map(move |files| BytesReader { files, host, idx })
@@ -582,9 +598,9 @@ where
 
     fn compute(&self, split: Box<dyn Split>) -> Result<Box<dyn Iterator<Item = Self::Item>>> {
         let split = split.downcast_ref::<FileReader>().unwrap();
-        let files_by_part = self.load_local_files()?;
         let idx = split.idx;
         let host = split.host;
+        let files_by_part = self.load_local_files(idx)?;
         Ok(Box::new(
             files_by_part
                 .into_iter()
@@ -600,9 +616,9 @@ where
         tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let split = split.downcast_ref::<FileReader>().unwrap();
-        let files_by_part = self.load_local_files()?;
         let idx = split.idx;
         let host = split.host;
+        let files_by_part = self.load_local_files(idx)?;
         let readers = files_by_part
             .into_iter()
             .map(move |files| FileReader { files, host, idx })
