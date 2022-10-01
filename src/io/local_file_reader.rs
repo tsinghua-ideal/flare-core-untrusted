@@ -257,7 +257,8 @@ where
         }
 
         if total_files == 0 {
-            return Err(Error::NoFilesFound);
+            // return Err(Error::NoFilesFound);
+            return Ok(Vec::new());
         }
 
         debug!(
