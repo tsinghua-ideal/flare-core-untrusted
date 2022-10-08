@@ -105,7 +105,7 @@ where
         tx: SyncSender<(usize, usize)>,
     ) -> Result<Vec<JoinHandle<()>>> {
         let part_id = split.get_index();
-        let fut = ShuffleFetcher::secure_fetch(
+        let fut = ShuffleFetcher::secure_fetch::<Vec<ItemE>>(
             GetServerUriReq::PrevStage(self.shuffle_id),
             part_id,
             usize::MAX,
@@ -129,46 +129,13 @@ where
         let num_splits = *acc_arg.split_nums.last().unwrap();
         let part_group = (stage_id, part_id_offset, num_splits);
 
-        //column sort
         //need split_num fix first
         wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
-        let now = Instant::now();
-        let data = {
-            //count the cnt_per_partition
-            acc_arg.get_enclave_lock();
-            let dep_info = DepInfo::padding_new(20);
-            let invalid_ptr = wrapper_secure_execute(
-                &cur_rdd_ids,
-                &cur_op_ids,
-                &cur_part_ids,
-                Default::default(),
-                dep_info,
-                &buckets,
-                &Vec::<Vec<ItemE>>::new(),
-                &HashMap::new(),
-            )
-            .0;
-            assert_eq!(invalid_ptr, 0);
-            acc_arg.free_enclave_lock();
-            println!("count the cnt_per_partition");
-            //step 3 - 8
-            ShuffleFetcher::fetch_sort(
-                buckets,
-                &cur_rdd_ids,
-                &cur_op_ids,
-                &cur_part_ids,
-                part_group,
-                acc_arg,
-                0,
-            )
-        };
-        let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-        println!("***in shuffled rdd, first column sort, total {:?}***", dur);
-
         //shuffle read
         let now = Instant::now();
         let (data, marks) = secure_shuffle_read(
-            data,
+            stage_id,
+            buckets,
             &cur_rdd_ids,
             &cur_op_ids,
             &cur_part_ids,
@@ -182,7 +149,7 @@ where
         let acc_arg = acc_arg.clone();
         let handle = thread::spawn(move || {
             let now = Instant::now();
-            let wait = start_execute(acc_arg, data, marks, tx);
+            let wait = start_execute(stage_id, acc_arg, data, marks, tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in shuffled rdd, compute, total {:?}***", dur);
         });
@@ -326,7 +293,8 @@ where
 
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
+            let mut handles =
+                secure_compute_cached(stage_id, acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
@@ -336,5 +304,233 @@ where
         } else {
             self.secure_compute_prev(stage_id, split, acc_arg, tx)
         }
+    }
+}
+
+fn secure_shuffle_read(
+    stage_id: usize,
+    buckets: Vec<Vec<ItemE>>,
+    cur_rdd_ids: &Vec<usize>,
+    cur_op_ids: &Vec<OpId>,
+    cur_part_ids: &Vec<usize>,
+    part_group: (usize, usize, usize),
+    acc_arg: &AccArg,
+    is_aggregator_default: bool,
+) -> (Vec<ItemE>, Vec<ItemE>) {
+    let reduce_id = cur_part_ids[0];
+    let mut tmp_captured_var = HashMap::new();
+
+    if is_aggregator_default {
+        //obliv_filter_stage3 + obliv_agg_stage1
+        let (part, mut buckets) = {
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(20);
+            let (data_ptr, marks_ptr) = wrapper_secure_execute(
+                stage_id,
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
+                Default::default(),
+                dep_info,
+                &buckets,
+                &Vec::<ItemE>::new(),
+                &HashMap::new(),
+            );
+
+            let (part, mut buckets) = get_encrypted_data::<ItemE, Vec<ItemE>>(
+                cur_op_ids[0],
+                dep_info,
+                data_ptr,
+                marks_ptr,
+            );
+            acc_arg.free_enclave_lock();
+            buckets.resize(part_group.2, Vec::new());
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let ser_bytes = bincode::serialize(&bucket).unwrap();
+                env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
+            }
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
+            let fut = ShuffleFetcher::secure_fetch::<Vec<ItemE>>(
+                GetServerUriReq::CurStage(part_group),
+                reduce_id,
+                usize::MAX,
+            );
+            (
+                part,
+                futures::executor::block_on(fut)
+                    .unwrap()
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        //obliv_agg_stage_2 + obliv_group_by_stage1 + obliv_group_by_stage2 + obliv_group_by_stage3
+        let (buckets, alpha, beta, n_out_prime) = {
+            tmp_captured_var.insert(
+                cur_rdd_ids[0],
+                vec![bincode::serialize(&part_group).unwrap()],
+            );
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(21);
+            let (data_ptr, meta_data_ptr) = wrapper_secure_execute(
+                stage_id,
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
+                Default::default(),
+                dep_info,
+                &buckets,
+                &Vec::<ItemE>::new(),
+                &tmp_captured_var,
+            );
+
+            let (mut buckets, meta_data) = get_encrypted_data::<Vec<ItemE>, u8>(
+                cur_op_ids[0],
+                dep_info,
+                data_ptr,
+                meta_data_ptr,
+            );
+            acc_arg.free_enclave_lock();
+            let (alpha, beta, n_out_prime): (usize, usize, usize) =
+                bincode::deserialize(&meta_data).unwrap();
+            buckets.resize(part_group.2, Vec::new());
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let ser_bytes = bincode::serialize(&bucket).unwrap();
+                env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
+            }
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
+            let fut = ShuffleFetcher::secure_fetch::<Vec<ItemE>>(
+                GetServerUriReq::CurStage(part_group),
+                reduce_id,
+                usize::MAX,
+            );
+            (
+                futures::executor::block_on(fut)
+                    .unwrap()
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>(),
+                alpha,
+                beta,
+                n_out_prime,
+            )
+        };
+
+        //obliv_group_by_stage_4
+        let buckets = {
+            tmp_captured_var.insert(
+                cur_rdd_ids[0],
+                vec![bincode::serialize(&(part_group, beta, n_out_prime)).unwrap()],
+            );
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(22);
+            let (data_ptr, marks_ptr) = wrapper_secure_execute(
+                stage_id,
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
+                Default::default(),
+                dep_info,
+                &part,
+                &buckets,
+                &tmp_captured_var,
+            );
+
+            assert_eq!(marks_ptr, 0);
+            let (mut buckets, _) = get_encrypted_data::<Vec<ItemE>, ItemE>(
+                cur_op_ids[0],
+                dep_info,
+                data_ptr,
+                marks_ptr,
+            );
+            acc_arg.free_enclave_lock();
+            buckets.resize(part_group.2, Vec::new());
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                let ser_bytes = bincode::serialize(&bucket).unwrap();
+                env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
+            }
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
+            let fut = ShuffleFetcher::secure_fetch::<Vec<ItemE>>(
+                GetServerUriReq::CurStage(part_group),
+                reduce_id,
+                usize::MAX,
+            );
+            futures::executor::block_on(fut)
+                .unwrap()
+                .filter(|x| !x.is_empty())
+                .collect::<Vec<_>>()
+        };
+
+        //obliv_group_by_stage_5
+        {
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(2);
+            let (data_ptr, marks_ptr) = wrapper_secure_execute(
+                stage_id,
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
+                Default::default(),
+                dep_info,
+                &buckets,
+                &Vec::<ItemE>::new(),
+                &HashMap::new(),
+            );
+
+            //the invalid values have not been filtered.
+            assert_ne!(marks_ptr, 0);
+            let (data, marks) =
+                get_encrypted_data::<ItemE, ItemE>(cur_op_ids[0], dep_info, data_ptr, marks_ptr);
+            acc_arg.free_enclave_lock();
+            (data, marks)
+        }
+    } else {
+        //obliv_agg_stage2
+        acc_arg.get_enclave_lock();
+        let dep_info = DepInfo::padding_new(2);
+        let (data_ptr, marks_ptr) = wrapper_secure_execute(
+            stage_id,
+            cur_rdd_ids,
+            cur_op_ids,
+            cur_part_ids,
+            Default::default(),
+            dep_info,
+            &buckets,
+            &Vec::<ItemE>::new(),
+            &HashMap::new(),
+        );
+
+        let (data, marks) =
+            get_encrypted_data::<ItemE, ItemE>(cur_op_ids[0], dep_info, data_ptr, marks_ptr);
+        acc_arg.free_enclave_lock();
+        //the invalid values have been filtered.
+        assert!(marks.is_empty());
+        (data, marks)
     }
 }

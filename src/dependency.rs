@@ -5,19 +5,13 @@ use crate::rdd::{
     default_hash, free_res_enc, get_encrypted_data, AccArg, ItemE, OpId, RddBase, STAGE_LOCK,
 };
 use crate::serializable_traits::Data;
-use dashmap::mapref::one::RefMut;
-use dashmap::DashMap;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 use sgx_types::*;
 
 use std::cmp::Ordering;
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::hash::Hash;
-use std::marker::PhantomData;
-use std::mem::forget;
 use std::sync::{
     atomic,
     mpsc::{self, RecvError},

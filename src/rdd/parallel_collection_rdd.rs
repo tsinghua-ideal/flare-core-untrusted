@@ -70,6 +70,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
 
     fn secure_iterator(
         &self,
+        stage_id: usize,
         acc_arg: &mut AccArg,
         tx: SyncSender<(usize, usize)>,
     ) -> JoinHandle<()> {
@@ -83,7 +84,7 @@ impl<T: Data> ParallelCollectionSplit<T> {
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
-            let wait = start_execute(acc_arg, data, Vec::<T>::new(), tx);
+            let wait = start_execute(stage_id, acc_arg, data, Vec::<T>::new(), tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             log::debug!("***in parallel collection rdd, total {:?}***", dur);
         });
@@ -366,15 +367,15 @@ where
             let should_cache = self.should_cache();
             if should_cache {
                 let mut handles =
-                    secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
+                    secure_compute_cached(stage_id, acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
                 if handles.is_empty() {
                     acc_arg.set_caching_rdd_id(cur_rdd_id);
-                    handles.append(&mut vec![s.secure_iterator(acc_arg, tx)]);
+                    handles.append(&mut vec![s.secure_iterator(stage_id, acc_arg, tx)]);
                 }
                 Ok(handles)
             } else {
-                Ok(vec![s.secure_iterator(acc_arg, tx)])
+                Ok(vec![s.secure_iterator(stage_id, acc_arg, tx)])
             }
         } else {
             Err(Error::DowncastFailure("ParallelCollectionSplit<TE>"))

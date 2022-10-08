@@ -257,11 +257,11 @@ where
                     };
                     STAGE_LOCK.free_stage_lock();
                     //sync in order to clear the sort cache
-                    futures::executor::block_on(ShuffleFetcher::fetch_sync((
-                        self.stage_id,
-                        0,
-                        num_splits,
-                    )))
+                    futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                        (self.stage_id, 0, num_splits),
+                        self.partition,
+                        Vec::new(),
+                    ))
                     .unwrap();
                     //clear the sort cache
                     env::SORT_CACHE.retain(|k, _| k.0 .0 != self.stage_id);

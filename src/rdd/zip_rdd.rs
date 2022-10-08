@@ -104,11 +104,16 @@ where
         let sec_data = sec_data_iter.collect::<Vec<_>>();
         let sec_marks = sec_marks_iter.collect::<Vec<_>>();
 
-        let (data, marks) = self.secure_zip((fst_data, sec_data), (fst_marks, sec_marks), acc_arg);
+        let (data, marks) = self.secure_zip(
+            stage_id,
+            (fst_data, sec_data),
+            (fst_marks, sec_marks),
+            acc_arg,
+        );
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
-            let wait = start_execute(acc_arg, data, marks, tx);
+            let wait = start_execute(stage_id, acc_arg, data, marks, tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in zipped rdd, compute, total {:?}***", dur);
         });
@@ -117,6 +122,7 @@ where
 
     fn secure_zip(
         &self,
+        stage_id: usize,
         data: (Vec<ItemE>, Vec<ItemE>),
         marks: (Vec<ItemE>, Vec<ItemE>),
         acc_arg: &mut AccArg,
@@ -128,6 +134,7 @@ where
         let dep_info = DepInfo::padding_new(2);
 
         let (data_ptr, marks_ptr) = wrapper_secure_execute(
+            stage_id,
             &cur_rdd_ids,
             &cur_op_ids,
             &cur_part_ids,
@@ -273,7 +280,8 @@ where
 
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
+            let mut handles =
+                secure_compute_cached(stage_id, acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);

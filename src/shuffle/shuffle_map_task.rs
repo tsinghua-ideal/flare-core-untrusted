@@ -97,8 +97,12 @@ impl Task for ShuffleMapTask {
         ) as SerBox<dyn AnyData>;
         STAGE_LOCK.remove_stage(rdd_id_pair, self.task_id);
         //sync in order to clear the sort cache
-        futures::executor::block_on(ShuffleFetcher::fetch_sync((self.stage_id, 0, num_splits)))
-            .unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(
+            (self.stage_id, 0, num_splits),
+            self.partition,
+            Vec::new(),
+        ))
+        .unwrap();
         //clear the sort cache
         env::SORT_CACHE.retain(|k, _| k.0 .0 != self.stage_id);
         res

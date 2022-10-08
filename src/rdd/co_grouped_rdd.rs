@@ -179,7 +179,7 @@ where
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     has_shuffle = true;
-                    let fut = ShuffleFetcher::secure_fetch(
+                    let fut = ShuffleFetcher::secure_fetch::<Vec<ItemE>>(
                         GetServerUriReq::PrevStage(shuffle_id),
                         split.get_index(),
                         usize::MAX,
@@ -237,7 +237,7 @@ where
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
                     has_shuffle = true;
-                    let fut = ShuffleFetcher::secure_fetch(
+                    let fut = ShuffleFetcher::secure_fetch::<Vec<ItemE>>(
                         GetServerUriReq::PrevStage(shuffle_id),
                         split.get_index(),
                         usize::MAX,
@@ -266,33 +266,17 @@ where
             //TODO: what if has_shuffle is false?
             let data = (kv.0, kv.1, kw.0, kw.1);
             //column sort
-            //need split_num fix first
+            //shuffle read
             wrapper_secure_execute_pre(&acc_arg.op_ids, &acc_arg.split_nums, acc_arg.dep_info);
             let now = Instant::now();
-            let data = {
-                secure_column_sort(
-                    data,
-                    &cur_rdd_ids,
-                    &cur_op_ids,
-                    &cur_part_ids,
-                    part_group,
-                    acc_arg,
-                    0,
-                )
-            };
-            let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-            println!("***in co grouped rdd, column sort, total {:?}***", dur);
-
-            let now = Instant::now();
-            //exchange info and do single-node oblivious join
             let (data, marks) = secure_shuffle_read(
+                stage_id,
                 data,
                 &cur_rdd_ids,
                 &cur_op_ids,
                 &cur_part_ids,
                 part_group,
                 acc_arg,
-                true,
             );
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("***in co grouped rdd, shuffle read, total {:?}***", dur);
@@ -300,7 +284,7 @@ where
             let acc_arg = acc_arg.clone();
             let handle = std::thread::spawn(move || {
                 let now = Instant::now();
-                let wait = start_execute(acc_arg, data, marks, tx);
+                let wait = start_execute(stage_id, acc_arg, data, marks, tx);
                 let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
                 println!("***in co grouped rdd, compute, total {:?}***", dur);
             });
@@ -579,7 +563,8 @@ where
 
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
+            let mut handles =
+                secure_compute_cached(stage_id, acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
@@ -590,4 +575,21 @@ where
             self.secure_compute_prev(stage_id, split, acc_arg, tx)
         }
     }
+}
+
+fn secure_shuffle_read(
+    stage_id: usize,
+    buckets: (
+        (Vec<ItemE>, Vec<ItemE>),
+        Vec<Vec<ItemE>>,
+        (Vec<ItemE>, Vec<ItemE>),
+        Vec<Vec<ItemE>>,
+    ),
+    cur_rdd_ids: &Vec<usize>,
+    cur_op_ids: &Vec<OpId>,
+    cur_part_ids: &Vec<usize>,
+    part_group: (usize, usize, usize),
+    acc_arg: &AccArg,
+) -> (Vec<ItemE>, Vec<ItemE>) {
+    todo!()
 }

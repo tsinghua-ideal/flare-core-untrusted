@@ -375,6 +375,7 @@ where
 
     fn secure_compute_(
         &self,
+        stage_id: usize,
         data: Vec<ItemE>,
         acc_arg: &mut AccArg,
         tx: SyncSender<(usize, usize)>,
@@ -382,7 +383,7 @@ where
         let acc_arg = acc_arg.clone();
         let handle = std::thread::spawn(move || {
             let now = Instant::now();
-            let wait = start_execute(acc_arg, data, Vec::<ItemE>::new(), tx);
+            let wait = start_execute(stage_id, acc_arg, data, Vec::<ItemE>::new(), tx);
             let dur = now.elapsed().as_nanos() as f64 * 1e-9 - wait;
             println!("***in local file reader, total {:?}***", dur);
         });
@@ -585,7 +586,7 @@ where
         let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
         acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
-        self.secure_compute_(data, acc_arg, tx)
+        self.secure_compute_(stage_id, data, acc_arg, tx)
     }
 }
 
@@ -641,7 +642,7 @@ where
         let cur_part_id = split.get_index();
         let cur_split_num = self.number_of_splits();
         acc_arg.insert_quadruple(cur_rdd_id, cur_op_id, cur_part_id, cur_split_num);
-        self.secure_compute_(data, acc_arg, tx)
+        self.secure_compute_(stage_id, data, acc_arg, tx)
     }
 }
 

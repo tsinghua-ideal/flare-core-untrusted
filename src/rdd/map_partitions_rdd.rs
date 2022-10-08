@@ -207,7 +207,7 @@ where
         }
         let should_cache = self.should_cache();
         if should_cache {
-            let mut handles = secure_compute_cached(acc_arg, cur_rdd_id, cur_part_id, tx.clone());
+            let mut handles = secure_compute_cached(stage_id, acc_arg, cur_rdd_id, cur_part_id, tx.clone());
 
             if handles.is_empty() {
                 acc_arg.set_caching_rdd_id(cur_rdd_id);
