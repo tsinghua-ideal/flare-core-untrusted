@@ -176,7 +176,7 @@ pub unsafe extern "C" fn ocall_cache_to_outside(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ocall_cache_from_outside(
+pub extern "C" fn ocall_cache_from_outside(
     rdd_id: usize,
     part_id: usize,
     marks_ptr: *mut usize,
@@ -193,28 +193,25 @@ pub unsafe extern "C" fn ocall_cache_from_outside(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ocall_stage_comm(
+pub extern "C" fn ocall_stage_comm(
     data_ptr: usize,
     stage_id: usize,
     part_id_offset: usize,
     num_splits: usize,
     part_id: usize,
 ) -> usize {
-    let data = unsafe { (data_ptr as *const u8 as *const Vec<u8>).as_ref() }
-        .unwrap()
-        .clone();
+    let data_in = unsafe { Box::from_raw(data_ptr as *mut u8 as *mut Vec<u8>) };
+    let data = *data_in.clone();
+    forget(data_in);
     let part_group = (stage_id, part_id_offset, num_splits);
-    let res_set = futures::executor::block_on(ShuffleFetcher::fetch_sync(
-        part_group,
-        part_id,
-        bincode::serialize(&data).unwrap(),
-    ))
-    .unwrap();
+    let res_set = Env::run_in_async_rt(|| {
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group, part_id, data)).unwrap()
+    });
     Box::into_raw(Box::new(res_set)) as *mut u8 as usize
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ocall_stage_comm_post(data_ptr: usize) {
+pub extern "C" fn ocall_stage_comm_post(data_ptr: usize) {
     let data = unsafe { Box::from_raw(data_ptr as *mut u8 as *mut Vec<Vec<u8>>) };
     drop(data);
 }
