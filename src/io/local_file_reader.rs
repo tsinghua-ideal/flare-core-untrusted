@@ -21,7 +21,6 @@ use crate::split::Split;
 use crate::Fn;
 use log::debug;
 use parking_lot::Mutex;
-use rand::prelude::*;
 use serde_derive::{Deserialize, Serialize};
 use sgx_types::*;
 pub struct LocalFsReaderConfig {
@@ -80,7 +79,7 @@ impl ReaderConfiguration<Vec<u8>> for LocalFsReaderConfig {
         let read_files = Fn!(
             move |part: usize, readers: Box<dyn Iterator<Item = BytesReader>>| {
                 let readers = readers.collect::<Vec<_>>();
-                match readers.get(part % local_num_splits) {
+                match readers.get(part) {
                     Some(reader) => {
                         Box::new((*reader).clone().into_iter()) as Box<dyn Iterator<Item = _>>
                     }
@@ -117,7 +116,7 @@ impl ReaderConfiguration<PathBuf> for LocalFsReaderConfig {
         let read_files = Fn!(
             move |part: usize, readers: Box<dyn Iterator<Item = FileReader>>| {
                 let readers = readers.collect::<Vec<_>>();
-                match readers.get(part % local_num_splits) {
+                match readers.get(part) {
                     Some(reader) => {
                         Box::new((*reader).clone().into_iter()) as Box<dyn Iterator<Item = _>>
                     }
@@ -200,14 +199,14 @@ where
 
     /// This function should be called once per host to come with the paralel workload.
     /// Is safe to recompute on failure though.
-    fn load_local_files(&self, part_id: usize) -> Result<Vec<Vec<PathBuf>>> {
+    fn load_local_files(&self) -> Result<Vec<Vec<PathBuf>>> {
         let mut total_size = 0_u64;
         if self.is_single_file {
             let files = vec![vec![self.path.clone()]];
             return Ok(files);
         }
 
-        let mut num_partitions = self.get_executor_partitions();
+        let mut num_partitions = self.splits.len() as u64 * self.get_executor_partitions();
         let mut files: Vec<(u64, PathBuf)> = vec![];
         // We compute std deviation incrementally to estimate a good breakpoint
         // of size per partition.
@@ -220,17 +219,8 @@ where
             .map_err(Error::InputRead)?
             .collect::<Vec<_>>();
         entries.sort_by_key(|e| e.as_ref().ok().map(|x| x.file_name()));
-        let num_nodes = self.splits.len();
-        let files_per_node = entries.len().checked_sub(1).unwrap() / num_nodes + 1;
-        let mut cur = 0;
-        for (i, entry) in entries.into_iter().enumerate() {
-            if cur < part_id * files_per_node || cur >= (part_id + 1) * files_per_node {
-                cur += 1;
-                continue;
-            } else {
-                cur += 1;
-            }
 
+        for (i, entry) in entries.into_iter().enumerate() {
             let path = entry.map_err(Error::InputRead)?.path();
             if path.is_file() {
                 let is_proper_file = {
@@ -313,16 +303,15 @@ where
         let mut partitions = Vec::with_capacity(num_partitions as usize);
         let mut partition = Vec::with_capacity(0);
         let mut curr_part_size = 0_u64;
-        let mut rng = rand::thread_rng();
 
-        for (size, file) in files.into_iter() {
+        for (i, (size, file)) in files.into_iter().enumerate() {
             if partitions.len() as u64 == num_partitions - 1 {
                 partition.push(file);
                 continue;
             }
 
             let new_part_size = curr_part_size + size;
-            let larger_than_mean = rng.gen::<bool>();
+            let larger_than_mean = i % 2 == 0;
             if (larger_than_mean && new_part_size < high_part_size_bound)
                 || (!larger_than_mean && new_part_size <= avg_partition_size)
             {
@@ -542,7 +531,7 @@ where
         let split = split.downcast_ref::<BytesReader>().unwrap();
         let idx = split.idx;
         let host = split.host;
-        let files_by_part = self.load_local_files(idx)?;
+        let files_by_part = self.load_local_files()?;
         Ok(Box::new(
             files_by_part
                 .into_iter()
@@ -560,12 +549,12 @@ where
         let now = Instant::now();
         let idx = split.idx;
         let host = split.host;
-        let files_by_part = self.load_local_files(idx)?;
+        let files_by_part = self.load_local_files()?;
         let readers = files_by_part
             .into_iter()
             .map(move |files| BytesReader { files, host, idx })
             .collect::<Vec<_>>();
-        let data = match readers.get(idx % (self.get_executor_partitions() as usize)) {
+        let data = match readers.get(idx) {
             Some(reader) => (*reader)
                 .clone()
                 .into_iter() //Vec<Vec<u8>>, ser_enc_data
@@ -599,7 +588,7 @@ where
         let split = split.downcast_ref::<FileReader>().unwrap();
         let idx = split.idx;
         let host = split.host;
-        let files_by_part = self.load_local_files(idx)?;
+        let files_by_part = self.load_local_files()?;
         Ok(Box::new(
             files_by_part
                 .into_iter()
@@ -616,12 +605,12 @@ where
         let split = split.downcast_ref::<FileReader>().unwrap();
         let idx = split.idx;
         let host = split.host;
-        let files_by_part = self.load_local_files(idx)?;
+        let files_by_part = self.load_local_files()?;
         let readers = files_by_part
             .into_iter()
             .map(move |files| FileReader { files, host, idx })
             .collect::<Vec<_>>();
-        let data = match readers.get(idx % (self.get_executor_partitions() as usize)) {
+        let data = match readers.get(idx) {
             Some(reader) => (*reader)
                 .clone()
                 .into_iter() //Vec<Vec<u8>>, ser_enc_data
