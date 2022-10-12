@@ -375,9 +375,10 @@ fn secure_shuffle_read(
                 cur_rdd_ids[0],
                 vec![bincode::serialize(&part_group).unwrap()],
             );
+            //obliv_agg_stage_2 + obliv_group_by_stage1
             acc_arg.get_enclave_lock();
             let dep_info = DepInfo::padding_new(21);
-            let (data_ptr, meta_data_ptr) = wrapper_secure_execute(
+            let (data_ptr, marks_ptr) = wrapper_secure_execute(
                 stage_id,
                 cur_rdd_ids,
                 cur_op_ids,
@@ -388,16 +389,77 @@ fn secure_shuffle_read(
                 &Vec::<ItemE>::new(),
                 &tmp_captured_var,
             );
+            assert_eq!(marks_ptr, 0);
 
-            let (mut buckets, meta_data) = get_encrypted_data::<Vec<ItemE>, u8>(
+            let (mut info, _) =
+                get_encrypted_data::<ItemE, ItemE>(cur_op_ids[0], dep_info, data_ptr, marks_ptr);
+            acc_arg.free_enclave_lock();
+            let stat = info.pop().unwrap();
+            let part_ptr = info.pop().unwrap();
+
+            let stat = futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group, reduce_id, stat,
+            ))
+            .unwrap();
+
+            //obliv_group_by_stage2
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(22);
+            let (data_ptr, meta_data_ptr) = wrapper_secure_execute(
+                stage_id,
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
+                Default::default(),
+                dep_info,
+                &(part_ptr, stat),
+                &Vec::<ItemE>::new(),
+                &tmp_captured_var,
+            );
+            assert_ne!(meta_data_ptr, 0);
+
+            let (mut info, meta_data) =
+                get_encrypted_data::<ItemE, u8>(cur_op_ids[0], dep_info, data_ptr, meta_data_ptr);
+            acc_arg.free_enclave_lock();
+            let last_bin_info = info.pop().unwrap();
+            let part_ptr = info.pop().unwrap();
+            let (alpha, beta, n_out_prime): (usize, usize, usize) =
+                bincode::deserialize(&meta_data).unwrap();
+
+            let last_bin_info = futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                last_bin_info,
+            ))
+            .unwrap();
+
+            //obliv_group_by_stage3
+            tmp_captured_var.insert(
+                cur_rdd_ids[0],
+                vec![bincode::serialize(&(part_group, alpha)).unwrap()],
+            );
+            acc_arg.get_enclave_lock();
+            let dep_info = DepInfo::padding_new(23);
+            let (data_ptr, marks_ptr) = wrapper_secure_execute(
+                stage_id,
+                cur_rdd_ids,
+                cur_op_ids,
+                cur_part_ids,
+                Default::default(),
+                dep_info,
+                &(part_ptr, last_bin_info),
+                &Vec::<ItemE>::new(),
+                &tmp_captured_var,
+            );
+            assert_eq!(marks_ptr, 0);
+
+            let (mut buckets, _) = get_encrypted_data::<Vec<ItemE>, ItemE>(
                 cur_op_ids[0],
                 dep_info,
                 data_ptr,
-                meta_data_ptr,
+                marks_ptr,
             );
             acc_arg.free_enclave_lock();
-            let (alpha, beta, n_out_prime): (usize, usize, usize) =
-                bincode::deserialize(&meta_data).unwrap();
             buckets.resize(part_group.2, Vec::new());
             futures::executor::block_on(ShuffleFetcher::fetch_sync(
                 part_group,
@@ -438,7 +500,7 @@ fn secure_shuffle_read(
                 vec![bincode::serialize(&(part_group, beta, n_out_prime)).unwrap()],
             );
             acc_arg.get_enclave_lock();
-            let dep_info = DepInfo::padding_new(22);
+            let dep_info = DepInfo::padding_new(24);
             let (data_ptr, marks_ptr) = wrapper_secure_execute(
                 stage_id,
                 cur_rdd_ids,

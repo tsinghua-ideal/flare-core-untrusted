@@ -2,9 +2,11 @@ use crate::aggregator::Aggregator;
 use crate::env;
 use crate::partitioner::Partitioner;
 use crate::rdd::{
-    default_hash, free_res_enc, get_encrypted_data, AccArg, ItemE, OpId, RddBase, STAGE_LOCK,
+    default_hash, free_res_enc, get_encrypted_data, wrapper_secure_execute, AccArg, ItemE, OpId,
+    RddBase, STAGE_LOCK,
 };
 use crate::serializable_traits::Data;
+use crate::shuffle::ShuffleFetcher;
 use serde_derive::{Deserialize, Serialize};
 use serde_traitobject::{Deserialize, Serialize};
 use sgx_types::*;
@@ -285,7 +287,7 @@ where
             let mut op_ids = vec![self.child_op_id];
             rdd_base.get_op_ids(&mut op_ids);
             let hash_ops = default_hash(&op_ids);
-            let dep_info = self.get_dep_info();
+            let mut dep_info = self.get_dep_info();
             let key = (hash_ops, partition, dep_info.identifier);
 
             println!("in denepdency, key = {:?}, ops = {:?}", key, op_ids);
@@ -313,16 +315,61 @@ where
             let buckets = match rx.recv() {
                 Ok((buckets_ptr, marks_ptr)) => {
                     assert_eq!(marks_ptr, 0usize);
-                    let mut buckets = get_encrypted_data::<Vec<ItemE>, Vec<ItemE>>(
-                        rdd_base.get_op_id(),
-                        dep_info,
-                        buckets_ptr,
-                        marks_ptr,
-                    )
-                    .0;
-                    acc_arg.free_enclave_lock();
-                    buckets.resize(num_output_splits, Vec::new());
-                    buckets
+                    if self.aggregator.is_default {
+                        let mut info = get_encrypted_data::<ItemE, Vec<ItemE>>(
+                            rdd_base.get_op_id(),
+                            dep_info,
+                            buckets_ptr,
+                            marks_ptr,
+                        )
+                        .0;
+                        acc_arg.free_enclave_lock();
+                        let num_invalids = info.pop().unwrap();
+                        let data_ptr = info.pop().unwrap();
+                        let num_invalids = futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                            (stage_id, 0, rdd_base.number_of_splits()),
+                            partition,
+                            num_invalids,
+                        ))
+                        .unwrap();
+                        //finish the shuffle
+                        acc_arg.get_enclave_lock();
+                        dep_info.is_shuffle = 11;
+                        let (data_ptr, marks_ptr) = wrapper_secure_execute(
+                            stage_id,
+                            &vec![rdd_base.get_rdd_id()],
+                            &vec![rdd_base.get_op_id()],
+                            &vec![partition],
+                            Default::default(),
+                            dep_info,
+                            &(data_ptr, num_invalids),
+                            &Vec::<ItemE>::new(),
+                            &HashMap::new(),
+                        );
+
+                        assert_eq!(marks_ptr, 0);
+                        let mut buckets = get_encrypted_data::<Vec<ItemE>, ItemE>(
+                            rdd_base.get_op_id(),
+                            dep_info,
+                            data_ptr,
+                            marks_ptr,
+                        )
+                        .0;
+                        acc_arg.free_enclave_lock();
+                        buckets.resize(num_output_splits, Vec::new());
+                        buckets
+                    } else {
+                        let mut buckets = get_encrypted_data::<Vec<ItemE>, Vec<ItemE>>(
+                            rdd_base.get_op_id(),
+                            dep_info,
+                            buckets_ptr,
+                            marks_ptr,
+                        )
+                        .0;
+                        acc_arg.free_enclave_lock();
+                        buckets.resize(num_output_splits, Vec::new());
+                        buckets
+                    }
                 }
                 Err(RecvError) => vec![Vec::new(); num_output_splits],
             };

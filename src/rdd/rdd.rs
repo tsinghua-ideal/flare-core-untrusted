@@ -192,30 +192,6 @@ pub extern "C" fn ocall_cache_from_outside(
     }
 }
 
-#[no_mangle]
-pub extern "C" fn ocall_stage_comm(
-    data_ptr: usize,
-    stage_id: usize,
-    part_id_offset: usize,
-    num_splits: usize,
-    part_id: usize,
-) -> usize {
-    let data_in = unsafe { Box::from_raw(data_ptr as *mut u8 as *mut Vec<u8>) };
-    let data = *data_in.clone();
-    forget(data_in);
-    let part_group = (stage_id, part_id_offset, num_splits);
-    let res_set = Env::run_in_async_rt(|| {
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group, part_id, data)).unwrap()
-    });
-    Box::into_raw(Box::new(res_set)) as *mut u8 as usize
-}
-
-#[no_mangle]
-pub extern "C" fn ocall_stage_comm_post(data_ptr: usize) {
-    let data = unsafe { Box::from_raw(data_ptr as *mut u8 as *mut Vec<Vec<u8>>) };
-    drop(data);
-}
-
 pub fn default_hash<T: Hash>(t: &T) -> u64 {
     let mut s = DefaultHasher::new();
     t.hash(&mut s);
@@ -532,10 +508,10 @@ pub fn secure_global_filter<T: Construct + Data>(
 ) -> Vec<ItemE> {
     let reduce_id = cur_part_ids[0];
 
-    //obliv_global_filter_stage1 + obliv_global_filter_stage2
     let buckets = {
+        //obliv_global_filter_stage1
         acc_arg.get_enclave_lock();
-        let dep_info = DepInfo::padding_new(26);
+        let dep_info = DepInfo::padding_new(12);
         let (data_ptr, marks_ptr) = wrapper_secure_execute(
             stage_id,
             cur_rdd_ids,
@@ -544,6 +520,32 @@ pub fn secure_global_filter<T: Construct + Data>(
             Default::default(),
             dep_info,
             &data,
+            &Vec::<ItemE>::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(marks_ptr, 0);
+        let (mut info, _) =
+            get_encrypted_data::<ItemE, ItemE>(cur_op_ids[0], dep_info, data_ptr, marks_ptr);
+        acc_arg.free_enclave_lock();
+        let stat = info.pop().unwrap();
+        let part_ptr = info.pop().unwrap();
+
+        let stat =
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group, reduce_id, stat))
+                .unwrap();
+
+        //obliv_global_filter_stage2
+        acc_arg.get_enclave_lock();
+        let dep_info = DepInfo::padding_new(13);
+        let (data_ptr, marks_ptr) = wrapper_secure_execute(
+            stage_id,
+            cur_rdd_ids,
+            cur_op_ids,
+            cur_part_ids,
+            Default::default(),
+            dep_info,
+            &(part_ptr, stat),
             &Vec::<ItemE>::new(),
             &HashMap::new(),
         );
@@ -578,7 +580,7 @@ pub fn secure_global_filter<T: Construct + Data>(
     //obliv_global_filter_stage3
     let data = {
         acc_arg.get_enclave_lock();
-        let dep_info = DepInfo::padding_new(27);
+        let dep_info = DepInfo::padding_new(14);
         let (data_ptr, marks_ptr) = wrapper_secure_execute(
             stage_id,
             cur_rdd_ids,
