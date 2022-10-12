@@ -3,7 +3,6 @@ use crate::env;
 use crate::partitioner::Partitioner;
 use crate::rdd::{
     default_hash, free_res_enc, get_encrypted_data, AccArg, ItemE, OpId, RddBase, MAX_THREAD,
-    STAGE_LOCK,
 };
 use crate::serializable_traits::Data;
 use dashmap::mapref::one::RefMut;
@@ -281,12 +280,6 @@ where
             let key = (hash_ops, partition, dep_info.identifier);
 
             println!("in denepdency, key = {:?}, ops = {:?}", key, op_ids);
-            STAGE_LOCK.get_stage_lock((
-                dep_info.child_rdd_id,
-                dep_info.parent_rdd_id,
-                dep_info.identifier,
-            ));
-
             let now = Instant::now();
             let (tx, rx) = mpsc::sync_channel(0);
             let mut acc_arg = AccArg::new(
@@ -322,8 +315,6 @@ where
             }
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             log::info!("in dependency, shuffle write {:?}", dur);
-            STAGE_LOCK.free_stage_lock();
-
             for (i, local_buckets) in buckets.chunks_exact(MAX_THREAD + 1).into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(local_buckets).unwrap();
                 env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);

@@ -85,11 +85,12 @@ impl Stage {
 
     pub fn add_output_loc(&mut self, partition: usize, host: String) {
         log::debug!(
-            "adding loc for partition inside stage {} @{}",
+            "before adding loc for partition inside stage {}, partition {} @{}",
+            self.id,
             partition,
             host
         );
-        if !self.output_locs[partition].is_empty() {
+        if self.output_locs[partition].is_empty() {
             self.num_available_outputs += 1;
         }
         self.output_locs[partition].push(host);

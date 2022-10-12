@@ -449,7 +449,8 @@ impl NativeScheduler for DistributedScheduler {
                             message
                         };
 
-                        capnp_serialize::write_message(writer, message).await
+                        capnp_serialize::write_message(writer, message)
+                            .await
                             .map_err(Error::CapnpDeserialization)
                             .unwrap();
 

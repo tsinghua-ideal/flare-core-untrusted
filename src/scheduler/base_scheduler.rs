@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::dependency::{DepInfo, Dependency, ShuffleDependencyTrait};
 use crate::env;
 use crate::error::{Error, Result};
-use crate::rdd::{ItemE, RddBase, STAGE_LOCK};
+use crate::rdd::{ItemE, RddBase};
 use crate::scheduler::{
     CompletionEvent, FetchFailedVals, JobListener, JobTracker, ResultTask, Stage, TaskBase,
     TaskContext, TaskOption,
@@ -36,11 +36,6 @@ pub(crate) trait NativeScheduler: Send + Sync {
     {
         if jt.final_stage.parents.is_empty() && (jt.num_output_parts == 1) {
             let final_rdd_id = jt.final_rdd.get_rdd_id();
-            STAGE_LOCK.insert_stage((final_rdd_id, final_rdd_id, 0), 0);
-            STAGE_LOCK.set_num_splits(
-                (final_rdd_id, final_rdd_id, 0),
-                jt.final_rdd.number_of_splits(),
-            );
             let split = (jt.final_rdd.splits()[jt.output_parts[0]]).clone();
             let task_context = TaskContext::new(jt.final_stage.id, jt.output_parts[0], 0);
             let now = Instant::now();
@@ -52,13 +47,11 @@ pub(crate) trait NativeScheduler: Send + Sync {
                     task_context,
                     match final_rdd.get_secure() {
                         true => (Box::new(Vec::new().into_iter()), {
-                            STAGE_LOCK.get_stage_lock((final_rdd_id, final_rdd_id, 0));
                             let dep_info = DepInfo::padding_new(0);
                             let res = match final_rdd.secure_iterator(split, dep_info, action_id) {
                                 Ok(r) => r,
                                 Err(_) => Box::new(Vec::new().into_iter()),
                             };
-                            STAGE_LOCK.free_stage_lock();
                             res
                         }),
                         false => (
@@ -77,7 +70,6 @@ pub(crate) trait NativeScheduler: Send + Sync {
                 res
             })
             .await?;
-            STAGE_LOCK.remove_stage((final_rdd_id, final_rdd_id, 0), 0);
             res
         } else {
             Ok(None)
@@ -123,7 +115,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
             missing.iter().map(|x| x.id).collect::<Vec<_>>()
         );
         log::debug!(
-            "visited stages: {:?}",
+            "visited rdd: {:?}",
             visited.iter().map(|x| x.get_rdd_id()).collect::<Vec<_>>()
         );
         if !visited.contains(&rdd) {
@@ -183,7 +175,7 @@ pub(crate) trait NativeScheduler: Send + Sync {
             parents.iter().map(|x| x.id).collect::<Vec<_>>()
         );
         log::debug!(
-            "visited stages: {:?}",
+            "visited rdd: {:?}",
             visited.iter().map(|x| x.get_rdd_id()).collect::<Vec<_>>()
         );
         if !visited.contains(&rdd) {
@@ -308,7 +300,12 @@ pub(crate) trait NativeScheduler: Send + Sync {
                 "completed shuffle task server uri: {:?}",
                 shuffle_server_uri
             );
-            self.add_output_loc_to_stage(smt.stage_id, smt.partition, shuffle_server_uri);
+            self.add_output_loc_to_stage(
+                smt.stage_id,
+                smt.dep.get_shuffle_id(),
+                smt.partition,
+                shuffle_server_uri,
+            );
 
             let stage = self.fetch_from_stage_cache(smt.stage_id);
             log::debug!(
@@ -547,7 +544,13 @@ pub(crate) trait NativeScheduler: Send + Sync {
         ) -> U;
 
     // mutators:
-    fn add_output_loc_to_stage(&self, stage_id: usize, partition: usize, host: String);
+    fn add_output_loc_to_stage(
+        &self,
+        stage_id: usize,
+        shuffle_id: usize,
+        partition: usize,
+        host: String,
+    );
     fn insert_into_stage_cache(&self, id: usize, stage: Stage);
     /// refreshes cache locations
     fn register_shuffle(&self, shuffle_id: usize, num_maps: usize);
@@ -604,9 +607,19 @@ pub(crate) trait NativeScheduler: Send + Sync {
 macro_rules! impl_common_scheduler_funcs {
     () => {
         #[inline]
-        fn add_output_loc_to_stage(&self, stage_id: usize, partition: usize, host: String) {
+        fn add_output_loc_to_stage(
+            &self,
+            stage_id: usize,
+            shuffle_id: usize,
+            partition: usize,
+            host: String,
+        ) {
             self.stage_cache
                 .get_mut(&stage_id)
+                .unwrap()
+                .add_output_loc(partition, host.clone());
+            self.shuffle_to_map_stage
+                .get_mut(&shuffle_id)
                 .unwrap()
                 .add_output_loc(partition, host);
         }

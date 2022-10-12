@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::dependency::DepInfo;
 use crate::env;
-use crate::rdd::{ItemE, OpId, Rdd, STAGE_LOCK};
+use crate::rdd::{ItemE, OpId, Rdd};
 use crate::scheduler::{Task, TaskBase, TaskContext};
 use crate::serializable_traits::{AnyData, Data};
 use crate::SerBox;
@@ -191,9 +191,6 @@ where
 {
     fn run(&self, id: usize) -> SerBox<dyn AnyData> {
         log::debug!("resulttask runs");
-        let rdd_id = self.rdd.get_rdd_id();
-        STAGE_LOCK.insert_stage((rdd_id, rdd_id, 0), self.task_id);
-        STAGE_LOCK.set_num_splits((rdd_id, rdd_id, 0), self.rdd.number_of_splits());
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
 
@@ -203,7 +200,6 @@ where
             context,
             match self.rdd.get_secure() {
                 true => (Box::new(Vec::new().into_iter()), {
-                    STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
                     let dep_info = DepInfo::padding_new(0);
                     let res =
                         match self
@@ -213,7 +209,6 @@ where
                             Ok(r) => r,
                             Err(_) => Box::new(Vec::new().into_iter()),
                         };
-                    STAGE_LOCK.free_stage_lock();
                     res
                 }),
                 false => (
@@ -228,7 +223,6 @@ where
 
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("result_task {:?}s", dur);
-        STAGE_LOCK.remove_stage((rdd_id, rdd_id, 0), self.task_id);
         res
     }
 }
