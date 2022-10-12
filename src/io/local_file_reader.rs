@@ -564,9 +564,6 @@ where
                 .collect::<Vec<_>>(), //enc_data
             None => Vec::new(),
         };
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("io time: {:?} s", dur);
         let cur_rdd_id = self.get_rdd_id();
