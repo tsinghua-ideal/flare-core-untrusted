@@ -76,7 +76,7 @@ pub use union_rdd::*;
 pub type ItemE = Vec<u8>;
 
 static immediate_cout: bool = true;
-pub static STAGE_LOCK: Lazy<StageLock> = Lazy::new(|| StageLock::new());
+pub const PARALLEL_NUM: usize = 1;
 pub const MAX_ENC_BL: usize = 1024;
 
 extern "C" {
@@ -1047,7 +1047,7 @@ impl Input {
         Input {
             data,
             marks,
-            parallel_num: STAGE_LOCK.get_parall_num(),
+            parallel_num: PARALLEL_NUM,
         }
     }
 
@@ -1065,121 +1065,7 @@ impl Input {
         Input {
             data: data as usize,
             marks: marks as usize,
-            parallel_num: STAGE_LOCK.get_parall_num(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct StageLock {
-    slock: AtomicBool,
-    lock_holder_info: RwLock<LockHolderInfo>,
-    //For result task, key.0 == key.1
-    //For shuffle task, key.0 > key.1, key.0 is child rdd id and key.1 is parent rdd id, key.2 is identifier
-    waiting_list: RwLock<BTreeMap<(usize, usize, usize), Vec<usize>>>,
-    num_splits_mapping: RwLock<BTreeMap<(usize, usize, usize), usize>>,
-}
-
-#[derive(Debug)]
-pub struct LockHolderInfo {
-    cur_holder: (usize, usize, usize),
-    num_cur_holders: usize,
-    max_cur_holders: usize,
-}
-
-impl StageLock {
-    pub fn new() -> Self {
-        StageLock {
-            slock: AtomicBool::new(false),
-            lock_holder_info: RwLock::new(LockHolderInfo {
-                cur_holder: (0, 0, 0),
-                num_cur_holders: 0,
-                max_cur_holders: 48,
-            }),
-            waiting_list: RwLock::new(BTreeMap::new()),
-            num_splits_mapping: RwLock::new(BTreeMap::new()),
-        }
-    }
-
-    pub fn insert_stage(&self, rdd_id_pair: (usize, usize, usize), task_id: usize) {
-        let mut waiting_list = self.waiting_list.write().unwrap();
-        waiting_list
-            .entry(rdd_id_pair)
-            .or_insert(vec![])
-            .push(task_id);
-    }
-
-    pub fn remove_stage(&self, rdd_id_pair: (usize, usize, usize), task_id: usize) {
-        let mut waiting_list = self.waiting_list.write().unwrap();
-        let mut remaining = 0;
-        if let Some(task_ids) = waiting_list.get_mut(&rdd_id_pair) {
-            if let Some(pos) = task_ids.iter().position(|x| *x == task_id) {
-                task_ids.remove(pos);
-            }
-            remaining = task_ids.len();
-        }
-        if remaining == 0 {
-            waiting_list.remove(&rdd_id_pair);
-            self.num_splits_mapping
-                .write()
-                .unwrap()
-                .remove(&rdd_id_pair);
-        }
-    }
-
-    pub fn set_num_splits(&self, rdd_id_pair: (usize, usize, usize), num_splits: usize) {
-        let mut num_splits_mapping = self.num_splits_mapping.write().unwrap();
-        num_splits_mapping.insert(rdd_id_pair, num_splits);
-    }
-
-    pub fn get_parall_num(&self) -> usize {
-        let num_splits_mapping = self.num_splits_mapping.read().unwrap();
-        let info = self.lock_holder_info.read().unwrap();
-        std::cmp::min(
-            *num_splits_mapping.get(&info.cur_holder).unwrap(),
-            info.max_cur_holders,
-        )
-    }
-
-    pub fn get_stage_lock(&self, cur_rdd_id_pair: (usize, usize, usize)) {
-        use atomic::Ordering::SeqCst;
-        let mut flag = true;
-        while flag {
-            while self.slock.compare_and_swap(false, true, SeqCst) {
-                //wait or bypass
-                let mut info = self.lock_holder_info.write().unwrap();
-                if cur_rdd_id_pair == info.cur_holder  //The case for bypass
-                    && info.num_cur_holders < info.max_cur_holders
-                {
-                    info.num_cur_holders += 1;
-                    return;
-                }
-            }
-            if *self
-                .waiting_list
-                .read()
-                .unwrap()
-                .first_key_value()
-                .unwrap()
-                .0
-                < cur_rdd_id_pair
-            {
-                self.slock.store(false, SeqCst);
-            } else {
-                let mut info = self.lock_holder_info.write().unwrap();
-                info.cur_holder = cur_rdd_id_pair;
-                info.num_cur_holders += 1;
-                flag = false;
-            }
-        }
-    }
-
-    pub fn free_stage_lock(&self) {
-        use atomic::Ordering::SeqCst;
-        self.lock_holder_info.write().unwrap().num_cur_holders -= 1;
-        let num_cur_holder = self.lock_holder_info.read().unwrap().num_cur_holders;
-        if num_cur_holder == 0 {
-            self.slock.compare_and_swap(true, false, SeqCst);
+            parallel_num: PARALLEL_NUM,
         }
     }
 }

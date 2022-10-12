@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::dependency::DepInfo;
 use crate::env;
-use crate::rdd::{ItemE, OpId, Rdd, STAGE_LOCK};
+use crate::rdd::{ItemE, OpId, Rdd};
 use crate::scheduler::{Task, TaskBase, TaskContext};
 use crate::serializable_traits::{AnyData, Data};
 use crate::shuffle::ShuffleFetcher;
@@ -228,10 +228,6 @@ where
 {
     fn run(&self, id: usize) -> SerBox<dyn AnyData> {
         log::debug!("resulttask runs");
-        let rdd_id = self.rdd.get_rdd_id();
-        let num_splits = self.rdd.number_of_splits();
-        STAGE_LOCK.insert_stage((rdd_id, rdd_id, 0), self.task_id);
-        STAGE_LOCK.set_num_splits((rdd_id, rdd_id, 0), num_splits);
         let split = self.rdd.splits()[self.partition].clone();
         let context = TaskContext::new(self.stage_id, self.partition, id);
 
@@ -241,7 +237,6 @@ where
             context,
             match self.rdd.get_secure() {
                 true => (Box::new(Vec::new().into_iter()), {
-                    STAGE_LOCK.get_stage_lock((rdd_id, rdd_id, 0));
                     let dep_info = DepInfo::padding_new(0);
                     let res = match self.rdd.secure_iterator(
                         self.stage_id,
@@ -255,17 +250,6 @@ where
                             Box::new(Vec::new().into_iter()) as Box<dyn Iterator<Item = _>>,
                         ),
                     };
-                    STAGE_LOCK.free_stage_lock();
-                    //sync in order to clear the sort cache
-                    futures::executor::block_on(ShuffleFetcher::fetch_sync(
-                        (self.stage_id, 0, num_splits),
-                        self.partition,
-                        Vec::new(),
-                    ))
-                    .unwrap();
-                    //clear the sort cache
-                    env::SORT_CACHE.retain(|k, _| k.0 .0 != self.stage_id);
-
                     res
                 }),
                 false => (
@@ -282,7 +266,6 @@ where
         ))) as SerBox<dyn AnyData>;
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
         println!("result_task {:?}s", dur);
-        STAGE_LOCK.remove_stage((rdd_id, rdd_id, 0), self.task_id);
         res
     }
 }
