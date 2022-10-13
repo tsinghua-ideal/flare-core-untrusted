@@ -2592,7 +2592,7 @@ pub trait Rdd: RddBase + 'static {
                     Box<dyn Iterator<Item = ItemE>>
                 )
             )| {
-                assert!(marks_iter.collect::<Vec<_>>().is_empty());
+                // assert!(marks_iter.collect::<Vec<_>>().is_empty());
                 let data = data_iter.collect::<Vec<_>>();
                 let (partial, _) = wrapper_take(op_id, &data, left);
                 partial
