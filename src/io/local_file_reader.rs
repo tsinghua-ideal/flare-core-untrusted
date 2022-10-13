@@ -620,9 +620,6 @@ where
                 .collect::<Vec<_>>(), //enc_data
             None => Vec::new(),
         };
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let cur_rdd_id = self.get_rdd_id();
         let cur_op_id = self.get_op_id();
