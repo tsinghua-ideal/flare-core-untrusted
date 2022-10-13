@@ -75,9 +75,6 @@ impl<T: Data> ParallelCollectionSplit<T> {
     ) -> JoinHandle<()> {
         let data = self.values.clone();
         let len = data.len();
-        if len == 0 {
-            return std::thread::spawn(|| {});
-        }
         let data = (0..len).map(move |i| data[i].clone()).collect::<Vec<T>>();
         //sub-partition
         let acc_arg = acc_arg.clone();
