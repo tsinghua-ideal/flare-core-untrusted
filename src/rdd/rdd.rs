@@ -883,7 +883,12 @@ pub fn secure_column_sort<T: Construct + Data>(
             );
             env::SORT_CACHE.insert((part_group, cur_part_ids[0], i), ser_bytes);
         }
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(
+            part_group,
+            cur_part_ids[0],
+            Vec::new(),
+        ))
+        .unwrap();
         let fut = ShuffleFetcher::secure_fetch(
             GetServerUriReq::CurStage(part_group),
             cur_part_ids[0],
@@ -958,11 +963,21 @@ pub fn secure_shuffle_read(
     assert_eq!(encrypted_cnt.len(), 1);
 
     //sync in order to clear the sort cache
-    futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+    futures::executor::block_on(ShuffleFetcher::fetch_sync(
+        part_group,
+        cur_part_ids[0],
+        Vec::new(),
+    ))
+    .unwrap();
     //clear the sort cache
     env::SORT_CACHE.retain(|k, _| k.0 != part_group);
     //sync again to avoid clearing the just-written value
-    futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+    futures::executor::block_on(ShuffleFetcher::fetch_sync(
+        part_group,
+        cur_part_ids[0],
+        Vec::new(),
+    ))
+    .unwrap();
 
     if reduce_id != 0 {
         let fut = ShuffleFetcher::secure_fetch(
@@ -1060,7 +1075,12 @@ pub fn secure_shuffle_read(
         }
     }
 
-    futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+    futures::executor::block_on(ShuffleFetcher::fetch_sync(
+        part_group,
+        cur_part_ids[0],
+        Vec::new(),
+    ))
+    .unwrap();
     if is_aggregator_default {
         //group by: send max group to other nodes
         //for reduce_id == num_splits, it can directly fetch from local storage
@@ -1092,11 +1112,21 @@ pub fn secure_shuffle_read(
         assert_eq!(part_cnts.len(), num_splits);
 
         //sync in order to clear the sort cache
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(
+            part_group,
+            cur_part_ids[0],
+            Vec::new(),
+        ))
+        .unwrap();
         //clear the sort cache
         env::SORT_CACHE.retain(|k, _| k.0 != part_group);
         //sync again to avoid clearing the just-written value
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(
+            part_group,
+            cur_part_ids[0],
+            Vec::new(),
+        ))
+        .unwrap();
 
         //To guarantee the count is securely revealed, the integrity check should be synchronized
         //Currently we do not implement it
@@ -1131,7 +1161,12 @@ pub fn secure_shuffle_read(
             env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
         }
 
-        futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(
+            part_group,
+            cur_part_ids[0],
+            Vec::new(),
+        ))
+        .unwrap();
         //fetch max group from other nodes
         let fut = ShuffleFetcher::secure_fetch(
             GetServerUriReq::CurStage(part_group),

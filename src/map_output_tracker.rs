@@ -37,10 +37,8 @@ pub(crate) enum MapOutputTrackerMessage {
     GetMapOutputLocations(usize),
     // Contains stage_id, not the part group, because the workers will cache the server list
     GetExecutorLocations(usize),
-    // Contains part_group, cnt,
-    GetMaxCnt((usize, usize, usize), usize),
-    // Contains part_group
-    CheckStepReady((usize, usize, usize)),
+    // Contains part_group, part_id, and info
+    FetchSync((usize, usize, usize), usize, Vec<u8>),
     StopMapOutputTracker,
 }
 
@@ -57,10 +55,8 @@ pub(crate) struct MapOutputTracker {
     fetching_for_sort: Arc<DashSet<usize>>,
     generation: Arc<Mutex<i64>>,
     master_addr: SocketAddr,
-    //(part_group) -> (barrier, num_executors). If the worker is ready for step if the corresponding uri is contained
-    step_map: Arc<Mutex<HashMap<(usize, usize, usize), (Arc<Barrier>, usize)>>>,
-    //(part_group) -> (cnt, barrier, num_executors)
-    cnt_map: Arc<Mutex<HashMap<(usize, usize, usize), (usize, Arc<Barrier>, usize)>>>,
+    //(part_group) -> (barrier, info_set, num_executors). If the worker is ready for step if the corresponding uri is contained
+    step_map: Arc<Mutex<HashMap<(usize, usize, usize), (Arc<Barrier>, Vec<Vec<u8>>, usize)>>>,
     // stage_id -> hosts indexed by partition id
     executor_map: ServerUris,
 }
@@ -76,7 +72,6 @@ impl Default for MapOutputTracker {
             generation: Default::default(),
             master_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
             step_map: Default::default(),
-            cnt_map: Default::default(),
             executor_map: Default::default(),
         }
     }
@@ -92,7 +87,6 @@ impl MapOutputTracker {
             generation: Arc::new(Mutex::new(0)),
             master_addr,
             step_map: Arc::new(Mutex::new(HashMap::new())),
-            cnt_map: Arc::new(Mutex::new(HashMap::new())),
             executor_map: Arc::new(DashMap::new()),
         };
         output_tracker.server();
@@ -137,7 +131,12 @@ impl MapOutputTracker {
         Ok(locs)
     }
 
-    async fn client_check_ready(&self, part_group: (usize, usize, usize)) -> Result<()> {
+    async fn client_fetch_sync(
+        &self,
+        part_group: (usize, usize, usize),
+        part_id: usize,
+        info: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>> {
         let mut stream = loop {
             match TcpStream::connect(self.master_addr).await {
                 Ok(stream) => break stream,
@@ -148,45 +147,17 @@ impl MapOutputTracker {
         let reader = reader.compat();
         let mut writer = writer.compat_write();
         log::debug!("connected to master to sync at part_group {:?}", part_group);
-        let bytes = bincode::serialize(&MapOutputTrackerMessage::CheckStepReady(part_group))?;
+        let bytes = bincode::serialize(&MapOutputTrackerMessage::FetchSync(
+            part_group, part_id, info,
+        ))?;
         let mut message = MsgBuilder::new_default();
         let mut data = message.init_root::<serialized_data::Builder>();
         data.set_msg(&bytes);
         capnp_serialize::write_message(&mut writer, &message).await?;
         let message_reader = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
         let res = message_reader.get_root::<serialized_data::Reader>()?;
-        assert!(bincode::deserialize::<bool>(&res.get_msg()?)?);
-        Ok(())
-    }
-
-    async fn client_get_max_cnt(
-        &self,
-        part_group: (usize, usize, usize),
-        cnt: usize,
-    ) -> Result<usize> {
-        let mut stream = loop {
-            match TcpStream::connect(self.master_addr).await {
-                Ok(stream) => break stream,
-                Err(_) => continue,
-            }
-        };
-        let (reader, writer) = stream.split();
-        let reader = reader.compat();
-        let mut writer = writer.compat_write();
-        log::debug!(
-            "connected to master to fetch cnt at part group #{:?}",
-            part_group
-        );
-
-        let bytes = bincode::serialize(&MapOutputTrackerMessage::GetMaxCnt(part_group, cnt))?;
-        let mut message = MsgBuilder::new_default();
-        let mut data = message.init_root::<serialized_data::Builder>();
-        data.set_msg(&bytes);
-        capnp_serialize::write_message(&mut writer, &message).await?;
-        let message_reader = capnp_serialize::read_message(reader, CAPNP_BUF_READ_OPTS).await?;
-        let data = message_reader.get_root::<serialized_data::Reader>()?;
-        let cnt: usize = bincode::deserialize(&data.get_msg()?)?;
-        Ok(cnt)
+        let info_set = bincode::deserialize::<Vec<Vec<u8>>>(&res.get_msg()?)?;
+        Ok(info_set)
     }
 
     fn server(&self) {
@@ -197,7 +168,6 @@ impl MapOutputTracker {
         let master_addr = self.master_addr;
         let server_uris = self.server_uris.clone();
         let step_map = self.step_map.clone();
-        let cnt_map = self.cnt_map.clone();
         let executor_map = self.executor_map.clone();
         tokio::spawn(async move {
             let mut listener = TcpListener::bind(master_addr)
@@ -207,7 +177,6 @@ impl MapOutputTracker {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let server_uris_clone = server_uris.clone();
                 let step_map_clone = step_map.clone();
-                let cnt_map_clone = cnt_map.clone();
                 let executor_map_clone = executor_map.clone();
                 tokio::spawn(async move {
                     let (reader, writer) = stream.split();
@@ -285,57 +254,20 @@ impl MapOutputTracker {
                             // writting response
                             bincode::serialize(&locs)?
                         }
-                        MapOutputTrackerMessage::GetMaxCnt(part_group, cnt_per_partition) => {
-                            let num_of_executors = part_group.2;
-                            assert!(num_of_executors > 0);
-
-                            let barrier = {
-                                let mut unlocked_cnt_map = cnt_map_clone.lock();
-                                let (item, barrier, _) =
-                                    unlocked_cnt_map.entry(part_group).or_insert((
-                                        cnt_per_partition,
-                                        Arc::new(Barrier::new(num_of_executors)),
-                                        num_of_executors,
-                                    ));
-                                *item = std::cmp::max(*item, cnt_per_partition);
-                                barrier.clone()
-                            };
-
-                            //send back
-                            log::debug!(
-                                "(part_group) wait for the |get max cnt| point ({:?})",
-                                part_group,
-                            );
-                            barrier.wait().await;
-                            log::debug!(
-                                "(part_group) pass the |get max cnt| point ({:?})",
-                                part_group
-                            );
-                            let (cnt, should_remove) = {
-                                let mut unlocked_cnt_map = cnt_map_clone.lock();
-                                let (item, _, remain) =
-                                    unlocked_cnt_map.get_mut(&part_group).unwrap();
-                                *remain -= 1;
-                                (*item, *remain == 0)
-                            };
-
-                            if should_remove {
-                                cnt_map_clone.lock().remove(&part_group).unwrap();
-                            }
-
-                            bincode::serialize(&cnt)?
-                        }
-                        MapOutputTrackerMessage::CheckStepReady(part_group) => {
+                        MapOutputTrackerMessage::FetchSync(part_group, part_id, info) => {
                             let num_of_executors = part_group.2;
                             assert!(num_of_executors > 0);
                             //insert the value and release the lock immediately
 
                             let barrier = {
                                 let mut unlocked_step_map = step_map_clone.lock();
-                                let (barrier, _) = unlocked_step_map.entry(part_group).or_insert((
-                                    Arc::new(Barrier::new(num_of_executors)),
-                                    num_of_executors,
-                                ));
+                                let (barrier, info_set, _) =
+                                    unlocked_step_map.entry(part_group).or_insert((
+                                        Arc::new(Barrier::new(num_of_executors)),
+                                        vec![Vec::new(); num_of_executors],
+                                        num_of_executors,
+                                    ));
+                                info_set[part_id] = info;
                                 barrier.clone()
                             };
 
@@ -349,19 +281,19 @@ impl MapOutputTracker {
                                 part_group
                             );
 
-                            let should_remove = {
+                            let (info_set, should_remove) = {
                                 let mut unlocked_step_map = step_map_clone.lock();
-                                let (_, remain) = unlocked_step_map.get_mut(&part_group).unwrap();
+                                let (_, info_set, remain) =
+                                    unlocked_step_map.get_mut(&part_group).unwrap();
                                 *remain -= 1;
-                                *remain == 0
+                                (info_set.clone(), *remain == 0)
                             };
 
                             if should_remove {
                                 step_map_clone.lock().remove(&part_group).unwrap();
                             }
 
-                            //check
-                            bincode::serialize(&true)?
+                            bincode::serialize(&info_set)?
                         }
                         MapOutputTrackerMessage::StopMapOutputTracker => unimplemented!(),
                     };
@@ -554,18 +486,14 @@ impl MapOutputTracker {
         }
     }
 
-    pub async fn check_ready(&self, part_group: (usize, usize, usize)) -> Result<()> {
-        self.client_check_ready(part_group).await?;
-        Ok(())
-    }
-
-    pub async fn get_max_cnt(
+    pub async fn fetch_sync(
         &self,
         part_group: (usize, usize, usize),
-        cnt: usize,
-    ) -> Result<usize> {
-        let cnt = self.client_get_max_cnt(part_group, cnt).await?;
-        Ok(cnt)
+        part_id: usize,
+        info: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let res = self.client_fetch_sync(part_group, part_id, info).await?;
+        Ok(res)
     }
 
     pub fn increment_generation(&self) {

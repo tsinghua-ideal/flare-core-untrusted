@@ -137,16 +137,20 @@ impl ShuffleFetcher {
         Ok(results.into_iter())
     }
 
-    pub async fn fetch_sync(part_group: (usize, usize, usize)) -> Result<()> {
+    pub async fn fetch_sync(
+        part_group: (usize, usize, usize),
+        part_id: usize,
+        info: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>> {
         log::debug!(
             "begin fetch_sync, part_group (stage_id = {:?}, part_id_offset = {:?}, cur_num_splits = {:?})",
             part_group.0,
             part_group.1,
             part_group.2,
         );
-        env::Env::get()
+        let res = env::Env::get()
             .map_output_tracker
-            .check_ready(part_group)
+            .fetch_sync(part_group, part_id, info)
             .await
             .map_err(|_| ShuffleError::FailCheckingReady)?;
         log::debug!(
@@ -155,20 +159,7 @@ impl ShuffleFetcher {
             part_group.1,
             part_group.2,
         );
-        Ok(())
-    }
-
-    pub async fn fetch_cnt(
-        //(stage_id, part_id_offset, cur num split)
-        part_group: (usize, usize, usize),
-        mut cnt: usize,
-    ) -> Result<usize> {
-        cnt = env::Env::get()
-            .map_output_tracker
-            .get_max_cnt(part_group, cnt)
-            .await
-            .map_err(|_| ShuffleError::FailGettingMaxCnt)?;
-        Ok(cnt)
+        Ok(res)
     }
 
     pub async fn secure_fetch(
@@ -345,11 +336,17 @@ impl ShuffleFetcher {
             };
             let r = cnt_per_partition % d;
             cnt_per_partition += (d - r) % d;
-            cnt_per_partition = futures::executor::block_on(ShuffleFetcher::fetch_cnt(
+            let cnt_per_partition_vec = futures::executor::block_on(ShuffleFetcher::fetch_sync(
                 part_group,
-                cnt_per_partition,
+                reduce_id,
+                bincode::serialize(&cnt_per_partition).unwrap(),
             ))
             .unwrap();
+            cnt_per_partition = cnt_per_partition_vec
+                .into_iter()
+                .map(|x| bincode::deserialize::<usize>(&x).unwrap())
+                .max()
+                .unwrap();
             assert!(
                 cnt_per_partition % 2 == 0 && cnt_per_partition % num_splits == 0 //&& cnt_per_partition >= 2 * (num_splits - 1) * (num_splits - 1)
             );
@@ -393,7 +390,12 @@ impl ShuffleFetcher {
                 );
                 env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
             }
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(part_group),
                 reduce_id,
@@ -447,12 +449,22 @@ impl ShuffleFetcher {
                 (reduce_id + 1) % num_splits,
                 bucket,
             );
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
             env::SORT_CACHE.insert(
                 (part_group, reduce_id, (reduce_id + 1) % num_splits),
                 ser_bytes,
             );
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(part_group),
                 reduce_id,
@@ -508,7 +520,12 @@ impl ShuffleFetcher {
                 (reduce_id + num_splits - 1) % num_splits,
                 bucket,
             );
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
             env::SORT_CACHE.insert(
                 (
                     part_group,
@@ -518,7 +535,12 @@ impl ShuffleFetcher {
                 ser_bytes,
             );
 
-            futures::executor::block_on(ShuffleFetcher::fetch_sync(part_group)).unwrap();
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
             let fut = ShuffleFetcher::secure_fetch(
                 GetServerUriReq::CurStage(part_group),
                 reduce_id,
