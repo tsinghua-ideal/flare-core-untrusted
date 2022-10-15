@@ -180,7 +180,10 @@ impl ShuffleFetcher {
         }
         //get the uri of current worker
         let uri = env::Env::get().shuffle_manager.get_server_uri();
-        assert_eq!(uri, server_uris[reduce_id]);
+        assert_eq!(
+            uri.split(':').collect::<Vec<_>>()[1],
+            server_uris[reduce_id].split(':').collect::<Vec<_>>()[1]
+        );
         log::debug!(
             "server uris for req #{:?}, reduce_id #{}: {:?}",
             req,
