@@ -381,13 +381,6 @@ impl ShuffleFetcher {
             buckets.resize(num_splits, Vec::new());
             for (i, bucket) in buckets.into_iter().enumerate() {
                 let ser_bytes = bincode::serialize(&bucket).unwrap();
-                log::debug!(
-                    "during step 4. bucket #{} in stage id #{}, partition #{}: {:?}",
-                    i,
-                    stage_id,
-                    reduce_id,
-                    bucket
-                );
                 env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
             }
             futures::executor::block_on(ShuffleFetcher::fetch_sync(
@@ -406,11 +399,6 @@ impl ShuffleFetcher {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>()
         };
-        log::debug!(
-            "step 4 finished. partition = {:?}, data = {:?}",
-            reduce_id,
-            data
-        );
 
         //step 5: sort + step 6: shuffle (shift)
         let data = {
@@ -442,13 +430,6 @@ impl ShuffleFetcher {
             }
             let bucket = buckets.pop().unwrap();
             let ser_bytes = bincode::serialize(&bucket).unwrap();
-            log::debug!(
-                "during step 6. stage id #{}, input partition #{}, output partition #{}, {:?}",
-                stage_id,
-                reduce_id,
-                (reduce_id + 1) % num_splits,
-                bucket,
-            );
             futures::executor::block_on(ShuffleFetcher::fetch_sync(
                 part_group,
                 reduce_id,
@@ -480,7 +461,6 @@ impl ShuffleFetcher {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>()
         };
-        log::debug!("step 6 finished. partition #{}, data {:?}", reduce_id, data);
         //step 7: sort + step 8: shuffle (unshift)
         let res = {
             acc_arg.get_enclave_lock();
@@ -513,13 +493,6 @@ impl ShuffleFetcher {
             }
             let bucket = buckets.pop().unwrap();
             let ser_bytes = bincode::serialize(&bucket).unwrap();
-            log::debug!(
-                "during step 8. stage id #{}, input partition #{}, output partition #{}, {:?}",
-                stage_id,
-                reduce_id,
-                (reduce_id + num_splits - 1) % num_splits,
-                bucket,
-            );
             futures::executor::block_on(ShuffleFetcher::fetch_sync(
                 part_group,
                 reduce_id,
@@ -559,7 +532,6 @@ impl ShuffleFetcher {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>()
         };
-        log::debug!("step 8 finished. partition #{}, {:?}", reduce_id, res);
         //assert!(res.is_sorted_by_key(|i| i.0.clone()));
         res
     }

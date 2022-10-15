@@ -369,13 +369,6 @@ where
                 .enumerate()
             {
                 let (k, v) = i;
-                if count == 0 {
-                    log::debug!(
-                        "iterating inside dependency map task after downcasting: key: {:?}, value: {:?}",
-                        k,
-                        v
-                    );
-                }
                 let bucket_id = partitioner.get_partition(&k);
                 let bucket = &mut buckets[bucket_id];
                 if let Some(old_v) = bucket.get_mut(&k) {

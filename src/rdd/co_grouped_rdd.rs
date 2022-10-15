@@ -501,10 +501,6 @@ where
                         .unwrap()
                         .into_iter()
                     {
-                        log::debug!(
-                            "inside iterator CoGroupedRdd narrow dep iterator any: {:?}",
-                            i
-                        );
                         let (k, v) = i;
                         agg.entry(k)
                             .or_insert_with(|| (Vec::new(), Vec::new()))
@@ -513,7 +509,6 @@ where
                     }
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
-                    log::debug!("inside iterator CoGroupedRdd shuffle dep, agg: {:?}", agg);
                     let fut = ShuffleFetcher::fetch::<K, Vec<V>>(shuffle_id, split.get_index());
                     for (k, c) in futures::executor::block_on(fut)?.into_iter() {
                         let temp = agg.entry(k).or_insert_with(|| (Vec::new(), Vec::new()));
@@ -535,10 +530,6 @@ where
                         .unwrap()
                         .into_iter()
                     {
-                        log::debug!(
-                            "inside iterator CoGroupedRdd narrow dep iterator any: {:?}",
-                            i
-                        );
                         let (k, v) = i;
                         agg.entry(k)
                             .or_insert_with(|| (Vec::new(), Vec::new()))
@@ -547,7 +538,6 @@ where
                     }
                 }
                 CoGroupSplitDep::ShuffleCoGroupSplitDep { shuffle_id } => {
-                    log::debug!("inside iterator CoGroupedRdd shuffle dep, agg: {:?}", agg);
                     let fut = ShuffleFetcher::fetch::<K, Vec<W>>(shuffle_id, split.get_index());
                     for (k, c) in futures::executor::block_on(fut)?.into_iter() {
                         let temp = agg.entry(k).or_insert_with(|| (Vec::new(), Vec::new()));

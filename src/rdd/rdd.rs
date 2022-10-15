@@ -874,13 +874,6 @@ pub fn secure_column_sort<T: Construct + Data>(
 
         for (i, bucket) in buckets.into_iter().enumerate() {
             let ser_bytes = bincode::serialize(&bucket).unwrap();
-            log::debug!(
-                "during step 2. bucket #{} in stage id #{}, partition #{}: {:?}",
-                i,
-                part_group.0,
-                cur_part_ids[0],
-                bucket
-            );
             env::SORT_CACHE.insert((part_group, cur_part_ids[0], i), ser_bytes);
         }
         futures::executor::block_on(ShuffleFetcher::fetch_sync(
@@ -899,11 +892,6 @@ pub fn secure_column_sort<T: Construct + Data>(
             .filter(|x| !x.is_empty())
             .collect::<Vec<_>>()
     };
-    log::debug!(
-        "step 2 finished. partition = {:?}, data = {:?}",
-        cur_part_ids[0],
-        fetched_data
-    );
     //step 3 - 8
     let data = ShuffleFetcher::fetch_sort(
         fetched_data,
