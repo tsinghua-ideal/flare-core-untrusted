@@ -354,13 +354,6 @@ where
                 .enumerate()
             {
                 let (k, v) = i;
-                if count == 0 {
-                    log::debug!(
-                        "iterating inside dependency map task after downcasting: key: {:?}, value: {:?}",
-                        k,
-                        v
-                    );
-                }
                 let bucket_id = partitioner.get_partition(&k);
                 let bucket = &mut buckets[bucket_id];
                 if let Some(old_v) = bucket.get_mut(&k) {
@@ -376,11 +369,10 @@ where
                 let set: Vec<(K, C)> = bucket.into_iter().collect();
                 let ser_bytes = bincode::serialize(&set).unwrap();
                 log::debug!(
-                    "shuffle dependency map task set from bucket #{} in shuffle id #{}, partition #{}: {:?}",
+                    "shuffle dependency map task set from bucket #{} in shuffle id #{}, partition #{}",
                     i,
                     self.shuffle_id,
                     partition,
-                    set.get(0)
                 );
                 env::SHUFFLE_CACHE.insert((self.shuffle_id, partition, i), ser_bytes);
             }
