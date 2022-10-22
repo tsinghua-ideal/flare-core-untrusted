@@ -3,3 +3,7 @@
 struct SerializedData{
     msg @0: Data;
 }
+
+struct SerializedDataList{
+    msg @0: List(Data);
+}

@@ -3,7 +3,12 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::Path;
 
 use crate::env;
-use crate::error;
+use crate::error::{Error, NetworkError};
+use crate::serialized_data_capnp::{serialized_data, serialized_data_list};
+use capnp::{
+    message::{Builder as MsgBuilder, HeapAllocator, Reader as CpnpReader, ReaderOptions},
+    serialize::OwnedSegments,
+};
 use rand::Rng;
 
 pub(crate) mod bounded_priority_queue;
@@ -22,7 +27,9 @@ where
     }
 }
 
-pub(crate) fn get_free_connection(ip: Ipv4Addr) -> Result<(TcpListener, u16), error::NetworkError> {
+pub(crate) fn get_free_connection(
+    ip: Ipv4Addr,
+) -> std::result::Result<(TcpListener, u16), NetworkError> {
     let mut port = 0;
     for _ in 0..100 {
         port = get_dynamic_port();
@@ -31,13 +38,38 @@ pub(crate) fn get_free_connection(ip: Ipv4Addr) -> Result<(TcpListener, u16), er
             return Ok((conn, port));
         }
     }
-    Err(error::NetworkError::FreePortNotFound(port, 100))
+    Err(NetworkError::FreePortNotFound(port, 100))
 }
 
 pub(crate) fn get_dynamic_port() -> u16 {
     const FIRST_DYNAMIC_PORT: u16 = 49152;
     const LAST_DYNAMIC_PORT: u16 = 65535;
     FIRST_DYNAMIC_PORT + rand::thread_rng().gen_range(0, LAST_DYNAMIC_PORT - FIRST_DYNAMIC_PORT)
+}
+
+//handle the case where result.len() >= (1 << 29)
+pub(crate) fn send_large_data(result: Vec<u8>) -> MsgBuilder<HeapAllocator> {
+    let mut message = capnp::message::Builder::new_default();
+    let task_data = message.init_root::<serialized_data_list::Builder>();
+    let buf_len = ((result.len().saturating_sub(1)) / (1 << 28) + 1) as u32;
+    let mut buf = task_data.init_msg(buf_len);
+    for (i, chunk) in result.chunks(1 << 28).enumerate() {
+        buf.set(i as u32, chunk);
+    }
+    message
+}
+
+pub(crate) fn recv_large_data(
+    message_reader: CpnpReader<OwnedSegments>,
+) -> std::result::Result<Vec<u8>, capnp::Error> {
+    let task_data = message_reader.get_root::<serialized_data_list::Reader>()?;
+    let msg = task_data.get_msg()?;
+    let msg = msg
+        .iter()
+        .map(|reader| reader.unwrap().to_owned())
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok(msg)
 }
 
 #[allow(unused_must_use)]
