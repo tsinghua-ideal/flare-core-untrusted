@@ -22,6 +22,7 @@ use crate::scheduler::{
 use crate::serializable_traits::{AnyData, Data, SerFunc};
 use crate::serialized_data_capnp::serialized_data;
 use crate::shuffle::ShuffleMapTask;
+use crate::utils::{recv_large_data, send_large_data};
 use capnp::message::ReaderOptions;
 use capnp_futures::serialize as capnp_serialize;
 use dashmap::DashMap;
@@ -331,15 +332,15 @@ impl DistributedScheduler {
             let message = capnp_futures::serialize::read_message(receiver, CAPNP_BUF_READ_OPTS)
                 .await
                 .unwrap();
-            let task_data = message.get_root::<serialized_data::Reader>().unwrap();
+            let data = recv_large_data(message).unwrap();
             log::debug!(
                 "received task #{} result of {} bytes from executor @{}",
                 task.get_task_id(),
-                task_data.get_msg().unwrap().len(),
+                data.len(),
                 target_port
             );
             let now = Instant::now();
-            let res = bincode::deserialize(&task_data.get_msg().unwrap()).unwrap();
+            let res = bincode::deserialize(&data).unwrap();
             let dur = now.elapsed().as_nanos() as f64 * 1e-9;
             println!("distributed_scheduler deserialize task time: {:?} s", dur);
             res
@@ -442,13 +443,7 @@ impl NativeScheduler for DistributedScheduler {
                             target_executor.port(),
                         );
 
-                        let message = {
-                            let mut message = capnp::message::Builder::new_default();
-                            let mut task_data = message.init_root::<serialized_data::Builder>();
-                            task_data.set_msg(&task_bytes);
-                            message
-                        };
-
+                        let message = send_large_data(task_bytes);
                         capnp_serialize::write_message(writer, message)
                             .await
                             .map_err(Error::CapnpDeserialization)

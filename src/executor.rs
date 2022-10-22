@@ -6,6 +6,7 @@ use crate::env;
 use crate::error::{Error, NetworkError, Result};
 use crate::scheduler::TaskOption;
 use crate::serialized_data_capnp::serialized_data;
+use crate::utils::{recv_large_data, send_large_data};
 use capnp::{
     message::{Builder as MsgBuilder, HeapAllocator, Reader as CpnpReader, ReaderOptions},
     serialize::OwnedSegments,
@@ -81,14 +82,16 @@ impl Executor {
                 let port = selfc.port;
                 log::debug!("received new task @{} executor", port);
                 let message = {
-                    let message_reader = capnp_serialize::read_message(&mut reader, CAPNP_BUF_READ_OPTS).await?;
+                    let message_reader =
+                        capnp_serialize::read_message(&mut reader, CAPNP_BUF_READ_OPTS).await?;
                     spawn_blocking(move || -> Result<_> {
                         let des_task = selfc.deserialize_task(message_reader)?;
                         selfc.run_task(des_task)
                     })
                     .await??
                 };
-                capnp_serialize::write_message(&mut writer, message).await
+                capnp_serialize::write_message(&mut writer, message)
+                    .await
                     .map_err(Error::CapnpDeserialization)
                     .unwrap();
                 log::debug!("sent result data to driver");
@@ -110,8 +113,7 @@ impl Executor {
         message_reader: CpnpReader<OwnedSegments>,
     ) -> Result<TaskOption> {
         let start = Instant::now();
-        let task_data = message_reader.get_root::<serialized_data::Reader>()?;
-        let msg = match task_data.get_msg() {
+        let msg = match recv_large_data(message_reader) {
             Ok(s) => {
                 log::debug!("got the task message in executor {}", self.port);
                 s
@@ -127,7 +129,6 @@ impl Executor {
             msg.len(),
             start.elapsed().as_millis()
         );
-        std::mem::drop(task_data);
         let start = Instant::now();
         let des_task: TaskOption = bincode::deserialize(&msg)?;
         log::debug!(
@@ -141,7 +142,7 @@ impl Executor {
 
     fn run_task(self: &Arc<Self>, des_task: TaskOption) -> Result<MsgBuilder<HeapAllocator>> {
         // Run execution + serialization in parallel in the executor threadpool
-        let result: Result<Vec<u8>> = {
+        let result: Vec<u8> = {
             let start = Instant::now();
             log::debug!("executing the task from server port {}", self.port);
             // TODO: change attempt id from 0 to proper value
@@ -163,13 +164,10 @@ impl Executor {
                 result.len(),
                 start.elapsed().as_millis(),
             );
-            Ok(result)
+            result
         };
 
-        let mut message = capnp::message::Builder::new_default();
-        let mut task_data = message.init_root::<serialized_data::Builder>();
-        task_data.set_msg(&(result?));
-        Ok(message)
+        Ok(send_large_data(result))
     }
 
     /// A listener for exit signal from master to end the whole slave process.
@@ -341,9 +339,7 @@ mod tests {
             });
             let mock_task: TaskOption = create_test_task(func).into();
             let ser_task = bincode::serialize(&mock_task)?;
-            let mut message = capnp::message::Builder::new_default();
-            let mut msg_data = message.init_root::<serialized_data::Builder>();
-            msg_data.set_msg(&ser_task);
+            let message = send_large_data(ser_task);
             let mut buf = Vec::new();
             capnp::serialize::write_message(&mut buf, &message).map_err(Error::OutputWrite)?;
 
@@ -365,9 +361,8 @@ mod tests {
                     if let Ok(res) =
                         capnp::serialize::read_message(&mut stream, CAPNP_BUF_READ_OPTS)
                     {
-                        let task_data = res.get_root::<serialized_data::Reader>().unwrap();
                         let now = Instant::now();
-                        match bincode::deserialize::<TaskResult>(&*task_data.get_msg().unwrap())? {
+                        match bincode::deserialize::<TaskResult>(&recv_large_data(res).unwrap())? {
                             TaskResult::ResultTask(_) => {}
                             _ => return Err(Error::DowncastFailure("incorrect task result")),
                         }
