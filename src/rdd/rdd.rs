@@ -871,7 +871,12 @@ pub fn secure_column_sort<T: Construct + Data>(
         .0;
         acc_arg.free_enclave_lock();
         buckets.resize(part_group.2, Vec::new());
-
+        futures::executor::block_on(ShuffleFetcher::fetch_sync(
+            part_group,
+            cur_part_ids[0],
+            Vec::new(),
+        ))
+        .unwrap();
         for (i, bucket) in buckets.into_iter().enumerate() {
             let ser_bytes = bincode::serialize(&bucket).unwrap();
             env::SORT_CACHE.insert((part_group, cur_part_ids[0], i), ser_bytes);
@@ -1136,14 +1141,13 @@ pub fn secure_shuffle_read(
                 }
 
                 (if remain_cnt != 0 {
-                    (remain_cnt - 1) / MAX_ENC_BL as u64 + 1
+                    1 + (remain_cnt - 1) / MAX_ENC_BL as u64 + 1
                 } else {
                     0
                 }) as usize
             } else {
                 0
             };
-
             let ser_bytes =
                 bincode::serialize(&data[data.len().saturating_sub(n_blocks)..]).unwrap();
             env::SORT_CACHE.insert((part_group, reduce_id, i), ser_bytes);
@@ -1176,7 +1180,11 @@ pub fn secure_shuffle_read(
                 }
             }
         }
-        let sup_data = fut_res.unwrap().flatten().collect::<Vec<_>>();
+        let sup_data = fut_res
+            .unwrap()
+            .flatten()
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>();
 
         //group by: do grouping
         let mut tmp_captured_var = HashMap::new();
