@@ -465,7 +465,7 @@ impl ShuffleFetcher {
                 .collect::<Vec<_>>()
         };
         //step 7: sort + step 8: shuffle (unshift)
-        let res = {
+        let mut res = {
             acc_arg.get_enclave_lock();
             let dep_info = DepInfo::padding_new(23 + phase * INTERVAL);
             let (data_ptr, marks_ptr) = wrapper_secure_execute(
@@ -536,6 +536,104 @@ impl ShuffleFetcher {
                 .collect::<Vec<_>>()
         };
         //assert!(res.is_sorted_by_key(|i| i.0.clone()));
+        let res = {
+            fn balance(mut num_blocks: Vec<usize>, reduce_id: usize) -> Vec<usize> {
+                let sum_num_blocks = num_blocks.iter().sum::<usize>();
+                let avg_num_blocks = sum_num_blocks / num_blocks.len();
+                let remain_num_blocks = sum_num_blocks - avg_num_blocks * num_blocks.len();
+                let mut expected_num_blocks = vec![avg_num_blocks; num_blocks.len()];
+                for i in 0..remain_num_blocks {
+                    expected_num_blocks[i] += 1;
+                }
+
+                let mut delta_num_blocks = vec![vec![0; num_blocks.len()]; num_blocks.len()];
+                for i in (1..num_blocks.len()).rev() {
+                    let mut j = i - 1;
+                    if expected_num_blocks[i] < num_blocks[i] {
+                        let mut excess = num_blocks[i] - expected_num_blocks[i];
+                        while excess > 0 {
+                            let new_excess = excess.saturating_sub(expected_num_blocks[j]);
+                            let delta = excess - new_excess;
+                            num_blocks[j] += delta;
+                            delta_num_blocks[i][j] = delta;
+                            if new_excess > 0 {
+                                j = j - 1;
+                            }
+                            excess = new_excess;
+                        }
+                    } else {
+                        let mut vacant = expected_num_blocks[i] - num_blocks[i];
+                        while vacant > 0 {
+                            let new_vacant = vacant.saturating_sub(num_blocks[j]);
+                            let delta = vacant - new_vacant;
+                            num_blocks[j] -= delta;
+                            delta_num_blocks[j][i] = delta;
+                            if new_vacant > 0 {
+                                j = j - 1;
+                            }
+                            vacant = new_vacant;
+                        }
+                    }
+                }
+                delta_num_blocks.remove(reduce_id)
+            }
+
+            //rebalance the partition
+            let num_blocks = futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                bincode::serialize(&res.len()).unwrap(),
+            ))
+            .unwrap()
+            .into_iter()
+            .map(|x| bincode::deserialize::<usize>(&x).unwrap())
+            .collect::<Vec<_>>();
+            let delta_num_blocks = balance(num_blocks, reduce_id)
+                .into_iter()
+                .enumerate()
+                .collect::<Vec<_>>();
+            let (send_front, send_back) = delta_num_blocks.split_at(reduce_id);
+            for (i, l) in send_front.iter() {
+                let mut tmp = res.split_off(*l);
+                std::mem::swap(&mut tmp, &mut res);
+                env::SORT_CACHE.insert(
+                    (part_group, reduce_id, *i),
+                    bincode::serialize(&tmp).unwrap(),
+                );
+            }
+            for (i, l) in send_back.iter().rev() {
+                let tmp = res.split_off(res.len() - *l);
+                env::SORT_CACHE.insert(
+                    (part_group, reduce_id, *i),
+                    bincode::serialize(&tmp).unwrap(),
+                );
+            }
+            futures::executor::block_on(ShuffleFetcher::fetch_sync(
+                part_group,
+                reduce_id,
+                Vec::new(),
+            ))
+            .unwrap();
+            let fut = ShuffleFetcher::secure_fetch(
+                GetServerUriReq::CurStage(part_group),
+                reduce_id,
+                usize::MAX,
+            );
+            let mut received = futures::executor::block_on(fut)
+                .unwrap()
+                .collect::<Vec<_>>();
+            let mut end = received
+                .split_off(reduce_id + 1)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            assert!(received.pop().unwrap().is_empty());
+            let mut front = received.into_iter().flatten().collect::<Vec<_>>();
+            front.append(&mut res);
+            front.append(&mut end);
+            front
+        };
+
         res
     }
 
