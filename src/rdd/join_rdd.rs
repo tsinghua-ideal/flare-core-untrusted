@@ -700,7 +700,7 @@ fn secure_shuffle_read(
         let (mut data_set, _) =
             get_encrypted_data::<Vec<ItemE>, ItemE>(cur_op_ids[0], dep_info, data_ptr, marks_ptr);
         acc_arg.free_enclave_lock();
-        let acc_col_misc = data_set.pop().unwrap().pop().unwrap(); //Enc(acc_col, num_bins, idx_last)
+        let acc_col_misc = data_set.pop().unwrap().pop().unwrap(); //Enc(acc_col, idx_last)
         let acc_col_rem = data_set.pop().unwrap().pop().unwrap();
         let data = data_set.pop().unwrap();
         let part = data_set.pop().unwrap();
@@ -793,7 +793,7 @@ fn secure_shuffle_read(
     }
 
     //obliv_join_stage3
-    let (acc_col, num_bins, mut join_cnt) = {
+    let (acc_col, mut join_cnt) = {
         tmp_captured_var.insert(
             cur_rdd_ids[0],
             vec![bincode::serialize(&part_group).unwrap()],
@@ -826,12 +826,11 @@ fn secure_shuffle_read(
             get_encrypted_data::<ItemE, ItemE>(cur_op_ids[0], dep_info, data_ptr, 0);
         acc_arg.free_enclave_lock();
 
-        let num_bins = data_set.pop().unwrap();
         last_bin_loc_rec = data_set.pop().unwrap(); //last_bin_loc_own serves as last_bin_loc_rec of next partition
         let acc_col = data_set.pop().unwrap();
         acc_col_rec = data_set.pop().unwrap();
         assert!(data_set.is_empty());
-        (acc_col, num_bins, join_cnt)
+        (acc_col, join_cnt)
     };
 
     if reduce_id < num_splits - 1 {
@@ -888,7 +887,7 @@ fn secure_shuffle_read(
             cur_part_ids,
             Default::default(),
             dep_info,
-            &(part, data, acc_col, num_bins, last_bin_loc_rec, acc_col_rem),
+            &(part, data, acc_col, last_bin_loc_rec, acc_col_rem),
             &Vec::<ItemE>::new(),
             &tmp_captured_var,
         );
