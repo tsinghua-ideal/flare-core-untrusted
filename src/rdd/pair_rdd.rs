@@ -176,6 +176,70 @@ where
         self.get_context().add_num(1);
         shuffle_steep.flat_map(flattener)
     }
+
+    #[track_caller]
+    fn sort_by_key(
+        &self,
+        ascending: bool,
+        num_partitions: usize,
+    ) -> SerArc<dyn Rdd<Item = Self::Item>>
+    where
+        K: Ord,
+        Self: Sized,
+    {
+        let sample_point_per_partition_hint = 20;
+        let sample_size = std::cmp::min(1000000, sample_point_per_partition_hint * num_partitions);
+        let sample_size_per_partition = sample_size * 3 / num_partitions;
+        let k_rdd = self.map(Fn!(move |(k, _): (K, V)| k));
+        self.get_context().add_num(1);
+        let sample_k_rdd =
+            k_rdd.map_partitions(Box::new(Fn!(
+                move |iter: Box<dyn Iterator<Item = K>>| -> Box<dyn Iterator<Item = K>> {
+                    let mut res = Vec::<K>::new();
+
+                    let mut rand = utils::random::get_rng_with_random_seed();
+                    for (idx, item) in iter.enumerate() {
+                        if idx < sample_size_per_partition {
+                            res.push(item);
+                        } else {
+                            let i = rand.gen_range(0, idx);
+                            if i < sample_size_per_partition {
+                                res[i] = item
+                            }
+                        }
+                    }
+                    Box::new(res.into_iter())
+                }
+            )));
+        self.get_context().add_num(1);
+
+        assert!(num_partitions >= 1);
+        let part = if self.get_secure() {
+            let samples_enc = sample_k_rdd.secure_collect().unwrap().get_ct();
+            RangePartitioner::<K>::new(num_partitions, ascending, Vec::new(), samples_enc)
+        } else {
+            let samples = sample_k_rdd.collect().unwrap();
+            RangePartitioner::<K>::new(num_partitions, ascending, samples, Vec::new())
+        };
+
+        let sort = Fn!(
+            move |iter: Box<dyn Iterator<Item = (K, V)>>| -> Box<dyn Iterator<Item = (K, V)>> {
+                let mut res: Vec<(K, V)> = iter.collect();
+                res.sort_by(|x, y| x.0.cmp(&y.0));
+                Box::new(res.into_iter())
+            }
+        );
+
+        let group_rdd = self.group_by_key_using_partitioner(Box::new(part));
+        self.get_context().add_num(1);
+        let flattener = Fn!(|values: Vec<V>| {
+            let iter: Box<dyn Iterator<Item = _>> = Box::new(values.into_iter());
+            iter
+        });
+        let partition_rdd = group_rdd.flat_map_values(flattener);
+        self.get_context().add_num(1);
+        partition_rdd.map_partitions(sort)
+    }
 }
 
 // Implementing the PairRdd trait for all types which implements Rdd

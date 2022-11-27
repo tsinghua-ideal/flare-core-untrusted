@@ -60,7 +60,7 @@ aes-gcm = "0.8.0"
 # dynamic typing
 downcast-rs = "1.1.1"
 dyn-clone = "1.0.1"
-serde_traitobject = "0.2.7"
+serde_traitobject = "=0.2.7"
 
 # optional features
 ## aws

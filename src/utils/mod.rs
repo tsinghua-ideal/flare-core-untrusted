@@ -12,6 +12,7 @@ use capnp::{
 use rand::Rng;
 
 pub(crate) mod bounded_priority_queue;
+pub(crate) mod date;
 pub(crate) mod random;
 #[cfg(test)]
 pub(crate) mod test_utils;

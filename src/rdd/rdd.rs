@@ -2562,10 +2562,9 @@ pub trait Rdd: RddBase + 'static {
         func: F,
     ) -> SerArc<dyn Rdd<Item = Self::Item>>
     where
-        K: Data + Eq + Hash + PartialEq + Ord + PartialOrd,
+        K: Data + Eq + Hash + Ord,
         F: SerFunc(&Self::Item) -> K,
-        Self::Item: Data + Eq + Hash,
-        Self: Sized + Clone,
+        Self: Sized,
     {
         let f_clone = func.clone();
         let sample_point_per_partition_hint = 20;

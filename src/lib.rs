@@ -18,6 +18,9 @@
 #![allow(dead_code, where_clauses_object_safety, deprecated)]
 #![allow(clippy::single_component_path_imports)]
 
+#[macro_use]
+extern crate lazy_static;
+
 mod serialized_data_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/serialized_data_capnp.rs"));
 }
@@ -64,3 +67,4 @@ pub use rdd::{
 };
 pub use serializable_traits::Data;
 pub use serialization_free::Construct;
+pub use utils::date::date_tuple::Date;
